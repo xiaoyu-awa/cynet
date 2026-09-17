@@ -43,7 +43,7 @@ pub enum Tlv {
     } = 3,
     /// A Hello TLV.
     ///
-    /// Unicast Hellos are irrelevant for this implementation. The Flags field is send as 0. Hello TLVs with the Unicast flag set are silently ignored.
+    /// Unicast Hellos are irrelevant for this implementation. The Flags field is sent as 0. Hello TLVs with the Unicast flag set are silently ignored.
     Hello {
         /// The sending node's outgoing Multicast Hello seqno.
         seqno: Seqno,
@@ -90,7 +90,7 @@ pub enum Tlv {
         /// The number of octets that have been omitted at the beginning of the advertised prefix and that should be taken from a preceding Update TLV in the same address family with the Prefix flag set.
         omitted: u8,
         /// An upper bound, expressed in centiseconds, on the time after which the sending node will send a new update for this prefix. This MUST NOT be 0. The receiving node will use this value to compute a hold time for the route table entry. The value FFFF hexadecimal (infinity) expresses that this announcement will not be repeated unless a request is received (Section 3.8.2.3).
-        interval: u16,
+        interval: Interval,
         /// The originator's sequence number for this update.
         seqno: Seqno,
         /// The sender's metric for this route. The value FFFF hexadecimal (infinity) means that this is a route retraction.
@@ -122,6 +122,7 @@ pub enum Tlv {
     } = 10,
 }
 
+/// Returns the smallest number of octets that are enough to hold a prefix of length `plen`.
 fn octets(plen: u8) -> usize {
     (plen as usize).div_ceil(8)
 }
@@ -135,13 +136,17 @@ impl Tlv {
             Self::Acknowledgement { .. } => 4,
             Self::Hello {
                 transmit_timestamp, ..
-            } => 8 + transmit_timestamp.map_or(0, |_| 4),
+            } => 8 + transmit_timestamp.map_or(0, |_| 6),
             Self::Ihu {
                 origin_receive_timestamps,
                 ..
-            } => 8 + origin_receive_timestamps.map_or(0, |_| 8),
+            } => 8 + origin_receive_timestamps.map_or(0, |_| 10),
             Self::RouterId { .. } => 12,
-            Self::Update { plen, omitted, .. } => 12 + octets(plen).strict_sub(omitted as usize),
+            Self::Update { plen, omitted, .. } => {
+                12 + octets(plen)
+                    .checked_sub(omitted as usize)
+                    .expect("Update should not omit more octets than the prefix contains")
+            }
             Self::RouteRequest { plen, .. } => 4 + octets(plen),
             Self::SeqnoRequest { plen, .. } => 16 + octets(plen),
         }
@@ -238,19 +243,21 @@ fn encode_payload(tlv: &Tlv, mut buf: &mut [u8]) -> usize {
                         verify_plen(ae, plen),
                         "Update with AE 1 or 2 should not carry overlarge plen"
                     );
+                    assert!(
+                        omitted as usize <= octets(plen),
+                        "Update should not omit more octets than the prefix contains"
+                    );
                 }
                 AddressEncoding::LinkLocalIpv6 => {
                     panic!("Update should not carry AE 3");
                 }
             }
 
-            assert!(interval != 0, "Update should carry nonzero interval");
-
             buf.put_u8(ae as u8);
             buf.put_u8(flags.bits());
             buf.put_u8(plen);
             buf.put_u8(omitted);
-            buf.put_u16(interval);
+            buf.put_u16(interval.get());
             buf.put_u16(seqno.get());
             buf.put_u16(metric);
             buf.put_slice(&prefix[omitted as usize..octets(plen)]);
@@ -336,7 +343,7 @@ fn decode(buf: &mut &[u8]) -> Result<Tlv, TlvDecodeError> {
 
     let mut tlv = match kind {
         TlvKind::RouterId => {
-            let mut decode = || {
+            let mut decode_payload = || {
                 let _reserved = buf.try_get_u16().ok()?;
                 let router_id = buf.try_get_u64().ok()?;
 
@@ -345,58 +352,17 @@ fn decode(buf: &mut &[u8]) -> Result<Tlv, TlvDecodeError> {
                 })
             };
 
-            // When the payload fails to decode, undefine the router-id slot.
-            decode().ok_or(TlvDecodeError::MalformedStateUpdate(StateSlots {
-                router_id: true,
-                prefix_ipv4: false,
-                prefix_ipv6: false,
-            }))?
+            // When the payload is malformed, undefine the router-id slot.
+            decode_payload().ok_or(TlvDecodeError::IgnoredStateModifying(
+                StateModifier::Undefine {
+                    router_id: true,
+                    prefix_ipv4: false,
+                    prefix_ipv6: false,
+                },
+            ))?
         }
         TlvKind::Update => {
-            let mut decode = || {
-                // When AE is unavailable, undefine all slots.
-                let mut slots = StateSlots {
-                    router_id: true,
-                    prefix_ipv4: true,
-                    prefix_ipv6: true,
-                };
-
-                let ae = buf.try_get_u8().map_err(|_| slots)?;
-                let ae = AddressEncoding::new(ae);
-
-                // When Flags is unavailable, undefine the router-id slot
-                // and the default prefix slot (if any) specified by the AE.
-                slots.prefix_ipv4 = ae == Some(AddressEncoding::Ipv4);
-                slots.prefix_ipv6 = ae == Some(AddressEncoding::Ipv6);
-
-                let flags = buf.try_get_u8().map_err(|_| slots)?;
-                let flags = UpdateFlags::from_bits_retain(flags);
-
-                // When AE is unknown or the payload fails to decode, undefine
-                // the router-id slot if the Router-Id flag is set, and the default
-                // prefix slot (if any) specified by the AE if the Prefix flag is set.
-                if !flags.contains(UpdateFlags::ROUTER_ID) {
-                    slots.router_id = false;
-                }
-
-                if !flags.contains(UpdateFlags::PREFIX) {
-                    slots.prefix_ipv4 = false;
-                    slots.prefix_ipv6 = false;
-                }
-
-                let ae = ae.ok_or(slots)?;
-                decode_update_payload(ae, flags, &mut buf).ok_or(slots)
-            };
-
-            let tlv = decode().map_err(TlvDecodeError::MalformedStateUpdate)?;
-
-            // If the interval is zero, ignore the Update TLV
-            // but still allow it to update the parser state.
-            if matches!(tlv, Tlv::Update { interval: 0, .. }) {
-                return Err(TlvDecodeError::Ignored(tlv));
-            }
-
-            tlv
+            decode_update_payload(&mut buf).map_err(TlvDecodeError::IgnoredStateModifying)?
         }
         _ => decode_stateless_payload(kind, &mut buf).ok_or(TlvDecodeError::Malformed)?,
     };
@@ -405,67 +371,131 @@ fn decode(buf: &mut &[u8]) -> Result<Tlv, TlvDecodeError> {
         if let Err(SubTlvDecodeError::Overrun | SubTlvDecodeError::UnknownMandatory) =
             decode_sub_tlv(&mut tlv, &mut buf)
         {
-            return Err(TlvDecodeError::Ignored(tlv));
+            return Err(match tlv {
+                Tlv::RouterId { router_id } => {
+                    TlvDecodeError::IgnoredStateModifying(StateModifier::RouterId { router_id })
+                }
+                Tlv::Update {
+                    ae,
+                    flags,
+                    plen,
+                    omitted,
+                    prefix,
+                    ..
+                } => TlvDecodeError::IgnoredStateModifying(StateModifier::Update {
+                    ae,
+                    flags,
+                    plen,
+                    omitted,
+                    prefix,
+                }),
+                _ => TlvDecodeError::Ignored,
+            });
         }
     }
 
     Ok(tlv)
 }
 
-fn decode_update_payload(ae: AddressEncoding, flags: UpdateFlags, buf: &mut &[u8]) -> Option<Tlv> {
-    let plen = buf.try_get_u8().ok()?;
-    let omitted = buf.try_get_u8().ok()?;
-    let interval = buf.try_get_u16().ok()?;
-    let seqno = buf.try_get_u16().ok()?;
-    let metric = buf.try_get_u16().ok()?;
+fn decode_update_payload(buf: &mut &[u8]) -> Result<Tlv, StateModifier> {
+    // When AE is unavailable, undefine all slots.
+    let ae = buf.try_get_u8().map_err(|_| StateModifier::Undefine {
+        router_id: true,
+        prefix_ipv4: true,
+        prefix_ipv6: true,
+    })?;
+    let ae = AddressEncoding::new(ae);
 
-    let mut prefix = [0; 16];
+    // When Flags is unavailable, undefine the router-id slot
+    // and the default prefix slot (if any) specified by the AE.
+    let flags = buf.try_get_u8().map_err(|_| StateModifier::Undefine {
+        router_id: true,
+        prefix_ipv4: ae == Some(AddressEncoding::Ipv4),
+        prefix_ipv6: ae == Some(AddressEncoding::Ipv6),
+    })?;
+    let flags = UpdateFlags::from_bits_retain(flags);
 
-    match ae {
-        AddressEncoding::Wildcard => {
-            if metric != METRIC_INFINITE || plen != 0 || omitted != 0 {
-                return None;
+    let mut decode_rest = || {
+        let ae = ae?;
+
+        let plen = buf.try_get_u8().ok()?;
+        let omitted = buf.try_get_u8().ok()?;
+        let interval = buf.try_get_u16().ok()?;
+        let seqno = buf.try_get_u16().ok()?;
+        let metric = buf.try_get_u16().ok()?;
+
+        let mut prefix = [0; 16];
+
+        match ae {
+            AddressEncoding::Wildcard => {
+                if metric != METRIC_INFINITE || plen != 0 || omitted != 0 {
+                    return None;
+                }
             }
+            AddressEncoding::Ipv4 | AddressEncoding::Ipv6 => {
+                if !verify_plen(ae, plen) {
+                    return None;
+                }
+
+                let omitted = omitted as usize;
+                let plen_octets = octets(plen);
+
+                if omitted > plen_octets {
+                    return None;
+                }
+
+                let slice = &mut prefix[omitted..plen_octets];
+                buf.try_copy_to_slice(slice).ok()?;
+
+                // Don't clear the low-order bits here, but only
+                // after the omitted octets are filled in.
+            }
+            AddressEncoding::LinkLocalIpv6 => return None,
         }
-        AddressEncoding::Ipv4 | AddressEncoding::Ipv6 => {
-            if !verify_plen(ae, plen) {
-                return None;
-            }
 
-            let omitted = omitted as usize;
-            let plen_octets = octets(plen);
+        Some(if let Some(interval) = Interval::new(interval) {
+            Ok(Tlv::Update {
+                ae,
+                flags,
+                plen,
+                omitted,
+                interval,
+                seqno: Seqno::new(seqno),
+                metric,
+                prefix,
+            })
+        } else {
+            Err(StateModifier::Update {
+                ae,
+                flags,
+                plen,
+                omitted,
+                prefix,
+            })
+        })
+    };
 
-            if omitted > plen_octets {
-                return None;
-            }
-
-            let slice = &mut prefix[omitted..plen_octets];
-            buf.try_copy_to_slice(slice).ok()?;
-
-            // Don't clear the low-order bits here, but only
-            // after the omitted octets are filled in.
-        }
-        AddressEncoding::LinkLocalIpv6 => return None,
-    }
-
-    Some(Tlv::Update {
-        ae,
-        flags,
-        plen,
-        omitted,
-        interval,
-        seqno: Seqno::new(seqno),
-        metric,
-        prefix,
-    })
+    // When AE is unknown or the payload is malformed, undefine
+    // the router-id slot if the Router-Id flag is set, and the default
+    // prefix slot (if any) specified by the AE if the Prefix flag is set.
+    decode_rest().ok_or_else(|| StateModifier::Undefine {
+        router_id: flags.contains(UpdateFlags::ROUTER_ID),
+        prefix_ipv4: ae == Some(AddressEncoding::Ipv4) && flags.contains(UpdateFlags::PREFIX),
+        prefix_ipv6: ae == Some(AddressEncoding::Ipv6) && flags.contains(UpdateFlags::PREFIX),
+    })?
 }
 
 fn decode_stateless_payload(kind: TlvKind, buf: &mut &[u8]) -> Option<Tlv> {
     Some(match kind {
         TlvKind::Pad1 => unreachable!(),
-        TlvKind::PadN => Tlv::PadN {
-            length: buf.len() as u8,
-        },
+        TlvKind::PadN => {
+            let length = buf.len() as u8;
+
+            // Skip the MBZ field.
+            *buf = &[];
+
+            Tlv::PadN { length }
+        }
         TlvKind::AcknowledgementRequest => {
             let _reserved = buf.try_get_u16().ok()?;
             let opaque = buf.try_get_u16().ok()?;
@@ -551,7 +581,7 @@ fn decode_stateless_payload(kind: TlvKind, buf: &mut &[u8]) -> Option<Tlv> {
             }
 
             let mut prefix = [0; 16];
-            buf.try_copy_to_slice(&mut prefix[..octets(plen)]).ok();
+            buf.try_copy_to_slice(&mut prefix[..octets(plen)]).ok()?;
 
             Tlv::SeqnoRequest {
                 ae,
@@ -565,32 +595,44 @@ fn decode_stateless_payload(kind: TlvKind, buf: &mut &[u8]) -> Option<Tlv> {
     })
 }
 
-/// A set of parser state slots.
-#[derive(Clone, Copy, Debug)]
-pub struct StateSlots {
-    /// Whether the router-id slot is included.
-    pub router_id: bool,
-    /// Whether the IPv4 default prefix slot is included.
-    pub prefix_ipv4: bool,
-    /// Whether the IPv6 default prefix slot is included.
-    pub prefix_ipv6: bool,
+/// Specifies a way to modify the parser state.
+#[derive(Clone, Debug)]
+pub enum StateModifier {
+    /// Modifies the parser state like a Router-Id TLV with the same value in the field.
+    RouterId { router_id: RouterId },
+    /// Modifies the parser state like an Update TLV with the same values in the fields.
+    Update {
+        ae: AddressEncoding,
+        flags: UpdateFlags,
+        plen: u8,
+        omitted: u8,
+        prefix: [u8; 16],
+    },
+    /// Undefines the parser state slots whose corresponding fields are set to `true`.
+    Undefine {
+        router_id: bool,
+        prefix_ipv4: bool,
+        prefix_ipv6: bool,
+    },
 }
 
 /// An error occurred when decoding a TLV.
 #[derive(Clone, Debug)]
 pub enum TlvDecodeError {
-    /// The TLV overruns the packet boundary.
+    /// The buffer is overrun while reading the TLV's type, length, or payload.
     Overrun,
-    /// The TLV is malformed.
-    Malformed,
-    /// The TLV is malformed and undefines the named parser state slots.
-    MalformedStateUpdate(StateSlots),
-    /// The TLV has an unknown type.
+    /// The TLV's type is unknown.
     Unknown,
+    /// The TLV's payload is malformed; it does not modify the parser state.
+    Malformed,
+    /// The TLV is ignored due to a sub-TLV overrunning the TLV boundary or
+    /// an unknown mandatory sub-TLV; it does not modify the parser state.
+    Ignored,
     /// The TLV is ignored due to a sub-TLV overrunning the TLV boundary,
-    /// an unknown mandatory sub-TLV, or the interval field being zero
-    /// for an Update TLV; it may still update the parser state.
-    Ignored(Tlv),
+    /// an unknown mandatory sub-TLV, the Interval field being zero for
+    /// an Update TLV, or the payload being malformed; it modifies
+    /// the parser state as specified by the `StateModifier`.
+    IgnoredStateModifying(StateModifier),
 }
 
 fn decode_sub_tlv(tlv: &mut Tlv, buf: &mut &[u8]) -> Result<(), SubTlvDecodeError> {
@@ -660,12 +702,12 @@ enum SubTlvKind {
 /// An error occurred when decoding a sub-TLV.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SubTlvDecodeError {
-    /// The sub-TLV overruns the TLV boundary.
+    /// The buffer is overrun while reading the sub-TLV's type, length, or payload.
     Overrun,
-    /// The sub-TLV is malformed.
+    /// The sub-TLV's payload is malformed.
     Malformed,
-    /// The sub-TLV is unknown.
+    /// The sub-TLV's type is unknown and does not have the mandatory bit set.
     Unknown,
-    /// The sub-TLV is unknown and has a type with the mandatory bit set.
+    /// The sub-TLV's type is unknown and has the mandatory bit set.
     UnknownMandatory,
 }
