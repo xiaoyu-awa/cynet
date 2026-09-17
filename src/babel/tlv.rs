@@ -312,18 +312,18 @@ fn verify_plen(ae: AddressEncoding, plen: u8) -> bool {
 }
 
 fn decode(buf: &mut &[u8]) -> Result<Tlv, TlvDecodeError> {
-    let kind = buf.try_get_u8().map_err(|_| TlvDecodeError::Malformed)?;
+    let kind = buf.try_get_u8().map_err(|_| TlvDecodeError::Overrun)?;
 
     if kind == TlvKind::Pad1 as u8 {
         return Ok(Tlv::Pad1);
     }
 
-    let len = buf.try_get_u8().map_err(|_| TlvDecodeError::Malformed)?;
+    let len = buf.try_get_u8().map_err(|_| TlvDecodeError::Overrun)?;
 
     let Some((payload, rem)) = buf.split_at_checked(len as usize) else {
         // Malformed TLV running past the end. Skip to the end.
         *buf = &[];
-        return Err(TlvDecodeError::Malformed);
+        return Err(TlvDecodeError::Overrun);
     };
     *buf = rem;
 
@@ -402,7 +402,9 @@ fn decode(buf: &mut &[u8]) -> Result<Tlv, TlvDecodeError> {
     };
 
     while !buf.is_empty() {
-        if decode_sub_tlv(&mut tlv, &mut buf) == Err(SubTlvDecodeError::UnknownMandatory) {
+        if let Err(SubTlvDecodeError::Overrun | SubTlvDecodeError::UnknownMandatory) =
+            decode_sub_tlv(&mut tlv, &mut buf)
+        {
             return Err(TlvDecodeError::Ignored(tlv));
         }
     }
@@ -577,43 +579,45 @@ pub struct StateSlots {
 /// An error occurred when decoding a TLV.
 #[derive(Clone, Debug)]
 pub enum TlvDecodeError {
+    /// The TLV overruns the packet boundary.
+    Overrun,
     /// The TLV is malformed.
     Malformed,
     /// The TLV is malformed and undefines the named parser state slots.
     MalformedStateUpdate(StateSlots),
     /// The TLV has an unknown type.
     Unknown,
-    /// The TLV is ignored due to an unknown mandatory sub-TLV, a sub-TLV
-    /// overrunning the TLV boundary, or the interval field being zero
-    /// in an Update TLV, but may still update the parser state.
+    /// The TLV is ignored due to a sub-TLV overrunning the TLV boundary,
+    /// an unknown mandatory sub-TLV, or the interval field being zero
+    /// for an Update TLV; it may still update the parser state.
     Ignored(Tlv),
 }
 
 fn decode_sub_tlv(tlv: &mut Tlv, buf: &mut &[u8]) -> Result<(), SubTlvDecodeError> {
-    let kind = buf.try_get_u8().map_err(|_| SubTlvDecodeError::Malformed)?;
+    let kind = buf.try_get_u8().map_err(|_| SubTlvDecodeError::Overrun)?;
 
     if kind == SubTlvKind::Pad1 as u8 {
         return Ok(());
     }
 
-    let len = buf.try_get_u8().map_err(|_| SubTlvDecodeError::Malformed)?;
+    let len = buf.try_get_u8().map_err(|_| SubTlvDecodeError::Overrun)?;
 
     let Some((payload, rem)) = buf.split_at_checked(len as usize) else {
         // Malformed sub-TLV running past the end. Skip to the end.
         *buf = &[];
-        return Err(SubTlvDecodeError::Malformed);
+        return Err(SubTlvDecodeError::Overrun);
     };
     *buf = rem;
 
     // Shadow it so we can never use the wrong slice.
     let mut buf = payload;
 
-    if kind & MANDATORY_BIT != 0 {
-        return Err(SubTlvDecodeError::UnknownMandatory);
-    }
-
     let Some(kind) = SubTlvKind::from_repr(kind) else {
-        return Err(SubTlvDecodeError::Unknown);
+        return Err(if kind & MANDATORY_BIT == 0 {
+            SubTlvDecodeError::Unknown
+        } else {
+            SubTlvDecodeError::UnknownMandatory
+        });
     };
 
     if kind == SubTlvKind::Timestamp {
@@ -653,9 +657,15 @@ enum SubTlvKind {
     Timestamp = 3,
 }
 
+/// An error occurred when decoding a sub-TLV.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SubTlvDecodeError {
+    /// The sub-TLV overruns the TLV boundary.
+    Overrun,
+    /// The sub-TLV is malformed.
     Malformed,
-    UnknownMandatory,
+    /// The sub-TLV is unknown.
     Unknown,
+    /// The sub-TLV is unknown and has a type with the mandatory bit set.
+    UnknownMandatory,
 }
