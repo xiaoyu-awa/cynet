@@ -328,7 +328,7 @@ fn decode(buf: &mut &[u8]) -> Result<Tlv, TlvDecodeError> {
     let len = buf.try_get_u8().map_err(|_| TlvDecodeError::Overrun)?;
 
     let Some((payload, rem)) = buf.split_at_checked(len as usize) else {
-        // Malformed TLV running past the end. Skip to the end.
+        // Payload overruns the buffer. Skip to the end.
         *buf = &[];
         return Err(TlvDecodeError::Overrun);
     };
@@ -343,7 +343,7 @@ fn decode(buf: &mut &[u8]) -> Result<Tlv, TlvDecodeError> {
 
     let mut tlv = match kind {
         TlvKind::RouterId => {
-            let mut decode_payload = || {
+            let mut decode_body = || {
                 let _reserved = buf.try_get_u16().ok()?;
                 let router_id = buf.try_get_u64().ok()?;
 
@@ -352,8 +352,8 @@ fn decode(buf: &mut &[u8]) -> Result<Tlv, TlvDecodeError> {
                 })
             };
 
-            // When the payload is malformed, undefine the router-id slot.
-            decode_payload().ok_or(TlvDecodeError::IgnoredStateModifying(
+            // When the body is malformed, undefine the router-id slot.
+            decode_body().ok_or(TlvDecodeError::IgnoredStateModifying(
                 StateModifier::Undefine {
                     router_id: true,
                     prefix_ipv4: false,
@@ -362,9 +362,9 @@ fn decode(buf: &mut &[u8]) -> Result<Tlv, TlvDecodeError> {
             ))?
         }
         TlvKind::Update => {
-            decode_update_payload(&mut buf).map_err(TlvDecodeError::IgnoredStateModifying)?
+            decode_update_body(&mut buf).map_err(TlvDecodeError::IgnoredStateModifying)?
         }
-        _ => decode_stateless_payload(kind, &mut buf).ok_or(TlvDecodeError::Malformed)?,
+        _ => decode_state_preserving_body(kind, &mut buf).ok_or(TlvDecodeError::Malformed)?,
     };
 
     while !buf.is_empty() {
@@ -397,7 +397,7 @@ fn decode(buf: &mut &[u8]) -> Result<Tlv, TlvDecodeError> {
     Ok(tlv)
 }
 
-fn decode_update_payload(buf: &mut &[u8]) -> Result<Tlv, StateModifier> {
+fn decode_update_body(buf: &mut &[u8]) -> Result<Tlv, StateModifier> {
     // When AE is unavailable, undefine all slots.
     let ae = buf.try_get_u8().map_err(|_| StateModifier::Undefine {
         router_id: true,
@@ -406,8 +406,8 @@ fn decode_update_payload(buf: &mut &[u8]) -> Result<Tlv, StateModifier> {
     })?;
     let ae = AddressEncoding::new(ae);
 
-    // When Flags is unavailable, undefine the router-id slot
-    // and the default prefix slot (if any) specified by the AE.
+    // When Flags is unavailable, undefine the router-id slot and
+    // the default prefix slot specified by the AE (if any).
     let flags = buf.try_get_u8().map_err(|_| StateModifier::Undefine {
         router_id: true,
         prefix_ipv4: ae == Some(AddressEncoding::Ipv4),
@@ -453,6 +453,8 @@ fn decode_update_payload(buf: &mut &[u8]) -> Result<Tlv, StateModifier> {
             AddressEncoding::LinkLocalIpv6 => return None,
         }
 
+        // When Interval is zero, ignore the TLV but allow it
+        // to update the parser state like a normal one.
         Some(if let Some(interval) = Interval::new(interval) {
             Ok(Tlv::Update {
                 ae,
@@ -475,17 +477,21 @@ fn decode_update_payload(buf: &mut &[u8]) -> Result<Tlv, StateModifier> {
         })
     };
 
-    // When AE is unknown or the payload is malformed, undefine
-    // the router-id slot if the Router-Id flag is set, and the default
-    // prefix slot (if any) specified by the AE if the Prefix flag is set.
-    decode_rest().ok_or_else(|| StateModifier::Undefine {
-        router_id: flags.contains(UpdateFlags::ROUTER_ID),
-        prefix_ipv4: ae == Some(AddressEncoding::Ipv4) && flags.contains(UpdateFlags::PREFIX),
-        prefix_ipv6: ae == Some(AddressEncoding::Ipv6) && flags.contains(UpdateFlags::PREFIX),
+    // When AE is unknown or the body is malformed, undefine the router-id
+    // slot if the Router-Id flag is set, and the default prefix slot
+    // specified by the AE (if any) if the Prefix flag is set.
+    decode_rest().ok_or_else(|| {
+        let p_set = flags.contains(UpdateFlags::PREFIX);
+
+        StateModifier::Undefine {
+            router_id: flags.contains(UpdateFlags::ROUTER_ID),
+            prefix_ipv4: ae == Some(AddressEncoding::Ipv4) && p_set,
+            prefix_ipv6: ae == Some(AddressEncoding::Ipv6) && p_set,
+        }
     })?
 }
 
-fn decode_stateless_payload(kind: TlvKind, buf: &mut &[u8]) -> Option<Tlv> {
+fn decode_state_preserving_body(kind: TlvKind, buf: &mut &[u8]) -> Option<Tlv> {
     Some(match kind {
         TlvKind::Pad1 => unreachable!(),
         TlvKind::PadN => {
@@ -623,14 +629,13 @@ pub enum TlvDecodeError {
     Overrun,
     /// The TLV's type is unknown.
     Unknown,
-    /// The TLV's payload is malformed; it does not modify the parser state.
+    /// The TLV's body is malformed; it does not modify the parser state.
     Malformed,
     /// The TLV is ignored due to a sub-TLV overrunning the TLV boundary or
     /// an unknown mandatory sub-TLV; it does not modify the parser state.
     Ignored,
     /// The TLV is ignored due to a sub-TLV overrunning the TLV boundary,
-    /// an unknown mandatory sub-TLV, the Interval field being zero for
-    /// an Update TLV, or the payload being malformed; it modifies
+    /// an unknown mandatory sub-TLV, or a malformed body; it modifies
     /// the parser state as specified by the `StateModifier`.
     IgnoredStateModifying(StateModifier),
 }
@@ -644,15 +649,15 @@ fn decode_sub_tlv(tlv: &mut Tlv, buf: &mut &[u8]) -> Result<(), SubTlvDecodeErro
 
     let len = buf.try_get_u8().map_err(|_| SubTlvDecodeError::Overrun)?;
 
-    let Some((payload, rem)) = buf.split_at_checked(len as usize) else {
-        // Malformed sub-TLV running past the end. Skip to the end.
+    let Some((body, rem)) = buf.split_at_checked(len as usize) else {
+        // Body overruns the buffer. Skip to the end.
         *buf = &[];
         return Err(SubTlvDecodeError::Overrun);
     };
     *buf = rem;
 
     // Shadow it so we can never use the wrong slice.
-    let mut buf = payload;
+    let mut buf = body;
 
     let Some(kind) = SubTlvKind::from_repr(kind) else {
         return Err(if kind & MANDATORY_BIT == 0 {
@@ -663,13 +668,13 @@ fn decode_sub_tlv(tlv: &mut Tlv, buf: &mut &[u8]) -> Result<(), SubTlvDecodeErro
     };
 
     if kind == SubTlvKind::Timestamp {
-        decode_timestamp_payload(tlv, &mut buf).ok_or(SubTlvDecodeError::Malformed)?;
+        decode_timestamp_body(tlv, &mut buf).ok_or(SubTlvDecodeError::Malformed)?;
     }
 
     Ok(())
 }
 
-fn decode_timestamp_payload(tlv: &mut Tlv, buf: &mut &[u8]) -> Option<()> {
+fn decode_timestamp_body(tlv: &mut Tlv, buf: &mut &[u8]) -> Option<()> {
     match tlv {
         Tlv::Hello {
             transmit_timestamp, ..
@@ -702,9 +707,9 @@ enum SubTlvKind {
 /// An error occurred when decoding a sub-TLV.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SubTlvDecodeError {
-    /// The buffer is overrun while reading the sub-TLV's type, length, or payload.
+    /// The buffer is overrun while reading the sub-TLV's type, length, or body.
     Overrun,
-    /// The sub-TLV's payload is malformed.
+    /// The sub-TLV's body is malformed.
     Malformed,
     /// The sub-TLV's type is unknown and does not have the mandatory bit set.
     Unknown,
