@@ -1,19 +1,15 @@
 mod base;
 mod defaults;
 mod packet;
-mod tlv;
 
-use std::{
-    collections::{HashMap, VecDeque},
-    net::Ipv6Addr,
-};
+use std::{collections::HashMap, net::Ipv6Addr};
 
 use tokio_util::time::{DelayQueue, delay_queue::Key as TimerKey};
 
 use crate::{
     babel::{
         base::{HelloHistory, RouterId, Seqno},
-        tlv::Tlv,
+        packet::PacketEncoder,
     },
     wireguard::LinkKey,
 };
@@ -87,6 +83,11 @@ pub enum Timeout {
     OutgoingTlv,
 }
 
+pub struct TlvBuffer {
+    encoder: PacketEncoder,
+    timer_key: TimerKey,
+}
+
 pub struct State {
     seqno: Seqno,
     hello_seqno: Seqno,
@@ -98,5 +99,5 @@ pub struct State {
     route_table: RouteTable,
     pending_seqno_request_table: PendingSeqnoRequestTable,
     timeout_queue: DelayQueue<Timeout>,
-    tlv_buffer: VecDeque<(Tlv, Option<LinkKey>)>,
+    tlv_buffers: HashMap<LinkKey, TlvBuffer>,
 }

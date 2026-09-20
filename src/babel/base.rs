@@ -1,30 +1,41 @@
 use std::{
-    num::NonZeroU16,
+    num::{NonZeroU16, NonZeroU64},
     ops::{Add, Sub},
+    sync::LazyLock,
     time::Duration,
 };
 
+use tokio::time::Instant;
+
 /// A router-id, assumed unique across the routing domain.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct RouterId(u64);
+pub struct RouterId(NonZeroU64);
 
 impl RouterId {
     /// Creates a router-id from a `u64`, returning `None` if it equals `0` or `u64::MAX`.
     pub fn new(n: u64) -> Option<Self> {
-        if n == 0 || n == u64::MAX {
+        if n == u64::MAX {
             None
         } else {
-            Some(Self(n))
+            NonZeroU64::new(n).map(Self)
         }
     }
 
     /// Returns the router-id as a `u64`.
     pub fn get(self) -> u64 {
-        self.0
+        self.0.get()
     }
 }
 
-/// A way of encoding addresses.
+/// An address encoding (AE).
+///
+/// For this implementation, AE 3 is not used in Next Hop or IHU TLVs
+/// for the reason described at [`Tlv`] and [`Tlv::Ihu`]. In practice,
+/// AE 3 is also not used in Update, Route Request, and Seqno Request
+/// TLVs. It is thus safe not to include AE 3 as a known AE at all.
+///
+/// [`Tlv`]: super::packet::tlv::Tlv
+/// [`Tlv::Ihu`]: super::packet::tlv::Tlv::Ihu
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AddressEncoding {
     /// Wildcard address. The value is 0 octets long.
@@ -33,8 +44,6 @@ pub enum AddressEncoding {
     Ipv4 = 1,
     /// IPv6 address. Compression is allowed. 16 octets or less.
     Ipv6 = 2,
-    /// Link-local IPv6 address. Compression is not allowed. The value is 8 octets long, a prefix of fe80::/64 is implied.
-    LinkLocalIpv6 = 3,
 }
 
 impl AddressEncoding {
@@ -44,9 +53,17 @@ impl AddressEncoding {
             0 => Self::Wildcard,
             1 => Self::Ipv4,
             2 => Self::Ipv6,
-            3 => Self::LinkLocalIpv6,
             _ => return None,
         })
+    }
+
+    /// Returns the maximum prefix length supported by this address encoding.
+    pub fn max_plen(self) -> u8 {
+        match self {
+            AddressEncoding::Wildcard => 0,
+            AddressEncoding::Ipv4 => 32,
+            AddressEncoding::Ipv6 => 128,
+        }
     }
 }
 
@@ -201,4 +218,12 @@ impl HelloHistory {
             HelloEffect::None
         }
     }
+}
+
+// TODO: It may be desirable to subtract a random offset from this,
+// but that comes at the cost of nondeterminism. Hold off for now.
+static TIMESTAMP_ORIGIN: LazyLock<Instant> = LazyLock::new(Instant::now);
+
+pub fn timestamp_now() -> u32 {
+    TIMESTAMP_ORIGIN.elapsed().as_micros() as u32
 }

@@ -21,10 +21,12 @@ const MANDATORY_BIT: u8 = 0x80;
 
 /// A TLV contained in a Babel packet.
 ///
-/// Next Hop TLVs are irrelevant for this implementation.
+/// For this implementation, all links are point-to-point, so there is only one next hop over each link. Thus, there is no need to assign a link-local address, and any next-hop address would be purely wrong, hence the following treatment.
+///
+/// Next Hop TLVs are never sent and are silently ignored on reception.
 #[derive(Clone, Debug, EnumDiscriminants, Eq, PartialEq)]
 #[repr(u8)]
-#[strum_discriminants(derive(FromRepr), name(TlvKind), vis(pub(self)))]
+#[strum_discriminants(derive(FromRepr), name(TlvKind), vis(pub(super)))]
 pub enum Tlv {
     Pad1 = 0,
     PadN {
@@ -56,7 +58,9 @@ pub enum Tlv {
     } = 4,
     /// An IHU TLV.
     ///
-    /// The AE field is sent as 0. IHU TLVs with a nonzero value in the AE field are silently ignored.
+    /// For this implementation, all links are point-to-point, so there is only one next hop over each link. Thus, there is no need to assign a link-local address, and any destination address would be purely wrong, hence the following treatment.
+    ///
+    /// The AE field is sent as 0. IHU TLVs with a nonzero value in the AE field are silently ignored. The Address field always contains 0 octets.
     Ihu {
         /// The rxcost according to the sending node of the interface whose address is specified in the Address field. The value FFFF hexadecimal (infinity) indicates that this interface is unreachable.
         rxcost: u16,
@@ -96,6 +100,8 @@ pub enum Tlv {
         /// The sender's metric for this route. The value FFFF hexadecimal (infinity) means that this is a route retraction.
         metric: u16,
         /// The prefix being advertised. This field's size is (Plen/8 - Omitted) rounded upwards.
+        ///
+        /// This field's value starts from index 0 of the array.
         prefix: [u8; 16],
     } = 8,
     RouteRequest {
@@ -104,6 +110,8 @@ pub enum Tlv {
         /// The length in bits of the requested prefix.
         plen: u8,
         /// The prefix being requested. This field's size is Plen/8 rounded upwards.
+        ///
+        /// This field's value starts from index 0 of the array.
         prefix: [u8; 16],
     } = 9,
     SeqnoRequest {
@@ -118,6 +126,8 @@ pub enum Tlv {
         /// The Router-Id that is being requested. This MUST NOT consist of all zeroes or all ones.
         router_id: RouterId,
         /// The prefix being requested. This field's size is Plen/8 rounded upwards.
+        ///
+        /// This field's value starts from index 0 of the array.
         prefix: [u8; 16],
     } = 10,
 }
@@ -134,18 +144,15 @@ impl Tlv {
             Self::PadN { length } => 2 + length as usize,
             Self::AcknowledgementRequest { .. } => 8,
             Self::Acknowledgement { .. } => 4,
-            Self::Hello {
-                transmit_timestamp, ..
-            } => 8 + transmit_timestamp.map_or(0, |_| 6),
+            // Hello TLVs are always encoded with a 4-octet sub-TLV, either Timestamp or PadN.
+            Self::Hello { .. } => 8 + 6,
             Self::Ihu {
                 origin_receive_timestamps,
                 ..
             } => 8 + origin_receive_timestamps.map_or(0, |_| 10),
             Self::RouterId { .. } => 12,
             Self::Update { plen, omitted, .. } => {
-                12 + octets(plen)
-                    .checked_sub(omitted as usize)
-                    .expect("Update should not omit more octets than the prefix contains")
+                12 + octets(plen).saturating_sub(omitted as usize)
             }
             Self::RouteRequest { plen, .. } => 4 + octets(plen),
             Self::SeqnoRequest { plen, .. } => 16 + octets(plen),
@@ -198,6 +205,11 @@ fn encode_payload(tlv: &Tlv, mut buf: &mut [u8]) -> usize {
                 buf.put_u8(SubTlvKind::Timestamp as u8); // Type
                 buf.put_u8(4); // Length
                 buf.put_u32(transmit_timestamp);
+            } else {
+                // Emit a placeholder for Timestamp.
+                buf.put_u8(SubTlvKind::PadN as u8); // Type
+                buf.put_u8(4); // Length
+                buf.put_u32(0); // Placeholder for Transmit Timestamp
             }
         }
         Tlv::Ihu {
@@ -235,21 +247,19 @@ fn encode_payload(tlv: &Tlv, mut buf: &mut [u8]) -> usize {
                 AddressEncoding::Wildcard => {
                     assert!(
                         metric == METRIC_INFINITE && plen == 0 && omitted == 0,
-                        "Update with AE 0 should carry infinite metric, plen=0, and omitted=0"
+                        "Update with AE 0 should carry infinite metric, Plen=0, and Omitted=0"
                     );
                 }
                 AddressEncoding::Ipv4 | AddressEncoding::Ipv6 => {
                     assert!(
-                        verify_plen(ae, plen),
-                        "Update with AE 1 or 2 should not carry overlarge plen"
+                        plen <= ae.max_plen(),
+                        "Update should not carry overlarge Plen"
                     );
+
                     assert!(
                         omitted as usize <= octets(plen),
-                        "Update should not omit more octets than the prefix contains"
+                        "Update should not omit more octets than enough to hold the prefix"
                     );
-                }
-                AddressEncoding::LinkLocalIpv6 => {
-                    panic!("Update should not carry AE 3");
                 }
             }
 
@@ -260,17 +270,12 @@ fn encode_payload(tlv: &Tlv, mut buf: &mut [u8]) -> usize {
             buf.put_u16(interval.get());
             buf.put_u16(seqno.get());
             buf.put_u16(metric);
-            buf.put_slice(&prefix[omitted as usize..octets(plen)]);
+            buf.put_slice(&prefix[..octets(plen) - omitted as usize]);
         }
         Tlv::RouteRequest { ae, plen, prefix } => {
             assert!(
-                ae != AddressEncoding::LinkLocalIpv6,
-                "Route Request should not carry AE 3"
-            );
-
-            assert!(
-                verify_plen(ae, plen),
-                "Route Request should not carry overlarge plen"
+                plen <= ae.max_plen(),
+                "Route Request should not carry overlarge Plen"
             );
 
             buf.put_u8(ae as u8);
@@ -286,13 +291,13 @@ fn encode_payload(tlv: &Tlv, mut buf: &mut [u8]) -> usize {
             prefix,
         } => {
             assert!(
-                ae != AddressEncoding::Wildcard && ae != AddressEncoding::LinkLocalIpv6,
-                "Seqno Request should not carry AE 0 or 3"
+                ae != AddressEncoding::Wildcard,
+                "Seqno Request should not carry AE 0"
             );
 
             assert!(
-                verify_plen(ae, plen),
-                "Seqno Request should not carry overlarge plen"
+                plen <= ae.max_plen(),
+                "Seqno Request should not carry overlarge Plen"
             );
 
             buf.put_u8(ae as u8);
@@ -306,16 +311,6 @@ fn encode_payload(tlv: &Tlv, mut buf: &mut [u8]) -> usize {
     }
 
     init_buf_len - buf.len()
-}
-
-fn verify_plen(ae: AddressEncoding, plen: u8) -> bool {
-    let plen_max = match ae {
-        AddressEncoding::Wildcard => 0,
-        AddressEncoding::Ipv4 => 32,
-        AddressEncoding::Ipv6 => 128,
-        AddressEncoding::LinkLocalIpv6 => unreachable!(),
-    };
-    plen <= plen_max
 }
 
 fn decode(buf: &mut &[u8]) -> Result<Tlv, TlvDecodeError> {
@@ -433,7 +428,7 @@ fn decode_update_body(buf: &mut &[u8]) -> Result<Tlv, StateModifier> {
                 }
             }
             AddressEncoding::Ipv4 | AddressEncoding::Ipv6 => {
-                if !verify_plen(ae, plen) {
+                if plen > ae.max_plen() {
                     return None;
                 }
 
@@ -444,13 +439,12 @@ fn decode_update_body(buf: &mut &[u8]) -> Result<Tlv, StateModifier> {
                     return None;
                 }
 
-                let slice = &mut prefix[omitted..plen_octets];
-                buf.try_copy_to_slice(slice).ok()?;
+                let prefix = &mut prefix[..plen_octets - omitted];
+                buf.try_copy_to_slice(prefix).ok()?;
 
                 // Don't clear the low-order bits here, but only
                 // after the omitted octets are filled in.
             }
-            AddressEncoding::LinkLocalIpv6 => return None,
         }
 
         // When Interval is zero, ignore the TLV but allow it
@@ -555,11 +549,7 @@ fn decode_state_preserving_body(kind: TlvKind, buf: &mut &[u8]) -> Option<Tlv> {
 
             let ae = AddressEncoding::new(ae)?;
 
-            if ae == AddressEncoding::LinkLocalIpv6 {
-                return None;
-            }
-
-            if !verify_plen(ae, plen) {
+            if plen > ae.max_plen() {
                 return None;
             }
 
@@ -578,11 +568,11 @@ fn decode_state_preserving_body(kind: TlvKind, buf: &mut &[u8]) -> Option<Tlv> {
 
             let ae = AddressEncoding::new(ae)?;
 
-            if ae == AddressEncoding::Wildcard || ae == AddressEncoding::LinkLocalIpv6 {
+            if ae == AddressEncoding::Wildcard {
                 return None;
             }
 
-            if !verify_plen(ae, plen) {
+            if plen > ae.max_plen() {
                 return None;
             }
 
@@ -636,7 +626,7 @@ pub enum TlvDecodeError {
     Ignored,
     /// The TLV is ignored due to a sub-TLV overrunning the TLV boundary,
     /// an unknown mandatory sub-TLV, or a malformed body; it modifies
-    /// the parser state as specified by the `StateModifier`.
+    /// the parser state as specified by the [`StateModifier`].
     IgnoredStateModifying(StateModifier),
 }
 
@@ -698,7 +688,7 @@ fn decode_timestamp_body(tlv: &mut Tlv, buf: &mut &[u8]) -> Option<()> {
 
 #[derive(Clone, Copy, Debug, Eq, FromRepr, PartialEq)]
 #[repr(u8)]
-enum SubTlvKind {
+pub(super) enum SubTlvKind {
     Pad1 = 0,
     PadN = 1,
     Timestamp = 3,
