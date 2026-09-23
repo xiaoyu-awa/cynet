@@ -28,14 +28,6 @@ impl RouterId {
 }
 
 /// An address encoding (AE).
-///
-/// For this implementation, AE 3 is not used in Next Hop or IHU TLVs
-/// for the reason described at [`Tlv`] and [`Tlv::Ihu`]. In practice,
-/// AE 3 is also not used in Update, Route Request, and Seqno Request
-/// TLVs. It is thus safe not to include AE 3 as a known AE at all.
-///
-/// [`Tlv`]: super::packet::tlv::Tlv
-/// [`Tlv::Ihu`]: super::packet::tlv::Tlv::Ihu
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AddressEncoding {
     /// Wildcard address. The value is 0 octets long.
@@ -44,6 +36,10 @@ pub enum AddressEncoding {
     Ipv4 = 1,
     /// IPv6 address. Compression is allowed. 16 octets or less.
     Ipv6 = 2,
+    /// Link-local IPv6 address. Compression is not allowed. The value is 8 octets long, a prefix of fe80::/64 is implied.
+    LinkLocalIpv6 = 3,
+    /// RFC 9229: v4-via-v6. Value encoding identical to AE 1.
+    V4ViaV6 = 4,
 }
 
 impl AddressEncoding {
@@ -53,6 +49,8 @@ impl AddressEncoding {
             0 => Self::Wildcard,
             1 => Self::Ipv4,
             2 => Self::Ipv6,
+            3 => Self::LinkLocalIpv6,
+            4 => Self::V4ViaV6,
             _ => return None,
         })
     }
@@ -60,9 +58,10 @@ impl AddressEncoding {
     /// Returns the maximum prefix length supported by this address encoding.
     pub fn max_plen(self) -> u8 {
         match self {
-            AddressEncoding::Wildcard => 0,
-            AddressEncoding::Ipv4 => 32,
-            AddressEncoding::Ipv6 => 128,
+            Self::Wildcard => 0,
+            Self::Ipv4 | Self::V4ViaV6 => 32,
+            Self::Ipv6 => 128,
+            Self::LinkLocalIpv6 => panic!("Plen is undefined for AE 3"),
         }
     }
 }
