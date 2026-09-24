@@ -1,3 +1,6 @@
+#[cfg(test)]
+mod tests;
+
 use std::num::NonZeroU8;
 
 use bytes::{Buf, BufMut};
@@ -40,7 +43,7 @@ const MANDATORY_BIT: u8 = 0x80;
 /// Next Hop TLVs are never sent and are silently ignored on reception.
 #[derive(Clone, Debug, EnumDiscriminants, Eq, PartialEq)]
 #[repr(u8)]
-#[strum_discriminants(derive(FromRepr), name(TlvKind), vis(pub(super)))]
+#[strum_discriminants(derive(FromRepr), name(TlvKind), vis(pub(self)))]
 pub enum Tlv {
     Pad1 = 0,
     PadN {
@@ -126,7 +129,7 @@ pub enum Tlv {
         plen: u8,
         /// The prefix being requested. This field's size is Plen/8 rounded upwards.
         ///
-        /// This field's value starts from index 0 of the array.
+        /// This field's value starts from index 0 of the array. Any bits beyond Plen must be cleared, and are cleared on decoding.
         prefix: [u8; 16],
     } = 9,
     SeqnoRequest {
@@ -142,7 +145,7 @@ pub enum Tlv {
         router_id: RouterId,
         /// The prefix being requested. This field's size is Plen/8 rounded upwards.
         ///
-        /// This field's value starts from index 0 of the array.
+        /// This field's value starts from index 0 of the array. Any bits beyond Plen must be cleared, and are cleared on decoding.
         prefix: [u8; 16],
     } = 10,
 }
@@ -152,6 +155,18 @@ pub(super) fn octets(plen: u8) -> usize {
     (plen as usize).div_ceil(8)
 }
 
+/// Clears the bits of a prefix beyond `plen`.
+pub(super) fn mask_prefix(mut prefix: [u8; 16], plen: u8) -> [u8; 16] {
+    let plen_octets = octets(plen);
+
+    prefix[plen_octets..].fill(0);
+    if !plen.is_multiple_of(8) {
+        prefix[plen_octets - 1] &= 0xff << (8 - plen % 8);
+    }
+
+    prefix
+}
+
 impl Tlv {
     pub fn encoded_len(&self) -> usize {
         match *self {
@@ -159,8 +174,9 @@ impl Tlv {
             Self::PadN { length } => 2 + length as usize,
             Self::AcknowledgementRequest { .. } => 8,
             Self::Acknowledgement { .. } => 4,
-            // Hello TLVs are always encoded with a 4-octet sub-TLV, either Timestamp or PadN.
-            Self::Hello { .. } => 8 + 6,
+            Self::Hello {
+                transmit_timestamp, ..
+            } => 8 + transmit_timestamp.map_or(0, |_| 6),
             Self::Ihu {
                 origin_receive_timestamps,
                 ..
@@ -220,11 +236,6 @@ fn encode_payload(tlv: &Tlv, mut buf: &mut [u8]) -> usize {
                 buf.put_u8(SubTlvKind::Timestamp as u8); // Type
                 buf.put_u8(4); // Length
                 buf.put_u32(transmit_timestamp);
-            } else {
-                // Emit a placeholder for Timestamp.
-                buf.put_u8(SubTlvKind::PadN as u8); // Type
-                buf.put_u8(4); // Length
-                buf.put_u32(0); // Placeholder for Transmit Timestamp
             }
         }
         Tlv::Ihu {
@@ -297,12 +308,17 @@ fn encode_payload(tlv: &Tlv, mut buf: &mut [u8]) -> usize {
         Tlv::RouteRequest { ae, plen, prefix } => {
             assert!(
                 ae != AddressEncoding::LinkLocalIpv6 && ae != AddressEncoding::V4ViaV6,
-                "Seqno Request should not carry AE 3 or 4"
+                "Route Request should not carry AE 3 or 4"
             );
 
             assert!(
                 plen <= ae.max_plen(),
                 "Route Request should not carry overlarge Plen"
+            );
+
+            assert!(
+                prefix == mask_prefix(prefix, plen),
+                "Route Request should not carry a prefix with bits set beyond Plen"
             );
 
             buf.put_u8(ae as u8);
@@ -327,6 +343,11 @@ fn encode_payload(tlv: &Tlv, mut buf: &mut [u8]) -> usize {
             assert!(
                 plen <= ae.max_plen(),
                 "Seqno Request should not carry overlarge Plen"
+            );
+
+            assert!(
+                prefix == mask_prefix(prefix, plen),
+                "Seqno Request should not carry a prefix with bits set beyond Plen"
             );
 
             buf.put_u8(ae as u8);
@@ -598,7 +619,11 @@ fn decode_state_irrelevant_body(kind: TlvKind, buf: &mut &[u8]) -> Option<Tlv> {
             let mut prefix = [0; 16];
             buf.try_copy_to_slice(&mut prefix[..octets(plen)]).ok()?;
 
-            Tlv::RouteRequest { ae, plen, prefix }
+            Tlv::RouteRequest {
+                ae,
+                plen,
+                prefix: mask_prefix(prefix, plen),
+            }
         }
         TlvKind::SeqnoRequest => {
             let ae = buf.try_get_u8().ok()?;
@@ -627,14 +652,14 @@ fn decode_state_irrelevant_body(kind: TlvKind, buf: &mut &[u8]) -> Option<Tlv> {
                 seqno: Seqno::new(seqno),
                 hop_count: NonZeroU8::new(hop_count)?,
                 router_id: RouterId::new(router_id)?,
-                prefix,
+                prefix: mask_prefix(prefix, plen),
             }
         }
     })
 }
 
 /// Specifies a way to modify the parser state.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StateModifier {
     /// Modifies the parser state like a Router-Id TLV with the same value in the field.
     RouterId { router_id: RouterId },
@@ -656,7 +681,7 @@ pub enum StateModifier {
 }
 
 /// An error occurred when decoding a TLV.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TlvDecodeError {
     /// The buffer is overrun while reading the TLV's type, length, or payload.
     Overrun,
@@ -731,7 +756,7 @@ fn decode_timestamp_body(tlv: &mut Tlv, buf: &mut &[u8]) -> Option<()> {
 
 #[derive(Clone, Copy, Debug, Eq, FromRepr, PartialEq)]
 #[repr(u8)]
-pub(super) enum SubTlvKind {
+enum SubTlvKind {
     Pad1 = 0,
     PadN = 1,
     Timestamp = 3,

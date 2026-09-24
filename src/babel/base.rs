@@ -43,7 +43,7 @@ pub enum AddressEncoding {
 }
 
 impl AddressEncoding {
-    /// Creates an `AddressEncoding` from a `u8`, returning `None` if it is greater than 3.
+    /// Creates an `AddressEncoding` from a `u8`, returning `None` if it is greater than 4.
     pub fn new(n: u8) -> Option<Self> {
         Some(match n {
             0 => Self::Wildcard,
