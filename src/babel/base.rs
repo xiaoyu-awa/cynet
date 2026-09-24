@@ -29,7 +29,7 @@ impl RouterId {
 
 /// An address encoding (AE).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum AddressEncoding {
+pub enum Ae {
     /// Wildcard address. The value is 0 octets long.
     Wildcard = 0,
     /// IPv4 address. Compression is allowed. 4 octets or less.
@@ -42,8 +42,8 @@ pub enum AddressEncoding {
     V4ViaV6 = 4,
 }
 
-impl AddressEncoding {
-    /// Creates an `AddressEncoding` from a `u8`, returning `None` if it is greater than 4.
+impl Ae {
+    /// Creates an `Ae` from a `u8`, returning `None` if it is greater than 4.
     pub fn new(n: u8) -> Option<Self> {
         Some(match n {
             0 => Self::Wildcard,

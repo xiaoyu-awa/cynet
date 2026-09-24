@@ -6,7 +6,7 @@ mod tests;
 use std::{array, num::NonZeroUsize};
 
 use crate::babel::{
-    base::{AddressEncoding, Interval, RouterId, Seqno, timestamp_now},
+    base::{Ae, Interval, RouterId, Seqno, timestamp_now},
     packet::tlv::{
         METRIC_INFINITE, StateModifier, Tlv, TlvDecodeError, UpdateFlags, mask_prefix, octets,
     },
@@ -21,7 +21,7 @@ const VERSION: u8 = 2;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Update {
     /// The encoding of the Prefix field.
-    pub ae: AddressEncoding,
+    pub ae: Ae,
     /// The length in bits of the advertised prefix.
     pub plen: u8,
     /// An upper bound, expressed in centiseconds, on the time after which the sending node will send a new update for this prefix. This MUST NOT be 0. The receiving node will use this value to compute a hold time for the route table entry. The value FFFF hexadecimal (infinity) expresses that this announcement will not be repeated unless a request is received (Section 3.8.2.3).
@@ -223,7 +223,7 @@ impl PacketEncoder {
         } = *update;
 
         assert!(
-            ae == AddressEncoding::Wildcard || ae == AddressEncoding::Ipv6,
+            ae == Ae::Wildcard || ae == Ae::Ipv6,
             "Update should carry AE 0 or 2"
         );
         assert!(
@@ -237,7 +237,7 @@ impl PacketEncoder {
         };
         let mut omitted = 0;
 
-        if ae == AddressEncoding::Ipv6 {
+        if ae == Ae::Ipv6 {
             assert!(
                 prefix == mask_prefix(prefix, plen),
                 "Update should not carry a prefix with bits set beyond Plen"
@@ -373,36 +373,28 @@ impl<'a> PacketDecoder<'a> {
 
     /// Returns the current default prefix for `ae`, or `None`
     /// if it is undefined or `ae` does not allow compression.
-    fn default_prefix(&self, ae: AddressEncoding) -> Option<&[u8]> {
+    fn default_prefix(&self, ae: Ae) -> Option<&[u8]> {
         match ae {
-            AddressEncoding::Ipv4 => self.prefix_ipv4.as_ref().map(|p| &p[..]),
-            AddressEncoding::Ipv6 => self.prefix_ipv6.as_ref().map(|p| &p[..]),
-            AddressEncoding::V4ViaV6 => self.prefix_v4_via_v6.as_ref().map(|p| &p[..]),
-            AddressEncoding::Wildcard | AddressEncoding::LinkLocalIpv6 => None,
+            Ae::Ipv4 => self.prefix_ipv4.as_ref().map(|p| &p[..]),
+            Ae::Ipv6 => self.prefix_ipv6.as_ref().map(|p| &p[..]),
+            Ae::V4ViaV6 => self.prefix_v4_via_v6.as_ref().map(|p| &p[..]),
+            Ae::Wildcard | Ae::LinkLocalIpv6 => None,
         }
     }
 
     /// Sets the default prefix for `ae`, doing nothing if `ae` does not allow compression.
-    fn set_default_prefix(&mut self, ae: AddressEncoding, prefix: Option<&[u8; 16]>) {
+    fn set_default_prefix(&mut self, ae: Ae, prefix: Option<&[u8; 16]>) {
         match ae {
-            AddressEncoding::Ipv4 => self.prefix_ipv4 = prefix.map(|p| *p.first_chunk().unwrap()),
-            AddressEncoding::Ipv6 => self.prefix_ipv6 = prefix.copied(),
-            AddressEncoding::V4ViaV6 => {
-                self.prefix_v4_via_v6 = prefix.map(|p| *p.first_chunk().unwrap());
-            }
-            AddressEncoding::Wildcard | AddressEncoding::LinkLocalIpv6 => {}
+            Ae::Ipv4 => self.prefix_ipv4 = prefix.map(|p| *p.first_chunk().unwrap()),
+            Ae::Ipv6 => self.prefix_ipv6 = prefix.copied(),
+            Ae::V4ViaV6 => self.prefix_v4_via_v6 = prefix.map(|p| *p.first_chunk().unwrap()),
+            Ae::Wildcard | Ae::LinkLocalIpv6 => {}
         }
     }
 
     /// Computes the prefix advertised by an Update TLV, returning `None`
     /// if the omitted octets cannot be taken from a default prefix.
-    fn expand_prefix(
-        &self,
-        ae: AddressEncoding,
-        plen: u8,
-        omitted: u8,
-        prefix: [u8; 16],
-    ) -> Option<[u8; 16]> {
+    fn expand_prefix(&self, ae: Ae, plen: u8, omitted: u8, prefix: [u8; 16]) -> Option<[u8; 16]> {
         let omitted = omitted as usize;
         let plen_octets = octets(plen);
 
@@ -420,7 +412,7 @@ impl<'a> PacketDecoder<'a> {
     /// returning the advertised prefix, or `None` if it cannot be computed.
     fn update_state(
         &mut self,
-        ae: AddressEncoding,
+        ae: Ae,
         flags: UpdateFlags,
         plen: u8,
         omitted: u8,
@@ -480,13 +472,11 @@ impl<'a> PacketDecoder<'a> {
 
 /// Computes a router-id from the first address of a prefix,
 /// returning `None` if it is invalid.
-fn router_id_from_prefix(ae: AddressEncoding, prefix: &[u8; 16]) -> Option<RouterId> {
+fn router_id_from_prefix(ae: Ae, prefix: &[u8; 16]) -> Option<RouterId> {
     let n = match ae {
-        AddressEncoding::Ipv4 | AddressEncoding::V4ViaV6 => {
-            u32::from_be_bytes(*prefix.first_chunk().unwrap()) as u64
-        }
-        AddressEncoding::Ipv6 => u64::from_be_bytes(*prefix.last_chunk().unwrap()),
-        AddressEncoding::Wildcard | AddressEncoding::LinkLocalIpv6 => return None,
+        Ae::Ipv4 | Ae::V4ViaV6 => u32::from_be_bytes(*prefix.first_chunk().unwrap()) as u64,
+        Ae::Ipv6 => u64::from_be_bytes(*prefix.last_chunk().unwrap()),
+        Ae::Wildcard | Ae::LinkLocalIpv6 => return None,
     };
     RouterId::new(n)
 }

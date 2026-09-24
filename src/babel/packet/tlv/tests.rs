@@ -1,5 +1,5 @@
 use super::*;
-use crate::babel::base::AddressEncoding::{Ipv4, Ipv6, LinkLocalIpv6, V4ViaV6, Wildcard};
+use crate::babel::base::Ae::{Ipv4, Ipv6, LinkLocalIpv6, V4ViaV6, Wildcard};
 use TlvDecodeError::{Ignored, Malformed, Overrun, Unknown};
 
 const P: u8 = UPDATE_FLAG_PREFIX;
@@ -35,11 +35,7 @@ fn hello(interval: Option<u16>, transmit_timestamp: Option<u32>) -> Tlv {
     }
 }
 
-fn ihu(
-    ae: AddressEncoding,
-    address: [u8; 8],
-    origin_receive_timestamps: Option<(u32, u32)>,
-) -> Tlv {
+fn ihu(ae: Ae, address: [u8; 8], origin_receive_timestamps: Option<(u32, u32)>) -> Tlv {
     Tlv::Ihu {
         ae,
         rxcost: 96,
@@ -50,7 +46,7 @@ fn ihu(
 }
 
 /// Returns an Update TLV with Interval 400 and Seqno 7.
-fn update(ae: AddressEncoding, flags: u8, plen: u8, omitted: u8, metric: u16, bytes: &[u8]) -> Tlv {
+fn update(ae: Ae, flags: u8, plen: u8, omitted: u8, metric: u16, bytes: &[u8]) -> Tlv {
     Tlv::Update {
         ae,
         flags: UpdateFlags::from_bits(flags),
@@ -64,7 +60,7 @@ fn update(ae: AddressEncoding, flags: u8, plen: u8, omitted: u8, metric: u16, by
 }
 
 /// Returns a Seqno Request TLV with Seqno 0x0102, Hop Count 64, and router-id `RID`.
-fn seqno_request(ae: AddressEncoding, plen: u8, bytes: &[u8]) -> Tlv {
+fn seqno_request(ae: Ae, plen: u8, bytes: &[u8]) -> Tlv {
     Tlv::SeqnoRequest {
         ae,
         plen,

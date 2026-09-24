@@ -6,7 +6,7 @@ use std::num::NonZeroU8;
 use bytes::{Buf, BufMut};
 use strum::{EnumDiscriminants, FromRepr};
 
-use crate::babel::base::{AddressEncoding, Interval, RouterId, Seqno};
+use crate::babel::base::{Ae, Interval, RouterId, Seqno};
 
 const HELLO_FLAG_UNICAST: u16 = 0x8000;
 
@@ -77,7 +77,7 @@ pub enum Tlv {
         /// The encoding of the Address field. This should be 1 or 3 in most cases. As an optimisation, it MAY be 0 if the TLV is sent to a unicast address, if the association is over a point-to-point link, or when bidirectional reachability is ascertained by means outside of the Babel protocol.
         ///
         /// For this implementation, this should only be 0 or 3. It must be sent as 0. IHU TLVs with an AE other than 0 and 3 are silently ignored.
-        ae: AddressEncoding,
+        ae: Ae,
         /// The rxcost according to the sending node of the interface whose address is specified in the Address field. The value FFFF hexadecimal (infinity) indicates that this interface is unreachable.
         rxcost: u16,
         /// An upper bound, expressed in centiseconds, on the time after which the sending node will send a new IHU; this MUST NOT be 0. The receiving node will use this value in order to compute a hold time for this symmetric association.
@@ -97,7 +97,7 @@ pub enum Tlv {
     } = 6,
     Update {
         /// The encoding of the Prefix field.
-        ae: AddressEncoding,
+        ae: Ae,
         /// The individual bits of this field specify special handling of this TLV (see below).
         ///
         /// P (Prefix) flag (80 hexadecimal): if set, then this Update TLV establishes a new default prefix for subsequent Update TLVs with a matching address encoding within the same packet, even if this TLV is otherwise ignored due to an unknown mandatory sub-TLV;
@@ -124,7 +124,7 @@ pub enum Tlv {
     } = 8,
     RouteRequest {
         /// The encoding of the Prefix field. The value 0 specifies that this is a request for a full route table dump (a wildcard request).
-        ae: AddressEncoding,
+        ae: Ae,
         /// The length in bits of the requested prefix.
         plen: u8,
         /// The prefix being requested. This field's size is Plen/8 rounded upwards.
@@ -134,7 +134,7 @@ pub enum Tlv {
     } = 9,
     SeqnoRequest {
         /// The encoding of the Prefix field. This MUST NOT be 0.
-        ae: AddressEncoding,
+        ae: Ae,
         /// The length in bits of the requested prefix.
         plen: u8,
         /// The sequence number that is being requested.
@@ -245,7 +245,7 @@ fn encode_payload(tlv: &Tlv, mut buf: &mut [u8]) -> usize {
             address: _,
             origin_receive_timestamps,
         } => {
-            assert!(ae == AddressEncoding::Wildcard, "IHU should carry AE 0");
+            assert!(ae == Ae::Wildcard, "IHU should carry AE 0");
 
             buf.put_u8(ae as u8); // AE
             buf.put_u8(0); // Reserved
@@ -274,13 +274,13 @@ fn encode_payload(tlv: &Tlv, mut buf: &mut [u8]) -> usize {
             prefix,
         } => {
             match ae {
-                AddressEncoding::Wildcard => {
+                Ae::Wildcard => {
                     assert!(
                         metric == METRIC_INFINITE && plen == 0 && omitted == 0,
                         "Update with AE 0 should carry infinite metric, Plen=0, and Omitted=0"
                     );
                 }
-                AddressEncoding::Ipv4 | AddressEncoding::Ipv6 | AddressEncoding::V4ViaV6 => {
+                Ae::Ipv4 | Ae::Ipv6 | Ae::V4ViaV6 => {
                     assert!(
                         plen <= ae.max_plen(),
                         "Update should not carry overlarge Plen"
@@ -291,7 +291,7 @@ fn encode_payload(tlv: &Tlv, mut buf: &mut [u8]) -> usize {
                         "Update should not omit more octets than enough to hold the prefix"
                     );
                 }
-                AddressEncoding::LinkLocalIpv6 => {
+                Ae::LinkLocalIpv6 => {
                     panic!("Update should not carry AE 3");
                 }
             }
@@ -307,7 +307,7 @@ fn encode_payload(tlv: &Tlv, mut buf: &mut [u8]) -> usize {
         }
         Tlv::RouteRequest { ae, plen, prefix } => {
             assert!(
-                ae != AddressEncoding::LinkLocalIpv6 && ae != AddressEncoding::V4ViaV6,
+                ae != Ae::LinkLocalIpv6 && ae != Ae::V4ViaV6,
                 "Route Request should not carry AE 3 or 4"
             );
 
@@ -334,9 +334,7 @@ fn encode_payload(tlv: &Tlv, mut buf: &mut [u8]) -> usize {
             prefix,
         } => {
             assert!(
-                ae != AddressEncoding::Wildcard
-                    && ae != AddressEncoding::LinkLocalIpv6
-                    && ae != AddressEncoding::V4ViaV6,
+                ae != Ae::Wildcard && ae != Ae::LinkLocalIpv6 && ae != Ae::V4ViaV6,
                 "Seqno Request should not carry AE 0, 3, or 4"
             );
 
@@ -451,15 +449,15 @@ fn decode_update_body(buf: &mut &[u8]) -> Result<Tlv, StateModifier> {
         prefix_ipv6: true,
         prefix_v4_via_v6: true,
     })?;
-    let ae = AddressEncoding::new(ae);
+    let ae = Ae::new(ae);
 
     // When Flags is unavailable, undefine the router-id slot and
     // the default prefix slot specified by the AE (if any).
     let flags = buf.try_get_u8().map_err(|_| StateModifier::Undefine {
         router_id: true,
-        prefix_ipv4: ae == Some(AddressEncoding::Ipv4),
-        prefix_ipv6: ae == Some(AddressEncoding::Ipv6),
-        prefix_v4_via_v6: ae == Some(AddressEncoding::V4ViaV6),
+        prefix_ipv4: ae == Some(Ae::Ipv4),
+        prefix_ipv6: ae == Some(Ae::Ipv6),
+        prefix_v4_via_v6: ae == Some(Ae::V4ViaV6),
     })?;
     let flags = UpdateFlags::from_bits(flags);
 
@@ -475,12 +473,12 @@ fn decode_update_body(buf: &mut &[u8]) -> Result<Tlv, StateModifier> {
         let mut prefix = [0; 16];
 
         match ae {
-            AddressEncoding::Wildcard => {
+            Ae::Wildcard => {
                 if metric != METRIC_INFINITE || plen != 0 || omitted != 0 {
                     return None;
                 }
             }
-            AddressEncoding::Ipv4 | AddressEncoding::Ipv6 | AddressEncoding::V4ViaV6 => {
+            Ae::Ipv4 | Ae::Ipv6 | Ae::V4ViaV6 => {
                 if plen > ae.max_plen() {
                     return None;
                 }
@@ -498,7 +496,7 @@ fn decode_update_body(buf: &mut &[u8]) -> Result<Tlv, StateModifier> {
                 // Don't clear the low-order bits here, but only
                 // after the omitted octets are filled in.
             }
-            AddressEncoding::LinkLocalIpv6 => return None,
+            Ae::LinkLocalIpv6 => return None,
         }
 
         // When Interval is zero, ignore the TLV but allow it
@@ -530,9 +528,9 @@ fn decode_update_body(buf: &mut &[u8]) -> Result<Tlv, StateModifier> {
     // specified by the AE (if any) if the Prefix flag is set.
     decode_rest().ok_or_else(|| StateModifier::Undefine {
         router_id: flags.router_id,
-        prefix_ipv4: ae == Some(AddressEncoding::Ipv4) && flags.prefix,
-        prefix_ipv6: ae == Some(AddressEncoding::Ipv6) && flags.prefix,
-        prefix_v4_via_v6: ae == Some(AddressEncoding::V4ViaV6) && flags.prefix,
+        prefix_ipv4: ae == Some(Ae::Ipv4) && flags.prefix,
+        prefix_ipv6: ae == Some(Ae::Ipv6) && flags.prefix,
+        prefix_v4_via_v6: ae == Some(Ae::V4ViaV6) && flags.prefix,
     })?
 }
 
@@ -583,13 +581,13 @@ fn decode_state_irrelevant_body(kind: TlvKind, buf: &mut &[u8]) -> Option<Tlv> {
             let rxcost = buf.try_get_u16().ok()?;
             let interval = buf.try_get_u16().ok()?;
 
-            let ae = AddressEncoding::new(ae)?;
+            let ae = Ae::new(ae)?;
 
             let mut address = [0; 8];
 
             match ae {
-                AddressEncoding::Wildcard => {}
-                AddressEncoding::LinkLocalIpv6 => buf.try_copy_to_slice(&mut address).ok()?,
+                Ae::Wildcard => {}
+                Ae::LinkLocalIpv6 => buf.try_copy_to_slice(&mut address).ok()?,
                 _ => return None,
             }
 
@@ -606,9 +604,9 @@ fn decode_state_irrelevant_body(kind: TlvKind, buf: &mut &[u8]) -> Option<Tlv> {
             let ae = buf.try_get_u8().ok()?;
             let plen = buf.try_get_u8().ok()?;
 
-            let ae = AddressEncoding::new(ae)?;
+            let ae = Ae::new(ae)?;
 
-            if ae == AddressEncoding::LinkLocalIpv6 {
+            if ae == Ae::LinkLocalIpv6 {
                 return None;
             }
 
@@ -633,9 +631,9 @@ fn decode_state_irrelevant_body(kind: TlvKind, buf: &mut &[u8]) -> Option<Tlv> {
             let _reserved = buf.try_get_u8().ok()?;
             let router_id = buf.try_get_u64().ok()?;
 
-            let ae = AddressEncoding::new(ae)?;
+            let ae = Ae::new(ae)?;
 
-            if ae == AddressEncoding::Wildcard || ae == AddressEncoding::LinkLocalIpv6 {
+            if ae == Ae::Wildcard || ae == Ae::LinkLocalIpv6 {
                 return None;
             }
 
@@ -665,7 +663,7 @@ pub enum StateModifier {
     RouterId { router_id: RouterId },
     /// Modifies the parser state like an Update TLV with the same values in the fields.
     Update {
-        ae: AddressEncoding,
+        ae: Ae,
         flags: UpdateFlags,
         plen: u8,
         omitted: u8,

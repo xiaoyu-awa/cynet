@@ -4,7 +4,7 @@ use std::{
 };
 
 use super::*;
-use crate::babel::base::AddressEncoding::{Ipv4, Ipv6, V4ViaV6, Wildcard};
+use crate::babel::base::Ae::{Ipv4, Ipv6, V4ViaV6, Wildcard};
 
 const P: u8 = 0x80;
 const R: u8 = 0x40;
@@ -55,14 +55,7 @@ fn addr(s: &str) -> [u8; 16] {
 }
 
 /// Returns an Update TLV with Interval 400 and Seqno 7.
-fn update_tlv(
-    ae: AddressEncoding,
-    flags: u8,
-    plen: u8,
-    omitted: u8,
-    metric: u16,
-    bytes: &[u8],
-) -> Tlv {
+fn update_tlv(ae: Ae, flags: u8, plen: u8, omitted: u8, metric: u16, bytes: &[u8]) -> Tlv {
     let mut prefix = [0; 16];
     prefix[..bytes.len()].copy_from_slice(bytes);
     Tlv::Update {
@@ -78,13 +71,7 @@ fn update_tlv(
 }
 
 /// Returns an update with Interval 400 and Seqno 7.
-fn update(
-    ae: AddressEncoding,
-    plen: u8,
-    metric: u16,
-    prefix: &str,
-    router_id: Option<u64>,
-) -> Update {
+fn update(ae: Ae, plen: u8, metric: u16, prefix: &str, router_id: Option<u64>) -> Update {
     Update {
         ae,
         plen,
