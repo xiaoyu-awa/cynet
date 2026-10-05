@@ -106,9 +106,8 @@ impl NeighbourValue {
         if self.rxcost() == COST_INFINITY {
             return COST_INFINITY;
         }
-        // The cost MUST be strictly positive (RFC 8966 §3.4.3),
-        // even if the neighbour sends an rxcost of 0.
-        self.txcost.max(1).saturating_add(self.rtt_penalty())
+        // The cost MUST be strictly positive (RFC 8966 §3.4.3).
+        self.txcost.saturating_add(self.rtt_penalty()).max(1)
     }
 }
 
