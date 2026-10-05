@@ -6,10 +6,8 @@ mod tests;
 use std::{array, num::NonZeroUsize};
 
 use crate::babel::{
-    base::{Ae, Interval, RouterId, Seqno, timestamp_now},
-    packet::tlv::{
-        METRIC_INFINITE, StateModifier, Tlv, TlvDecodeError, UpdateFlags, mask_prefix, octets,
-    },
+    base::{Ae, Interval, METRIC_INFINITY, RouterId, Seqno, timestamp_now},
+    packet::tlv::{StateModifier, Tlv, TlvDecodeError, UpdateFlags, mask_prefix, octets},
 };
 
 /// Magic number for Babel.
@@ -90,6 +88,10 @@ impl PacketEncoder {
             router_id: None,
             prefix_ipv6: None,
         }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 4
     }
 
     #[cfg(test)]
@@ -265,7 +267,7 @@ impl PacketEncoder {
         // The router-id is only required for a finite metric,
         // but is established for a retraction too if present.
         assert!(
-            metric == METRIC_INFINITE || router_id.is_some(),
+            metric == METRIC_INFINITY || router_id.is_some(),
             "Update with finite metric should carry a router-id"
         );
 
@@ -522,7 +524,7 @@ impl Iterator for PacketDecoder<'_> {
 
                 // The router-id is only required for a finite metric,
                 // but is retained for a retraction too if present.
-                if metric != METRIC_INFINITE && self.router_id.is_none() {
+                if metric != METRIC_INFINITY && self.router_id.is_none() {
                     return Some(Err(PacketDecodeError::Stateful(tlv)));
                 }
 

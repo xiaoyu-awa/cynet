@@ -153,7 +153,7 @@ fn wire_format() {
             &[6, 10, 0, 0, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef],
         ),
         (
-            update(Wildcard, 0, 0, 0, METRIC_INFINITE, &[]),
+            update(Wildcard, 0, 0, 0, METRIC_INFINITY, &[]),
             &[8, 10, 0, 0, 0, 0, 1, 0x90, 0, 7, 0xff, 0xff],
         ),
         (
@@ -173,7 +173,7 @@ fn wire_format() {
             &[8, 13, 1, 0x80, 24, 0, 1, 0x90, 0, 7, 0, 96, 10, 1, 2],
         ),
         (
-            update(V4ViaV6, 0, 32, 4, METRIC_INFINITE, &[]),
+            update(V4ViaV6, 0, 32, 4, METRIC_INFINITY, &[]),
             &[8, 10, 4, 0, 32, 4, 1, 0x90, 0, 7, 0xff, 0xff],
         ),
         (Tlv::RouteRequest { ae: Wildcard, plen: 0, prefix: [0; 16] }, &[9, 2, 0, 0]),
@@ -219,7 +219,7 @@ fn decode_tolerates_what_it_may_ignore() {
         (&[4, 6, 0x7f, 0xff, 1, 2, 1, 0x90], hello(Some(400), None)),
         (
             &[8, 10, 0, 0x3f, 0, 0, 1, 0x90, 0, 7, 0xff, 0xff],
-            update(Wildcard, 0, 0, 0, METRIC_INFINITE, &[]),
+            update(Wildcard, 0, 0, 0, METRIC_INFINITY, &[]),
         ),
         // A PadN sub-TLV in place of a Timestamp sub-TLV is ignored.
         (&[4, 12, 0, 0, 1, 2, 1, 0x90, 1, 4, 0, 0, 0, 0], hello(Some(400), None)),

@@ -6,7 +6,7 @@ use std::num::NonZeroU8;
 use bytes::{Buf, BufMut};
 use strum::{EnumDiscriminants, FromRepr};
 
-use crate::babel::base::{Ae, Interval, RouterId, Seqno};
+use crate::babel::base::{Ae, Interval, METRIC_INFINITY, RouterId, Seqno};
 
 const HELLO_FLAG_UNICAST: u16 = 0x8000;
 
@@ -31,8 +31,6 @@ impl UpdateFlags {
         self.prefix as u8 * UPDATE_FLAG_PREFIX + self.router_id as u8 * UPDATE_FLAG_ROUTER_ID
     }
 }
-
-pub(super) const METRIC_INFINITE: u16 = 0xffff;
 
 const MANDATORY_BIT: u8 = 0x80;
 
@@ -64,7 +62,7 @@ pub enum Tlv {
     ///
     /// Unicast Hellos are irrelevant for this implementation. The Flags field is sent as 0. Hello TLVs with the Unicast flag set are silently ignored.
     Hello {
-        /// The sending node's outgoing Multicast Hello seqno.
+        /// The sending node's outgoing Hello seqno.
         seqno: Seqno,
         /// If `Some`, this is an upper bound, expressed in centiseconds, on the time after which the sending node will send a new scheduled Hello TLV with the same setting of the Unicast flag. If this is `None`, then this Hello represents an unscheduled Hello and doesn't carry any new information about times at which Hellos are sent.
         interval: Option<Interval>,
@@ -276,7 +274,7 @@ fn encode_payload(tlv: &Tlv, mut buf: &mut [u8]) -> usize {
             match ae {
                 Ae::Wildcard => {
                     assert!(
-                        metric == METRIC_INFINITE && plen == 0 && omitted == 0,
+                        metric == METRIC_INFINITY && plen == 0 && omitted == 0,
                         "Update with AE 0 should carry infinite metric, Plen=0, and Omitted=0"
                     );
                 }
@@ -474,7 +472,7 @@ fn decode_update_body(buf: &mut &[u8]) -> Result<Tlv, StateModifier> {
 
         match ae {
             Ae::Wildcard => {
-                if metric != METRIC_INFINITE || plen != 0 || omitted != 0 {
+                if metric != METRIC_INFINITY || plen != 0 || omitted != 0 {
                     return None;
                 }
             }

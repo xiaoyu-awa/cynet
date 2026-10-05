@@ -1,4 +1,1 @@
-slotmap::new_key_type! {
-    /// Identifies a WireGuard link.
-    pub struct LinkKey;
-}
+pub type LinkKey = gotatun::x25519::PublicKey;

@@ -1,0 +1,3 @@
+[submodule "gotatun"]
+	path = gotatun
+	url = https://github.com/yescallop/gotatun.git

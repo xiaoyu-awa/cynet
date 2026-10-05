@@ -1,11 +1,17 @@
+#[cfg(test)]
+mod tests;
+
 use std::{
     num::{NonZeroU16, NonZeroU64},
-    ops::{Add, Sub},
+    ops::{Add, AddAssign, Sub},
     sync::LazyLock,
     time::Duration,
 };
 
 use tokio::time::Instant;
+
+pub const COST_INFINITY: u16 = 0xffff;
+pub const METRIC_INFINITY: u16 = 0xffff;
 
 /// A router-id, assumed unique across the routing domain.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -43,7 +49,7 @@ pub enum Ae {
 }
 
 impl Ae {
-    /// Creates an `Ae` from a `u8`, returning `None` if it is greater than 4.
+    /// Creates an `Ae` from a `u8`, returning `None` if it is greater than `4`.
     pub fn new(n: u8) -> Option<Self> {
         Some(match n {
             0 => Self::Wildcard,
@@ -95,6 +101,12 @@ impl Add<u16> for Seqno {
     }
 }
 
+impl AddAssign<u16> for Seqno {
+    fn add_assign(&mut self, rhs: u16) {
+        self.0 = self.0.wrapping_add(rhs);
+    }
+}
+
 impl Sub<Seqno> for Seqno {
     type Output = i16;
 
@@ -111,7 +123,7 @@ const NANOS_PER_CENTI: u32 = 10_000_000;
 const CENTIS_PER_SEC: u64 = 100;
 
 impl Interval {
-    /// Creates an `Interval` from a `u16`.
+    /// Creates an `Interval` from a `u16`, returning `None` if it equals `0`.
     pub fn new(n: u16) -> Option<Self> {
         NonZeroU16::new(n).map(Self)
     }
@@ -129,13 +141,13 @@ impl Interval {
         Duration::new(secs, subsec_centis * NANOS_PER_CENTI)
     }
 
-    /// Converts a [`Duration`] to an `Interval`, returning `None` if exact conversion is not possible.
+    /// Converts a [`Duration`] to an `Interval`, rounding towards zero,
+    /// returning `None` if the result is out of range.
     pub fn from_duration(d: Duration) -> Option<Self> {
-        const MAX_D: Duration = Interval(NonZeroU16::MAX).to_duration();
+        const MAX_D: Duration = Duration::from_nanos(655_359_999_999);
 
         if d.as_secs() <= MAX_D.as_secs()
             && (d.as_secs() != MAX_D.as_secs() || d.subsec_nanos() <= MAX_D.subsec_nanos())
-            && d.subsec_nanos().is_multiple_of(NANOS_PER_CENTI)
         {
             let centis = d.as_secs() as u16 * CENTIS_PER_SEC as u16
                 + (d.subsec_nanos() / NANOS_PER_CENTI) as u16;
@@ -152,7 +164,8 @@ impl Interval {
 pub enum HelloEffect {
     /// No effect.
     None,
-    /// The neighbour entry should be flushed.
+    /// The rest of the neighbour entry should be flushed. The Hello history
+    /// itself has already been restarted or emptied.
     Flush,
 }
 
@@ -163,11 +176,11 @@ pub struct HelloHistory {
 }
 
 impl HelloHistory {
-    /// Creates an empty Hello history expecting seqno `nr + 1`.
-    pub fn new(nr: Seqno) -> Self {
+    /// Creates an empty Hello history, which accepts any seqno next.
+    pub fn new() -> Self {
         Self {
-            bits: 1,
-            ne: nr + 1,
+            bits: 0,
+            ne: Seqno(0),
         }
     }
 
@@ -185,11 +198,18 @@ impl HelloHistory {
     /// Updates the history with the seqno of a received Hello,
     /// returning an effect that should be applied to the state.
     pub fn received(&mut self, nr: Seqno) -> HelloEffect {
+        if self.bits == 0 {
+            self.bits = 1;
+            self.ne = nr + 1;
+            return HelloEffect::None;
+        }
+
         let diff = nr - self.ne;
         let abs_diff = u32::from(diff.unsigned_abs());
 
         if abs_diff > 16 {
-            *self = Self::new(nr);
+            self.bits = 1;
+            self.ne = nr + 1;
             return HelloEffect::Flush;
         }
 
@@ -209,7 +229,7 @@ impl HelloHistory {
     /// returning an effect that should be applied to the state.
     pub fn missed(&mut self) -> HelloEffect {
         self.bits <<= 1;
-        self.ne = self.ne + 1;
+        self.ne += 1;
 
         if self.bits == 0 {
             HelloEffect::Flush
@@ -219,10 +239,21 @@ impl HelloHistory {
     }
 }
 
-// TODO: It may be desirable to subtract a random offset from this,
-// but that comes at the cost of nondeterminism. Hold off for now.
-static TIMESTAMP_ORIGIN: LazyLock<Instant> = LazyLock::new(Instant::now);
+/// The instant timestamps count from, and a random value added to them.
+static TIMESTAMP_ORIGIN_OFFSET: LazyLock<(Instant, u32)> =
+    LazyLock::new(|| (Instant::now(), rand::random()));
 
+/// Returns the current time in microseconds, modulo 2^32, from an arbitrary origin.
 pub fn timestamp_now() -> u32 {
-    TIMESTAMP_ORIGIN.elapsed().as_micros() as u32
+    let (origin, offset) = *TIMESTAMP_ORIGIN_OFFSET;
+    let now = Instant::now();
+
+    // Only the paused clock of a test can read earlier than the origin, which the first
+    // call sets. Count back from the origin then, rounding down as `as_micros` does when
+    // counting forward, so that differences between timestamps stay exact.
+    let micros = match now.checked_duration_since(origin) {
+        Some(elapsed) => elapsed.as_micros() as u32,
+        None => ((origin - now).as_nanos().div_ceil(1000) as u32).wrapping_neg(),
+    };
+    offset.wrapping_add(micros)
 }

@@ -10,7 +10,7 @@ const P: u8 = 0x80;
 const R: u8 = 0x40;
 
 const METRIC: u16 = 96;
-const INF: u16 = METRIC_INFINITE;
+const INF: u16 = METRIC_INFINITY;
 
 // Parser state slots.
 const ROUTER_ID: u8 = 1;
@@ -599,7 +599,8 @@ fn finalize_timestamps_hello() {
 
     let before = timestamp_now();
     let (t, decoded) = decode_timestamped(encoder.finalize());
-    assert!(t >= before);
+    // Timestamps wrap, so compare them by their difference.
+    assert!(t.wrapping_sub(before).cast_signed() >= 0);
     assert_eq!(
         decoded,
         items([ack, Tlv::Pad1, hello(Some(t)), ihu(Some((1, 2)))])
