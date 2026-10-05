@@ -417,7 +417,7 @@ impl State {
 
             if d <= T && dp <= T {
                 let rtt = &mut self.neighbour_table.get_mut(key).unwrap().rtt;
-                let rtt_n = d.wrapping_sub(dp).cast_signed() as f64;
+                let rtt_n = d.saturating_sub(dp) as f64;
 
                 if let Some(rtt) = rtt {
                     *rtt = ALPHA * *rtt + (1.0 - ALPHA) * rtt_n;
