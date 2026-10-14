@@ -14,7 +14,7 @@ pub const COST_INFINITY: u16 = 0xffff;
 pub const METRIC_INFINITY: u16 = 0xffff;
 
 /// A router-id, assumed unique across the routing domain.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct RouterId(NonZeroU64);
 
 impl RouterId {

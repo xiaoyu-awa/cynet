@@ -44,6 +44,8 @@ impl Params {
             DurationKey::InitialRequestTimeout => Duration::from_secs(2),
             DurationKey::UrgentTimeout => Duration::from_millis(200),
             DurationKey::SourceGcTime => Duration::from_mins(3),
+            DurationKey::RouteHoldTime => self.hello_interval * 4 * 4,
+            DurationKey::RouteHysteresisTimeConstant => self.hello_interval * 3,
         }
     }
 
@@ -53,8 +55,15 @@ impl Params {
             IntervalKey::Ihu => DurationKey::IhuInterval,
             IntervalKey::Update => DurationKey::UpdateInterval,
         };
-        Interval::from_duration(self.get_duration(dur_key))
-            .expect("interval should be within range")
+        let int = Interval::from_duration(self.get_duration(dur_key))
+            .expect("interval should be within range");
+
+        assert_ne!(
+            (key, int.get()),
+            (IntervalKey::Update, u16::MAX),
+            "Update interval should not be 0xFFFF"
+        );
+        int
     }
 
     pub fn get_f64(&self, key: F64Key) -> f64 {
@@ -75,6 +84,7 @@ impl Params {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DurationKey {
     /// Hello interval. Defaults to 4 seconds.
     HelloInterval,
@@ -88,8 +98,13 @@ pub enum DurationKey {
     UrgentTimeout,
     /// Source GC time. Defaults to 3 minutes.
     SourceGcTime,
+    /// Route hold time. Defaults to 4 times the Update interval.
+    RouteHoldTime,
+    /// Route hysteresis time constant. Defaults to 3 times the Hello interval.
+    RouteHysteresisTimeConstant,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IntervalKey {
     /// Hello interval. Defaults to 4 seconds.
     Hello,
@@ -99,6 +114,7 @@ pub enum IntervalKey {
     Update,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum F64Key {
     /// IHU Hold time, relative to the advertised IHU interval. Defaults to 3.5.
     IhuHoldTimeMultiplier,
@@ -115,6 +131,7 @@ pub enum F64Key {
     BufferTimeoutMultiplier,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum U8Key {
     /// The number of Hello TLVs sent per IHU TLV. Defaults to 3.
     HellosPerIhu,
