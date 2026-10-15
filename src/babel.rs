@@ -855,11 +855,13 @@ impl State {
                 continue;
             }
 
+            let usable = |r: &RouteValue| r.feasible && r.metric != METRIC_INFINITY;
+
             let current = match table.state {
                 RouteState::Selected(neigh) => table
                     .table
                     .get(neigh)
-                    .filter(|r| r.feasible && r.metric != METRIC_INFINITY)
+                    .filter(|r| usable(r))
                     .map(|r| (neigh, r)),
                 _ => None,
             };
@@ -888,7 +890,7 @@ impl State {
                 table
                     .table
                     .iter()
-                    .filter(|(_, r)| r.feasible && r.metric != METRIC_INFINITY)
+                    .filter(|(_, r)| usable(r))
                     .min_by(|(ka, ra), (kb, rb)| {
                         ra.metric
                             .cmp(&rb.metric)
