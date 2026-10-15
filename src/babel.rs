@@ -444,7 +444,7 @@ impl State {
                 );
             }
             Timeout::OutgoingUpdate => {
-                self.send_periodic_updates();
+                self.dump_routes(None);
 
                 self.update_timer_key = self.timers.insert(
                     Timeout::OutgoingUpdate,
@@ -640,9 +640,58 @@ impl State {
                 let prefixes = self.route_table.neighbour_prefixes(key);
                 self.updated_prefixes.extend(prefixes);
             }
-            Tlv::RouteRequest { .. } => todo!(),
+            Tlv::RouteRequest { ae, plen, prefix } => {
+                self.handle_route_request(key, ae, plen, prefix);
+            }
             Tlv::SeqnoRequest { .. } => todo!(),
         }
+    }
+
+    /// Answers a route request (RFC 8966 §3.8.1.1, RFC 9229 §2.3).
+    fn handle_route_request(&mut self, key: &LinkKey, ae: Ae, plen: u8, prefix: [u8; 16]) {
+        if ae == Ae::Wildcard {
+            // TODO: Full route table dumps SHOULD be rate-limited.
+            self.dump_routes(Some(key));
+            return;
+        }
+
+        let update = match ae {
+            Ae::Ipv6 => {
+                let prefix = Ipv6Net::new_assert(Ipv6Addr::from_octets(prefix), plen);
+                let table = self.route_table.by_prefix.get(&prefix);
+                let update = table.and_then(|table| self.update_for_prefix(table));
+
+                if let Some((router_id, seqno, metric)) = update {
+                    self.update_source_table(prefix, router_id, seqno, metric);
+                }
+                update
+            }
+            Ae::Ipv4 | Ae::V4ViaV6 => None,
+            Ae::Wildcard | Ae::LinkLocalIpv6 => unreachable!(),
+        };
+
+        // The local router-id and seqno are used for retracting an unknown route.
+        let (router_id, seqno, metric) =
+            update.unwrap_or((self.router_id, self.seqno, METRIC_INFINITY));
+
+        let update = Update {
+            ae,
+            plen,
+            interval: self.params.get_interval(IntervalKey::Update),
+            seqno,
+            metric,
+            prefix,
+            router_id: Some(router_id),
+        };
+
+        let neigh = self.neighbour_table.get_mut(key).unwrap();
+        neigh.packet_buf.put(
+            key,
+            &mut self.outputs,
+            &mut self.timers,
+            &self.params,
+            |e| e.put_update(&update),
+        );
     }
 
     fn handle_update(&mut self, neigh: &LinkKey, update: &Update) {
@@ -910,7 +959,9 @@ impl State {
         }
     }
 
-    fn send_periodic_updates(&mut self) {
+    /// Sends a full dump of the routes that this node advertises,
+    /// to every neighbour or to the given one.
+    fn dump_routes(&mut self, to: Option<&LinkKey>) {
         struct Update {
             prefix: Ipv6Net,
             router_id: RouterId,
@@ -948,19 +999,14 @@ impl State {
             .by_prefix
             .iter()
             .filter_map(|(prefix, table)| {
-                let update = match table.state {
-                    // A route injected by this node (RFC 8966 §3.7).
-                    RouteState::Local => Some((self.router_id, self.seqno, 0)),
-                    _ => table.update,
-                };
-                update.map(|(router_id, seqno, metric)| Update {
-                    prefix: *prefix,
-                    router_id,
-                    seqno,
-                    metric,
-                    router_id_omitted: router_id.get()
-                        == u64::from_be_bytes(*prefix.addr().octets().last_chunk().unwrap()),
-                })
+                self.update_for_prefix(table)
+                    .map(|(router_id, seqno, metric)| Update {
+                        prefix: *prefix,
+                        router_id,
+                        seqno,
+                        metric,
+                        router_id_omitted: router_id.get() == prefix.addr().to_bits() as u64,
+                    })
             })
             .collect();
 
@@ -990,20 +1036,38 @@ impl State {
                 router_id: Some(router_id),
             };
 
-            for (key, neigh) in &mut self.neighbour_table {
-                // Split horizon (RFC 8966 §3.7.4).
-                if state == RouteState::Selected(*key) {
-                    continue;
-                }
-
+            let mut put_update = |key, neigh: &mut NeighbourValue| {
                 neigh.packet_buf.put(
                     key,
                     &mut self.outputs,
                     &mut self.timers,
                     &self.params,
                     |e| e.put_update(&update),
-                );
+                )
+            };
+
+            if let Some(key) = to {
+                let neigh = self.neighbour_table.get_mut(key).unwrap();
+                put_update(key, neigh);
+            } else {
+                for (key, neigh) in &mut self.neighbour_table {
+                    // Split horizon (RFC 8966 §3.7.4).
+                    if state != RouteState::Selected(*key) {
+                        put_update(key, neigh);
+                    }
+                }
             }
+        }
+    }
+
+    /// Returns the router-id, seqno, and metric to send in an update for the prefix,
+    /// or the local router-id and seqno and a zero metric for a local route,
+    /// or `None` for a removed route.
+    fn update_for_prefix(&self, table: &PrefixRouteTable) -> Option<(RouterId, Seqno, u16)> {
+        match table.state {
+            // A route injected by this node (RFC 8966 §3.7).
+            RouteState::Local => Some((self.router_id, self.seqno, 0)),
+            _ => table.update,
         }
     }
 

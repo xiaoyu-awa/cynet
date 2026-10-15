@@ -195,8 +195,8 @@ impl PacketEncoder {
     /// Puts an Update TLV, preceded by a Router-Id TLV if needed, returning `false`
     /// without putting either if they do not fit.
     ///
-    /// Only AE 0 and 2 are supported. The prefix must have all bits beyond Plen
-    /// cleared, and the router-id must be present if the metric is finite.
+    /// AE 3 is not supported, and only AE 2 is compressed. The prefix must have all bits
+    /// beyond Plen cleared, and the router-id must be present if the metric is finite.
     ///
     /// A retraction with a router-id establishes the router-id like an announcement,
     /// while one without a router-id leaves the current one as is.
@@ -224,13 +224,15 @@ impl PacketEncoder {
             router_id,
         } = *update;
 
-        assert!(
-            ae == Ae::Wildcard || ae == Ae::Ipv6,
-            "Update should carry AE 0 or 2"
-        );
+        assert_ne!(ae, Ae::LinkLocalIpv6, "Update should not carry AE 3");
         assert!(
             plen <= ae.max_plen(),
             "Update should not carry overlarge Plen"
+        );
+        assert_eq!(
+            prefix,
+            mask_prefix(prefix, plen),
+            "Update should not carry a prefix with bits set beyond Plen"
         );
 
         let mut flags = UpdateFlags {
@@ -240,11 +242,6 @@ impl PacketEncoder {
         let mut omitted = 0;
 
         if ae == Ae::Ipv6 {
-            assert!(
-                prefix == mask_prefix(prefix, plen),
-                "Update should not carry a prefix with bits set beyond Plen"
-            );
-
             // TODO: babeld takes IPv4-mapped IPv6 prefixes (::ffff:0:0/96) for IPv4
             // routes, so it drops AE 2 updates for them, and rejects compressed AE 2
             // updates whose default prefix is one. Consider rejecting them here,

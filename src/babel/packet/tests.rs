@@ -4,7 +4,7 @@ use std::{
 };
 
 use super::*;
-use crate::babel::base::Ae::{Ipv4, Ipv6, V4ViaV6, Wildcard};
+use crate::babel::base::Ae::*;
 
 const P: u8 = 0x80;
 const R: u8 = 0x40;
@@ -425,8 +425,10 @@ fn put_update_round_trips_in_any_order() {
         update(Ipv6, 64, METRIC, "2001:db8:1:2::", Some(1)),
         update(Ipv6, 64, INF, "2001:db8:1:3::", Some(1)),
         update(Ipv6, 0, METRIC, "::", Some(2)),
+        update(V4ViaV6, 24, METRIC, "10.0.1.0", Some(2)),
         update(Ipv6, 64, INF, "2001:db8:0:9::", Some(2)),
         update(Ipv6, 61, METRIC, "2001:db8:1:8::", Some(2)),
+        update(Ipv4, 32, INF, "10.0.0.1", Some(0x0a00_0001)),
     ];
 
     assert_eq!(decode_updates(&encode_updates(&updates)), updates);
@@ -481,6 +483,23 @@ fn put_update_compresses() {
             router_id(1),
             update_tlv(Ipv6, P, 32, 0, METRIC, &[0x20, 0x01, 0x0d, 0xb8]),
             update_tlv(Ipv6, P, 64, 7, METRIC, &[1]),
+        ]
+    );
+
+    // IPv4 prefixes are not compressed, but may establish the router-id too.
+    let packet = encode_updates(&[
+        update(V4ViaV6, 24, METRIC, "10.0.1.0", Some(1)),
+        update(V4ViaV6, 24, METRIC, "10.0.2.0", Some(1)),
+        update(Ipv4, 32, INF, "10.0.0.1", Some(0x0a00_0001)),
+    ]);
+
+    assert_eq!(
+        decode_stateless(&packet),
+        [
+            router_id(1),
+            update_tlv(V4ViaV6, 0, 24, 0, METRIC, &[10, 0, 1]),
+            update_tlv(V4ViaV6, 0, 24, 0, METRIC, &[10, 0, 2]),
+            update_tlv(Ipv4, R, 32, 0, INF, &[10, 0, 0, 1]),
         ]
     );
 }
@@ -660,9 +679,9 @@ fn new_panics_with_small_buffer() {
 }
 
 #[test]
-#[should_panic(expected = "Update should carry AE 0 or 2")]
-fn put_update_panics_with_other_ae() {
-    let _ = PacketEncoder::new(512).put_update(&update(V4ViaV6, 32, METRIC, "10.0.0.1", Some(1)));
+#[should_panic(expected = "Update should not carry AE 3")]
+fn put_update_panics_with_ae_3() {
+    let _ = PacketEncoder::new(512).put_update(&update(LinkLocalIpv6, 64, INF, "fe80::", None));
 }
 
 #[test]

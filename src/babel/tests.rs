@@ -317,6 +317,11 @@ fn packet(body: &[u8]) -> Vec<u8> {
     buf
 }
 
+/// Builds a packet with a Route Request.
+fn route_request(ae: Ae, plen: u8, prefix: &[u8]) -> Vec<u8> {
+    packet(&[&[9, 2 + prefix.len() as u8, ae as u8, plen], prefix].concat())
+}
+
 /// Builds an Update for an IPv6 prefix.
 fn update(prefix: Ipv6Net, router_id: u64, seqno: u16, metric: u16, interval: u16) -> Update {
     Update {
@@ -787,18 +792,27 @@ async fn failed_link_retracts_routes_and_holds_prefix() {
         assert_eq!((held.entry, removed.entry), (Some(Fib::Unreachable), None));
         assert_eq!(removed.time - held.time, ROUTE_HOLD_TIME);
 
-        // While P is held, it is only retracted, and afterwards not mentioned at all.
+        // While P is held, it is only retracted, with the router-id of the route lost,
+        // at once and with every periodic dump (RFC 8966 §3.7), and afterwards not
+        // mentioned at all.
+        let mut retractions = 0;
         for sent in net
             .sent
             .iter()
             .filter(|sent| sent.from == i && sent.time > held.time)
         {
             for update in updates(&sent.buf).iter().filter(|update| is_for(update, p)) {
-                assert_eq!(update.metric, METRIC_INFINITY);
+                let router_id = RouterId::new(3);
+                assert_eq!(
+                    (update.metric, update.router_id),
+                    (METRIC_INFINITY, router_id)
+                );
                 // Allow for the buffering of a retraction put before the removal.
                 assert!(sent.time <= removed.time + Duration::from_secs(2));
+                retractions += 1;
             }
         }
+        assert!(retractions >= 4);
     }
 }
 
@@ -1066,4 +1080,100 @@ async fn random_link_failures_cause_no_loops() {
             assert_eq!(net.delivered_to(i, p.addr()), Some(j), "from {i} to {p}");
         }
     }
+}
+
+/// Sets up node 0 with a route learnt from node 1, a local route, and neighbour 9,
+/// outside the simulation. Returns the learnt and local prefixes, between periodic
+/// dumps, which are sent every 16 s and flushed within 2 s.
+async fn requested_net() -> (Net, Ipv6Net, Ipv6Net) {
+    let learnt = prefix("fd00:1::/64");
+    let local = prefix("fd00::/64");
+
+    let mut net = Net::new(2);
+    net.connect(0, 1, Duration::ZERO);
+    assert!(net.nodes[0].add_neighbour(key(9)));
+    net.originate(0, local);
+    net.originate(1, learnt);
+    net.run_for(Duration::from_secs(20)).await;
+    assert_eq!(net.fib(0, learnt), Some(Fib::Via(1)));
+
+    (net, learnt, local)
+}
+
+/// Returns the updates that node `from` sent to node `to` since `start`.
+fn updates_sent(net: &Net, from: usize, to: usize, start: Instant) -> Vec<Update> {
+    let sent = net.sent.iter();
+    let sent = sent.filter(|sent| (sent.from, sent.to) == (from, to) && sent.time >= start);
+    sent.flat_map(|sent| updates(&sent.buf)).collect()
+}
+
+#[tokio::test(start_paused = true)]
+async fn route_requests_are_answered() {
+    let (mut net, learnt, local) = requested_net().await;
+    let unknown = prefix("fd00:9::/64");
+    let interval = 1600;
+
+    let start = Instant::now();
+    for p in [learnt, local, unknown] {
+        let request = route_request(Ae::Ipv6, 64, &p.addr().octets()[..8]);
+        net.inject(9, 0, &request);
+    }
+    net.inject(9, 0, &route_request(Ae::Ipv4, 8, &[10]));
+    net.inject(9, 0, &route_request(Ae::V4ViaV6, 16, &[10, 1]));
+    // So is a request from the neighbour that the route was learnt from, although
+    // updates are otherwise not sent back to it (RFC 8966 §3.7.4).
+    net.inject(
+        1,
+        0,
+        &route_request(Ae::Ipv6, 64, &learnt.addr().octets()[..8]),
+    );
+    net.run_for(Duration::from_secs(3)).await;
+
+    // Each request is answered with the route that node 0 advertises, or else with
+    // a retraction carrying its own router-id and seqno, and the same AE
+    // (RFC 8966 §3.8.1.1, RFC 9229 §2.3).
+    let (seqno_0, seqno_1) = (net.nodes[0].seqno.get(), net.nodes[1].seqno.get());
+    let ipv4_retraction = |ae, plen, octets: &[u8]| {
+        let mut prefix = [0; 16];
+        prefix[..octets.len()].copy_from_slice(octets);
+        Update {
+            ae,
+            plen,
+            prefix,
+            ..update(unknown, 1, seqno_0, METRIC_INFINITY, interval)
+        }
+    };
+    assert_eq!(
+        updates_sent(&net, 0, 9, start),
+        [
+            update(learnt, 2, seqno_1, 96, interval),
+            update(local, 1, seqno_0, 0, interval),
+            update(unknown, 1, seqno_0, METRIC_INFINITY, interval),
+            ipv4_retraction(Ae::Ipv4, 8, &[10]),
+            ipv4_retraction(Ae::V4ViaV6, 16, &[10, 1]),
+        ]
+    );
+    assert_eq!(
+        updates_sent(&net, 0, 1, start),
+        [update(learnt, 2, seqno_1, 96, interval)]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn wildcard_route_requests_are_answered_with_full_dumps() {
+    let (mut net, learnt, local) = requested_net().await;
+
+    // A wildcard request is answered with a full dump, sent to the requester only.
+    let start = Instant::now();
+    net.inject(9, 0, &route_request(Ae::Wildcard, 0, &[]));
+    net.run_for(Duration::from_secs(3)).await;
+
+    // A dump of both prefixes, in whichever order.
+    let mut prefixes: Vec<_> = (updates_sent(&net, 0, 9, start).into_iter())
+        .map(|update| (update.plen, update.prefix))
+        .collect();
+    prefixes.sort();
+    let [local, learnt] = [local, learnt].map(|p| (p.prefix_len(), p.addr().octets()));
+    assert_eq!(prefixes, [local, learnt]);
+    assert_eq!(updates_sent(&net, 0, 1, start), []);
 }
