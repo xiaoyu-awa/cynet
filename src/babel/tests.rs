@@ -11,16 +11,6 @@ const INF: u16 = COST_INFINITY;
 /// The rxcost, txcost and link cost of a link that is up with a negligible RTT.
 const UP: (u16, u16, u16) = (NOMINAL_COST, NOMINAL_COST, NOMINAL_COST);
 
-/// Returns the link key of node `i`.
-fn key(i: usize) -> LinkKey {
-    LinkKey::from([i as u8; 32])
-}
-
-/// Returns the index of the node with the given link key.
-fn index(key: &LinkKey) -> usize {
-    key.as_bytes()[0] as usize
-}
-
 fn prefix(s: &str) -> Ipv6Net {
     s.parse().unwrap()
 }
@@ -67,6 +57,8 @@ type Filter = fn(usize, usize, Box<[u8]>) -> Option<Box<[u8]>>;
 /// After every event, the node's route table is checked to keep no empty entries.
 struct Net {
     nodes: Vec<State>,
+    /// The link keys of each node, mapped to and from the indices of their neighbours.
+    link_maps: Vec<LinkMap<usize>>,
     /// The one-way latency of each link direction that is up.
     links: HashMap<(usize, usize), Duration>,
     filter: Filter,
@@ -82,6 +74,7 @@ impl Net {
     fn new(n: usize) -> Self {
         Self {
             nodes: (0..n).map(state).collect(),
+            link_maps: (0..n).map(|_| LinkMap::new()).collect(),
             links: HashMap::new(),
             filter: |_, _, buf| Some(buf),
             in_flight: DelayQueue::new(),
@@ -92,11 +85,27 @@ impl Net {
         }
     }
 
+    /// Adds node `j` as a neighbour of node `i`, which may be outside the simulation.
+    fn add_neighbour(&mut self, i: usize, j: usize) {
+        let link = self.nodes[i].add_neighbour();
+        self.link_maps[i].insert(j, link);
+    }
+
     fn connect(&mut self, a: usize, b: usize, latency: Duration) {
-        assert!(self.nodes[a].add_neighbour(key(b)));
-        assert!(self.nodes[b].add_neighbour(key(a)));
+        self.add_neighbour(a, b);
+        self.add_neighbour(b, a);
         self.links.insert((a, b), latency);
         self.links.insert((b, a), latency);
+    }
+
+    /// Returns the link key of node `i` for node `j`.
+    fn key(&self, i: usize, j: usize) -> LinkKey {
+        self.link_maps[i].link(&j).unwrap()
+    }
+
+    /// Returns the index of the node that a link key of node `i` is for.
+    fn index(&self, i: usize, key: LinkKey) -> usize {
+        self.link_maps[i].key(key).unwrap()
     }
 
     fn originate(&mut self, i: usize, prefix: Ipv6Net) {
@@ -136,7 +145,8 @@ impl Net {
                 i
             }
             Event::Arrival(from, to, buf) => {
-                self.nodes[to].handle_packet(&key(from), &buf);
+                let key = self.key(to, from);
+                self.nodes[to].handle_packet(key, &buf);
                 to
             }
         };
@@ -145,7 +155,8 @@ impl Net {
 
     /// Hands a packet to node `to` as if it came from node `from`.
     fn inject(&mut self, from: usize, to: usize, buf: &[u8]) {
-        self.nodes[to].handle_packet(&key(from), buf);
+        let key = self.key(to, from);
+        self.nodes[to].handle_packet(key, buf);
         self.process_outputs(to);
     }
 
@@ -157,10 +168,12 @@ impl Net {
         while let Some(output) = self.nodes[from].poll_output() {
             let (prefix, entry) = match output {
                 Output::Packet(dst, buf) => {
-                    self.transmit(from, index(&dst), buf);
+                    self.transmit(from, self.index(from, dst), buf);
                     continue;
                 }
-                Output::RouteSelect(prefix, neigh) => (prefix, Some(Fib::Via(index(&neigh)))),
+                Output::RouteSelect(prefix, neigh) => {
+                    (prefix, Some(Fib::Via(self.index(from, neigh))))
+                }
                 Output::RouteHold(prefix) => (prefix, Some(Fib::Unreachable)),
                 Output::RouteRemove(prefix) => (prefix, None),
                 // Other outputs concern neither the links nor the forwarding tables.
@@ -277,7 +290,7 @@ impl Net {
 
     /// Returns node `i`'s entry for node `j`.
     fn neigh(&self, i: usize, j: usize) -> &NeighbourValue {
-        &self.nodes[i].neighbour_table[&key(j)]
+        &self.nodes[i].neighbour_table[self.key(i, j)]
     }
 
     /// Returns node `i`'s rxcost, txcost and link cost for node `j`.
@@ -619,7 +632,8 @@ async fn rebooted_neighbour_is_reacquired() {
     let hello_seqno = net.nodes[1].hello_seqno + 1000;
     net.nodes[1] = state(1);
     net.nodes[1].hello_seqno = hello_seqno;
-    assert!(net.nodes[1].add_neighbour(key(0)));
+    net.link_maps[1] = LinkMap::new();
+    net.add_neighbour(1, 0);
 
     // Its first Hello flushes node 0's entry for it, restarting the history.
     net.run_for(Duration::from_secs(3)).await;
@@ -636,7 +650,7 @@ async fn rebooted_neighbour_is_reacquired() {
 async fn acknowledgement_requests_are_answered_in_time() {
     // Node 1 is outside the simulation and only sends the requests.
     let mut net = Net::new(1);
-    assert!(net.nodes[0].add_neighbour(key(1)));
+    net.add_neighbour(0, 1);
 
     // More requests than one packet can hold Acknowledgments for.
     let interval = Interval::new(100).unwrap();
@@ -878,7 +892,7 @@ async fn retractions_and_expiry_unselect_routes() {
     };
 
     let mut net = Net::new(1);
-    assert!(net.nodes[0].add_neighbour(key(9)));
+    net.add_neighbour(0, 9);
     let mut neighbour = Scripted::new(9);
 
     // Announcements are selected once the neighbour is up.
@@ -925,8 +939,8 @@ async fn unfeasible_routes_are_never_selected() {
     let near = update(p, 42, 1, 100, 400);
 
     let mut net = Net::new(1);
-    assert!(net.nodes[0].add_neighbour(key(8)));
-    assert!(net.nodes[0].add_neighbour(key(9)));
+    net.add_neighbour(0, 8);
+    net.add_neighbour(0, 9);
     let (mut n8, mut n9) = (Scripted::new(8), Scripted::new(9));
 
     n9.send(&mut net, 0, from_ref(&far));
@@ -962,7 +976,7 @@ async fn router_id_change_is_advertised_urgently() {
 
     let mut net = Net::new(2);
     net.connect(0, 1, Duration::ZERO);
-    assert!(net.nodes[0].add_neighbour(key(9)));
+    net.add_neighbour(0, 9);
     let mut neighbour = Scripted::new(9);
 
     for _ in 0..10 {
@@ -997,8 +1011,8 @@ async fn better_routes_are_adopted_after_hysteresis() {
     let p = prefix("fd00:9::/64");
 
     let mut net = Net::new(1);
-    assert!(net.nodes[0].add_neighbour(key(8)));
-    assert!(net.nodes[0].add_neighbour(key(9)));
+    net.add_neighbour(0, 8);
+    net.add_neighbour(0, 9);
     let (mut n8, mut n9) = (Scripted::new(8), Scripted::new(9));
 
     // Routes of metrics 596 through neighbour 9 and 1096 through neighbour 8, long
@@ -1091,7 +1105,7 @@ async fn requested_net() -> (Net, Ipv6Net, Ipv6Net) {
 
     let mut net = Net::new(2);
     net.connect(0, 1, Duration::ZERO);
-    assert!(net.nodes[0].add_neighbour(key(9)));
+    net.add_neighbour(0, 9);
     net.originate(0, local);
     net.originate(1, learnt);
     net.run_for(Duration::from_secs(20)).await;

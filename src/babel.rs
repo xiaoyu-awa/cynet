@@ -8,27 +8,67 @@ mod tests;
 use std::{
     assert_matches,
     cmp::Ordering,
-    collections::{HashMap, HashSet, VecDeque, hash_map::Entry},
+    collections::{HashMap, HashSet, VecDeque, hash_map},
+    hash::Hash,
     net::Ipv6Addr,
     task::{Context, Poll},
     time::Duration,
 };
 
 use ipnet::Ipv6Net;
+use slotmap::{SecondaryMap, SlotMap, SparseSecondaryMap, sparse_secondary};
 use tokio::time::Instant;
 use tokio_util::time::{DelayQueue, delay_queue::Key as TimerKey};
 
-use crate::{
-    babel::{
-        base::{
-            Ae, COST_INFINITY, HelloEffect, HelloHistory, Interval, METRIC_INFINITY, RouterId,
-            Seqno, timestamp_now,
-        },
-        packet::{PacketDecoder, PacketEncoder, PacketItem, Update, tlv::Tlv},
-        params::{DurationKey, F64Key, IntervalKey, Params, U8Key},
+use crate::babel::{
+    base::{
+        Ae, COST_INFINITY, HelloEffect, HelloHistory, Interval, METRIC_INFINITY, RouterId, Seqno,
+        timestamp_now,
     },
-    wireguard::LinkKey,
+    packet::{PacketDecoder, PacketEncoder, PacketItem, Update, tlv::Tlv},
+    params::{DurationKey, F64Key, IntervalKey, Params, U8Key},
 };
+
+slotmap::new_key_type! {
+    /// Identifies a link to a neighbour.
+    pub struct LinkKey;
+}
+
+/// A one-to-one mapping between link keys and the keys that identify the same
+/// neighbours elsewhere, such as WireGuard public keys.
+pub struct LinkMap<K> {
+    links: HashMap<K, LinkKey>,
+    keys: SecondaryMap<LinkKey, K>,
+}
+
+impl<K: Copy + Eq + Hash> LinkMap<K> {
+    pub fn new() -> Self {
+        Self {
+            links: HashMap::new(),
+            keys: SecondaryMap::new(),
+        }
+    }
+
+    /// Maps `key` and `link` to each other. Neither may be mapped already.
+    pub fn insert(&mut self, key: K, link: LinkKey) {
+        assert!(
+            !self.links.contains_key(&key) && !self.keys.contains_key(link),
+            "key and link key should not be mapped already"
+        );
+        self.links.insert(key, link);
+        self.keys.insert(link, key);
+    }
+
+    /// Returns the link key mapped to `key`, if any.
+    pub fn link(&self, key: &K) -> Option<LinkKey> {
+        self.links.get(key).copied()
+    }
+
+    /// Returns the key mapped to `link`, if any.
+    pub fn key(&self, link: LinkKey) -> Option<K> {
+        self.keys.get(link).copied()
+    }
+}
 
 struct NeighbourValue {
     hello_history: HelloHistory,
@@ -146,7 +186,7 @@ enum RouteState {
 }
 
 struct PrefixRouteTable {
-    table: HashMap<LinkKey, RouteValue>,
+    table: SparseSecondaryMap<LinkKey, RouteValue>,
     state: RouteState,
     update: Option<(RouterId, Seqno, u16)>,
     metric_smoothed_at: Instant,
@@ -155,7 +195,7 @@ struct PrefixRouteTable {
 impl PrefixRouteTable {
     fn new() -> Self {
         Self {
-            table: HashMap::new(),
+            table: SparseSecondaryMap::new(),
             state: RouteState::Removed,
             update: None,
             metric_smoothed_at: Instant::now(),
@@ -165,21 +205,21 @@ impl PrefixRouteTable {
 
 struct RouteTable {
     by_prefix: HashMap<Ipv6Net, PrefixRouteTable>,
-    neigh_prefixes: HashMap<LinkKey, HashSet<Ipv6Net>>,
+    neigh_prefixes: SecondaryMap<LinkKey, HashSet<Ipv6Net>>,
 }
 
 impl RouteTable {
     fn new() -> Self {
         Self {
             by_prefix: HashMap::new(),
-            neigh_prefixes: HashMap::new(),
+            neigh_prefixes: SecondaryMap::new(),
         }
     }
 
     fn insert_local(&mut self, prefix: Ipv6Net) -> bool {
         match self.by_prefix.entry(prefix) {
-            Entry::Occupied(_) => false,
-            Entry::Vacant(e) => {
+            hash_map::Entry::Occupied(_) => false,
+            hash_map::Entry::Vacant(e) => {
                 let mut table = PrefixRouteTable::new();
                 table.state = RouteState::Local;
                 e.insert(table);
@@ -199,24 +239,26 @@ impl RouteTable {
             .entry(prefix)
             .or_insert_with(PrefixRouteTable::new);
 
-        match table.table.entry(neigh) {
-            Entry::Occupied(e) => Some(e.into_mut()),
-            Entry::Vacant(e) => {
+        match table.table.entry(neigh).unwrap() {
+            sparse_secondary::Entry::Occupied(e) => Some(e.into_mut()),
+            sparse_secondary::Entry::Vacant(e) => {
+                let prefixes = self.neigh_prefixes.entry(neigh).unwrap().or_default();
+                assert!(prefixes.insert(prefix));
+
                 e.insert(f());
-                assert!(self.neigh_prefixes.entry(neigh).or_default().insert(prefix));
                 None
             }
         }
     }
 
-    fn remove(&mut self, prefix: &Ipv6Net, neigh: &LinkKey) -> Option<RouteValue> {
+    fn remove(&mut self, prefix: &Ipv6Net, neigh: LinkKey) -> Option<RouteValue> {
         let route = self.by_prefix.get_mut(prefix)?.table.remove(neigh)?;
         assert!(self.neigh_prefixes.get_mut(neigh).unwrap().remove(prefix));
         Some(route)
     }
 
     /// Returns the prefixes of the routes through a neighbour.
-    fn neighbour_prefixes(&self, neigh: &LinkKey) -> Vec<Ipv6Net> {
+    fn neighbour_prefixes(&self, neigh: LinkKey) -> Vec<Ipv6Net> {
         let Some(prefixes) = self.neigh_prefixes.get(neigh) else {
             return Vec::new();
         };
@@ -238,20 +280,20 @@ struct PacketBuf {
 }
 
 impl PacketBuf {
-    fn flush(&mut self, key: &LinkKey, outputs: &mut VecDeque<Output>) {
+    fn flush(&mut self, key: LinkKey, outputs: &mut VecDeque<Output>) {
         assert!(
             !self.encoder.is_empty(),
             "empty buffer should not be flushed"
         );
 
         let buf = self.encoder.finalize().to_vec().into_boxed_slice();
-        outputs.push_back(Output::Packet(*key, buf));
+        outputs.push_back(Output::Packet(key, buf));
         self.encoder.clear();
     }
 
     fn put(
         &mut self,
-        key: &LinkKey,
+        key: LinkKey,
         outputs: &mut VecDeque<Output>,
         timers: &mut DelayQueue<Timeout>,
         params: &Params,
@@ -279,7 +321,7 @@ impl PacketBuf {
             // Encoding succeeded. The buffer was empty. Set a timer to flush it.
             assert!(self.flush_timer_key.is_none());
 
-            self.flush_timer_key = Some(timers.insert(Timeout::OutgoingPacket(*key), timeout()));
+            self.flush_timer_key = Some(timers.insert(Timeout::OutgoingPacket(key), timeout()));
         }
     }
 
@@ -326,7 +368,7 @@ pub struct State {
     hello_timer_key: TimerKey,
     hellos_until_ihu: u8,
     update_timer_key: TimerKey,
-    neighbour_table: HashMap<LinkKey, NeighbourValue>,
+    neighbour_table: SlotMap<LinkKey, NeighbourValue>,
     source_table: HashMap<SourceKey, SourceValue>,
     route_table: RouteTable,
     pending_seqno_request_table: HashMap<SourceKey, PendingSeqnoRequestValue>,
@@ -356,7 +398,7 @@ impl State {
             hello_timer_key,
             hellos_until_ihu,
             update_timer_key,
-            neighbour_table: HashMap::new(),
+            neighbour_table: SlotMap::with_key(),
             source_table: HashMap::new(),
             route_table: RouteTable::new(),
             pending_seqno_request_table: HashMap::new(),
@@ -369,14 +411,9 @@ impl State {
         }
     }
 
-    pub fn add_neighbour(&mut self, key: LinkKey) -> bool {
-        match self.neighbour_table.entry(key) {
-            Entry::Occupied(_) => false,
-            Entry::Vacant(e) => {
-                e.insert(NeighbourValue::new(&self.params));
-                true
-            }
-        }
+    pub fn add_neighbour(&mut self) -> LinkKey {
+        self.neighbour_table
+            .insert(NeighbourValue::new(&self.params))
     }
 
     pub fn add_local_route(&mut self, prefix: Ipv6Net) -> bool {
@@ -452,35 +489,35 @@ impl State {
                 );
             }
             Timeout::IncomingHello(key) => {
-                let neigh = self.neighbour_table.get_mut(&key).unwrap();
+                let neigh = self.neighbour_table.get_mut(key).unwrap();
 
                 let prefixes = if neigh.hello_history.missed() == HelloEffect::Flush {
                     neigh.hello_timer_key = None;
                     neigh.flush(&mut self.timers);
 
-                    self.remove_neighbour_routes(&key)
+                    self.remove_neighbour_routes(key)
                 } else {
                     let timeout = neigh.last_hello_interval.unwrap().to_duration();
                     neigh.hello_timer_key =
                         Some(self.timers.insert(Timeout::IncomingHello(key), timeout));
 
-                    self.route_table.neighbour_prefixes(&key)
+                    self.route_table.neighbour_prefixes(key)
                 };
 
                 self.select_routes(&prefixes);
             }
             Timeout::IncomingIhu(key) => {
-                let neigh = self.neighbour_table.get_mut(&key).unwrap();
+                let neigh = self.neighbour_table.get_mut(key).unwrap();
                 neigh.ihu_timer_key = None;
                 neigh.txcost = COST_INFINITY;
 
-                self.select_routes(&self.route_table.neighbour_prefixes(&key));
+                self.select_routes(&self.route_table.neighbour_prefixes(key));
             }
             Timeout::SourceGc(key) => {
                 assert!(self.source_table.remove(&key).is_some());
             }
             Timeout::RouteExpiry(prefix, key) => {
-                assert!(self.route_table.remove(&prefix, &key).is_some());
+                assert!(self.route_table.remove(&prefix, key).is_some());
                 self.select_routes(&[prefix]);
             }
             Timeout::RouteHold(prefix) => {
@@ -499,14 +536,14 @@ impl State {
             }
             Timeout::SeqnoRequest(_key) => todo!(),
             Timeout::OutgoingPacket(key) => {
-                let buf = &mut self.neighbour_table.get_mut(&key).unwrap().packet_buf;
+                let buf = &mut self.neighbour_table.get_mut(key).unwrap().packet_buf;
                 buf.flush_timer_key = None;
-                buf.flush(&key, &mut self.outputs);
+                buf.flush(key, &mut self.outputs);
             }
         }
     }
 
-    pub fn handle_packet(&mut self, key: &LinkKey, buf: &[u8]) {
+    pub fn handle_packet(&mut self, key: LinkKey, buf: &[u8]) {
         self.receive_timestamp = timestamp_now();
 
         // Malformed packets, and TLVs that fail to decode or are otherwise
@@ -555,7 +592,7 @@ impl State {
         self.select_routes(&prefixes);
     }
 
-    fn handle_tlv(&mut self, key: &LinkKey, tlv: &Tlv) {
+    fn handle_tlv(&mut self, key: LinkKey, tlv: &Tlv) {
         let neigh = self.neighbour_table.get_mut(key).unwrap();
 
         match *tlv {
@@ -599,7 +636,7 @@ impl State {
                         self.timers.reset(&timer_key, timeout);
                     } else {
                         neigh.hello_timer_key =
-                            Some(self.timers.insert(Timeout::IncomingHello(*key), timeout));
+                            Some(self.timers.insert(Timeout::IncomingHello(key), timeout));
                     }
                 }
 
@@ -627,7 +664,7 @@ impl State {
                     self.timers.reset(&timer_key, timeout);
                 } else {
                     neigh.ihu_timer_key =
-                        Some(self.timers.insert(Timeout::IncomingIhu(*key), timeout));
+                        Some(self.timers.insert(Timeout::IncomingIhu(key), timeout));
                 }
 
                 if let Some(ts) = origin_receive_timestamps {
@@ -648,7 +685,7 @@ impl State {
     }
 
     /// Answers a route request (RFC 8966 §3.8.1.1, RFC 9229 §2.3).
-    fn handle_route_request(&mut self, key: &LinkKey, ae: Ae, plen: u8, prefix: [u8; 16]) {
+    fn handle_route_request(&mut self, key: LinkKey, ae: Ae, plen: u8, prefix: [u8; 16]) {
         if ae == Ae::Wildcard {
             // TODO: Full route table dumps SHOULD be rate-limited.
             self.dump_routes(Some(key));
@@ -694,7 +731,7 @@ impl State {
         );
     }
 
-    fn handle_update(&mut self, neigh: &LinkKey, update: &Update) {
+    fn handle_update(&mut self, neigh: LinkKey, update: &Update) {
         let Update {
             ae,
             plen,
@@ -735,7 +772,7 @@ impl State {
 
         if let Some(route) = self
             .route_table
-            .get_or_insert_with(prefix, *neigh, || RouteValue {
+            .get_or_insert_with(prefix, neigh, || RouteValue {
                 router_id,
                 advertised_metric: metric,
                 metric: METRIC_INFINITY,
@@ -745,7 +782,7 @@ impl State {
                 feasible: false,
                 expiry_timer_key: self
                     .timers
-                    .insert(Timeout::RouteExpiry(prefix, *neigh), expiry_time),
+                    .insert(Timeout::RouteExpiry(prefix, neigh), expiry_time),
             })
         {
             route.router_id = router_id;
@@ -760,7 +797,7 @@ impl State {
 
     /// Removes the routes through a neighbour along with their expiry timers,
     /// returning their prefixes.
-    fn remove_neighbour_routes(&mut self, neigh: &LinkKey) -> Vec<Ipv6Net> {
+    fn remove_neighbour_routes(&mut self, neigh: LinkKey) -> Vec<Ipv6Net> {
         let Some(prefixes) = self.route_table.neigh_prefixes.get_mut(neigh) else {
             return Vec::new();
         };
@@ -821,8 +858,9 @@ impl State {
             let current = match table.state {
                 RouteState::Selected(neigh) => table
                     .table
-                    .get_key_value(&neigh)
-                    .filter(|(_, r)| r.feasible && r.metric != METRIC_INFINITY),
+                    .get(neigh)
+                    .filter(|r| r.feasible && r.metric != METRIC_INFINITY)
+                    .map(|r| (neigh, r)),
                 _ => None,
             };
 
@@ -843,7 +881,7 @@ impl State {
                         ra.metric_smoothed
                             .total_cmp(&rb.metric_smoothed)
                             .then(ra.metric.cmp(&rb.metric))
-                            .then(ka.as_bytes().cmp(kb.as_bytes()))
+                            .then(ka.cmp(kb))
                     })
                     .or(current)
             } else {
@@ -855,7 +893,7 @@ impl State {
                         ra.metric
                             .cmp(&rb.metric)
                             .then(ra.metric_smoothed.total_cmp(&rb.metric_smoothed))
-                            .then(ka.as_bytes().cmp(kb.as_bytes()))
+                            .then(ka.cmp(kb))
                     })
             };
 
@@ -882,11 +920,11 @@ impl State {
                     }
                 }
 
-                if table.state != RouteState::Selected(*neigh) {
-                    self.outputs.push_back(Output::RouteSelect(prefix, *neigh));
+                if table.state != RouteState::Selected(neigh) {
+                    self.outputs.push_back(Output::RouteSelect(prefix, neigh));
                 }
 
-                table.state = RouteState::Selected(*neigh);
+                table.state = RouteState::Selected(neigh);
                 table.update = Some((route.router_id, route.seqno, route.metric));
             } else if let RouteState::Selected(_) = table.state {
                 // Retraction. Send a triggered update.
@@ -906,7 +944,7 @@ impl State {
 
             if let Some(urgent) = update_urgent {
                 let (router_id, seqno, metric) = table.update.unwrap();
-                let next_hop = selection.map(|t| *t.0);
+                let next_hop = selection.map(|t| t.0);
                 self.send_triggered_update(urgent, next_hop, prefix, router_id, seqno, metric);
             }
 
@@ -941,7 +979,7 @@ impl State {
 
         for (key, neigh) in &mut self.neighbour_table {
             // Split horizon (RFC 8966 §3.7.4).
-            if next_hop == Some(*key) {
+            if next_hop == Some(key) {
                 continue;
             }
 
@@ -961,7 +999,7 @@ impl State {
 
     /// Sends a full dump of the routes that this node advertises,
     /// to every neighbour or to the given one.
-    fn dump_routes(&mut self, to: Option<&LinkKey>) {
+    fn dump_routes(&mut self, to: Option<LinkKey>) {
         struct Update {
             prefix: Ipv6Net,
             router_id: RouterId,
@@ -1052,7 +1090,7 @@ impl State {
             } else {
                 for (key, neigh) in &mut self.neighbour_table {
                     // Split horizon (RFC 8966 §3.7.4).
-                    if state != RouteState::Selected(*key) {
+                    if state != RouteState::Selected(key) {
                         put_update(key, neigh);
                     }
                 }
@@ -1083,7 +1121,7 @@ impl State {
             let gc_time = self.params.get_duration(DurationKey::SourceGcTime);
 
             match self.source_table.entry(key) {
-                Entry::Occupied(e) => {
+                hash_map::Entry::Occupied(e) => {
                     let v = e.into_mut();
                     if v.seqno.lt(seqno) {
                         v.seqno = seqno;
@@ -1093,7 +1131,7 @@ impl State {
                     }
                     self.timers.reset(&v.gc_timer_key, gc_time);
                 }
-                Entry::Vacant(e) => {
+                hash_map::Entry::Vacant(e) => {
                     e.insert(SourceValue {
                         seqno,
                         metric,
