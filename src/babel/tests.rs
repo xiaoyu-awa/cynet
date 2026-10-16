@@ -57,8 +57,8 @@ type Filter = fn(usize, usize, Box<[u8]>) -> Option<Box<[u8]>>;
 /// After every event, the node's route table is checked to keep no empty entries.
 struct Net {
     nodes: Vec<State>,
-    /// The link keys of each node, mapped to and from the indices of their neighbours.
-    link_maps: Vec<LinkMap<usize>>,
+    /// The neighbour keys of each node, mapped to and from the indices of their neighbours.
+    key_maps: Vec<NeighKeyMap<usize>>,
     /// The one-way latency of each link direction that is up.
     links: HashMap<(usize, usize), Duration>,
     filter: Filter,
@@ -74,7 +74,7 @@ impl Net {
     fn new(n: usize) -> Self {
         Self {
             nodes: (0..n).map(state).collect(),
-            link_maps: (0..n).map(|_| LinkMap::new()).collect(),
+            key_maps: (0..n).map(|_| NeighKeyMap::new()).collect(),
             links: HashMap::new(),
             filter: |_, _, buf| Some(buf),
             in_flight: DelayQueue::new(),
@@ -87,8 +87,8 @@ impl Net {
 
     /// Adds node `j` as a neighbour of node `i`, which may be outside the simulation.
     fn add_neighbour(&mut self, i: usize, j: usize) {
-        let link = self.nodes[i].add_neighbour();
-        self.link_maps[i].insert(j, link);
+        let key = self.nodes[i].add_neigh();
+        self.key_maps[i].insert(j, key);
     }
 
     fn connect(&mut self, a: usize, b: usize, latency: Duration) {
@@ -98,14 +98,14 @@ impl Net {
         self.links.insert((b, a), latency);
     }
 
-    /// Returns the link key of node `i` for node `j`.
-    fn key(&self, i: usize, j: usize) -> LinkKey {
-        self.link_maps[i].link(&j).unwrap()
+    /// Returns the neighbour key of node `i` for node `j`.
+    fn key(&self, i: usize, j: usize) -> NeighKey {
+        self.key_maps[i].internal(j).unwrap()
     }
 
-    /// Returns the index of the node that a link key of node `i` is for.
-    fn index(&self, i: usize, key: LinkKey) -> usize {
-        self.link_maps[i].key(key).unwrap()
+    /// Returns the index of the node that a neighbour key of node `i` is for.
+    fn index(&self, i: usize, key: NeighKey) -> usize {
+        self.key_maps[i].external(key).unwrap()
     }
 
     fn originate(&mut self, i: usize, prefix: Ipv6Net) {
@@ -207,7 +207,7 @@ impl Net {
         }
 
         for (prefix, table) in &self.nodes[from].route_table.by_prefix {
-            let empty = table.state == RouteState::Removed && table.table.is_empty();
+            let empty = table.state == RouteState::Removed && table.routes.is_empty();
             assert!(
                 !empty,
                 "node {from} should not keep an empty entry for {prefix}"
@@ -289,8 +289,8 @@ impl Net {
     }
 
     /// Returns node `i`'s entry for node `j`.
-    fn neigh(&self, i: usize, j: usize) -> &NeighbourValue {
-        &self.nodes[i].neighbour_table[self.key(i, j)]
+    fn neigh(&self, i: usize, j: usize) -> &NeighValue {
+        &self.nodes[i].neigh_table[self.key(i, j)]
     }
 
     /// Returns node `i`'s rxcost, txcost and link cost for node `j`.
@@ -446,7 +446,7 @@ fn link_cost() {
     ];
 
     for (bits, txcost, rtt_ms, rxcost, cost) in rows {
-        let mut neigh = NeighbourValue::new(&Params::new());
+        let mut neigh = NeighValue::new(&Params::new());
 
         // Receive or miss a Hello for each bit, the most recent last.
         for (i, seqno) in (0..16).rev().zip(0..) {
@@ -632,7 +632,7 @@ async fn rebooted_neighbour_is_reacquired() {
     let hello_seqno = net.nodes[1].hello_seqno + 1000;
     net.nodes[1] = state(1);
     net.nodes[1].hello_seqno = hello_seqno;
-    net.link_maps[1] = LinkMap::new();
+    net.key_maps[1] = NeighKeyMap::new();
     net.add_neighbour(1, 0);
 
     // Its first Hello flushes node 0's entry for it, restarting the history.

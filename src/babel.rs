@@ -10,6 +10,7 @@ use std::{
     cmp::Ordering,
     collections::{HashMap, HashSet, VecDeque, hash_map},
     hash::Hash,
+    mem,
     net::Ipv6Addr,
     task::{Context, Poll},
     time::Duration,
@@ -30,47 +31,47 @@ use crate::babel::{
 };
 
 slotmap::new_key_type! {
-    /// Identifies a link to a neighbour.
-    pub struct LinkKey;
+    /// Identifies a neighbour internally.
+    pub struct NeighKey;
 }
 
-/// A one-to-one mapping between link keys and the keys that identify the same
-/// neighbours elsewhere, such as WireGuard public keys.
-pub struct LinkMap<K> {
-    links: HashMap<K, LinkKey>,
-    keys: SecondaryMap<LinkKey, K>,
+/// A one-to-one mapping between internal neighbour keys and external ones that
+/// identify the same neighbours elsewhere, such as WireGuard public keys.
+pub struct NeighKeyMap<K> {
+    inward: HashMap<K, NeighKey>,
+    outward: SecondaryMap<NeighKey, K>,
 }
 
-impl<K: Copy + Eq + Hash> LinkMap<K> {
+impl<K: Copy + Eq + Hash> NeighKeyMap<K> {
     pub fn new() -> Self {
         Self {
-            links: HashMap::new(),
-            keys: SecondaryMap::new(),
+            inward: HashMap::new(),
+            outward: SecondaryMap::new(),
         }
     }
 
-    /// Maps `key` and `link` to each other. Neither may be mapped already.
-    pub fn insert(&mut self, key: K, link: LinkKey) {
+    /// Maps `external` and `internal` to each other. Neither may be mapped already.
+    pub fn insert(&mut self, external: K, internal: NeighKey) {
         assert!(
-            !self.links.contains_key(&key) && !self.keys.contains_key(link),
-            "key and link key should not be mapped already"
+            !self.inward.contains_key(&external) && !self.outward.contains_key(internal),
+            "keys should not be mapped already"
         );
-        self.links.insert(key, link);
-        self.keys.insert(link, key);
+        self.inward.insert(external, internal);
+        self.outward.insert(internal, external);
     }
 
-    /// Returns the link key mapped to `key`, if any.
-    pub fn link(&self, key: &K) -> Option<LinkKey> {
-        self.links.get(key).copied()
+    /// Returns the corresponding internal key, if any.
+    pub fn internal(&self, external: K) -> Option<NeighKey> {
+        self.inward.get(&external).copied()
     }
 
-    /// Returns the key mapped to `link`, if any.
-    pub fn key(&self, link: LinkKey) -> Option<K> {
-        self.keys.get(link).copied()
+    /// Returns the corresponding external key, if any.
+    pub fn external(&self, internal: NeighKey) -> Option<K> {
+        self.outward.get(internal).copied()
     }
 }
 
-struct NeighbourValue {
+struct NeighValue {
     hello_history: HelloHistory,
     txcost: u16,
     last_hello_interval: Option<Interval>,
@@ -81,7 +82,7 @@ struct NeighbourValue {
     rtt: Option<f64>,
 }
 
-impl NeighbourValue {
+impl NeighValue {
     fn new(params: &Params) -> Self {
         Self {
             hello_history: HelloHistory::new(),
@@ -180,13 +181,13 @@ struct RouteValue {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RouteState {
     Local,
-    Selected(LinkKey),
+    Selected(NeighKey),
     Held(TimerKey),
     Removed,
 }
 
 struct PrefixRouteTable {
-    table: SparseSecondaryMap<LinkKey, RouteValue>,
+    routes: SparseSecondaryMap<NeighKey, RouteValue>,
     state: RouteState,
     update: Option<(RouterId, Seqno, u16)>,
     metric_smoothed_at: Instant,
@@ -195,7 +196,7 @@ struct PrefixRouteTable {
 impl PrefixRouteTable {
     fn new() -> Self {
         Self {
-            table: SparseSecondaryMap::new(),
+            routes: SparseSecondaryMap::new(),
             state: RouteState::Removed,
             update: None,
             metric_smoothed_at: Instant::now(),
@@ -205,7 +206,7 @@ impl PrefixRouteTable {
 
 struct RouteTable {
     by_prefix: HashMap<Ipv6Net, PrefixRouteTable>,
-    neigh_prefixes: SecondaryMap<LinkKey, HashSet<Ipv6Net>>,
+    neigh_prefixes: SecondaryMap<NeighKey, HashSet<Ipv6Net>>,
 }
 
 impl RouteTable {
@@ -231,7 +232,7 @@ impl RouteTable {
     fn get_or_insert_with(
         &mut self,
         prefix: Ipv6Net,
-        neigh: LinkKey,
+        key: NeighKey,
         f: impl FnOnce() -> RouteValue,
     ) -> Option<&mut RouteValue> {
         let table = self
@@ -239,36 +240,26 @@ impl RouteTable {
             .entry(prefix)
             .or_insert_with(PrefixRouteTable::new);
 
-        match table.table.entry(neigh).unwrap() {
+        match table.routes.entry(key).unwrap() {
             sparse_secondary::Entry::Occupied(e) => Some(e.into_mut()),
             sparse_secondary::Entry::Vacant(e) => {
-                let prefixes = self.neigh_prefixes.entry(neigh).unwrap().or_default();
-                assert!(prefixes.insert(prefix));
-
+                assert!(self.neigh_prefixes[key].insert(prefix));
                 e.insert(f());
                 None
             }
         }
     }
 
-    fn remove(&mut self, prefix: &Ipv6Net, neigh: LinkKey) -> Option<RouteValue> {
-        let route = self.by_prefix.get_mut(prefix)?.table.remove(neigh)?;
-        assert!(self.neigh_prefixes.get_mut(neigh).unwrap().remove(prefix));
+    fn remove(&mut self, prefix: &Ipv6Net, key: NeighKey) -> Option<RouteValue> {
+        let route = self.by_prefix.get_mut(prefix)?.routes.remove(key)?;
+        assert!(self.neigh_prefixes[key].remove(prefix));
         Some(route)
-    }
-
-    /// Returns the prefixes of the routes through a neighbour.
-    fn neighbour_prefixes(&self, neigh: LinkKey) -> Vec<Ipv6Net> {
-        let Some(prefixes) = self.neigh_prefixes.get(neigh) else {
-            return Vec::new();
-        };
-        prefixes.iter().copied().collect()
     }
 }
 
 struct PendingSeqnoRequestValue {
     seqno: Seqno,
-    neighbour: Option<LinkKey>,
+    neigh_key: Option<NeighKey>,
     resends_left: u8,
     timer_key: TimerKey,
 }
@@ -280,7 +271,7 @@ struct PacketBuf {
 }
 
 impl PacketBuf {
-    fn flush(&mut self, key: LinkKey, outputs: &mut VecDeque<Output>) {
+    fn flush(&mut self, key: NeighKey, outputs: &mut VecDeque<Output>) {
         assert!(
             !self.encoder.is_empty(),
             "empty buffer should not be flushed"
@@ -293,7 +284,7 @@ impl PacketBuf {
 
     fn put(
         &mut self,
-        key: LinkKey,
+        key: NeighKey,
         outputs: &mut VecDeque<Output>,
         timers: &mut DelayQueue<Timeout>,
         params: &Params,
@@ -344,18 +335,18 @@ impl PacketBuf {
 pub enum Timeout {
     OutgoingHello,
     OutgoingUpdate,
-    IncomingHello(LinkKey),
-    IncomingIhu(LinkKey),
+    IncomingHello(NeighKey),
+    IncomingIhu(NeighKey),
     SourceGc(SourceKey),
-    RouteExpiry(Ipv6Net, LinkKey),
+    RouteExpiry(Ipv6Net, NeighKey),
     RouteHold(Ipv6Net),
     SeqnoRequest(SourceKey),
-    OutgoingPacket(LinkKey),
+    OutgoingPacket(NeighKey),
 }
 
 pub enum Output {
-    Packet(LinkKey, Box<[u8]>),
-    RouteSelect(Ipv6Net, LinkKey),
+    Packet(NeighKey, Box<[u8]>),
+    RouteSelect(Ipv6Net, NeighKey),
     RouteHold(Ipv6Net),
     RouteRemove(Ipv6Net),
 }
@@ -368,7 +359,7 @@ pub struct State {
     hello_timer_key: TimerKey,
     hellos_until_ihu: u8,
     update_timer_key: TimerKey,
-    neighbour_table: SlotMap<LinkKey, NeighbourValue>,
+    neigh_table: SlotMap<NeighKey, NeighValue>,
     source_table: HashMap<SourceKey, SourceValue>,
     route_table: RouteTable,
     pending_seqno_request_table: HashMap<SourceKey, PendingSeqnoRequestValue>,
@@ -378,7 +369,6 @@ pub struct State {
     receive_timestamp: u32,
     hello_timestamp: Option<u32>,
     ihu_timestamps: Option<(u32, u32)>,
-    updated_prefixes: HashSet<Ipv6Net>,
 }
 
 impl State {
@@ -398,7 +388,7 @@ impl State {
             hello_timer_key,
             hellos_until_ihu,
             update_timer_key,
-            neighbour_table: SlotMap::with_key(),
+            neigh_table: SlotMap::with_key(),
             source_table: HashMap::new(),
             route_table: RouteTable::new(),
             pending_seqno_request_table: HashMap::new(),
@@ -407,13 +397,13 @@ impl State {
             receive_timestamp: 0,
             hello_timestamp: None,
             ihu_timestamps: None,
-            updated_prefixes: HashSet::new(),
         }
     }
 
-    pub fn add_neighbour(&mut self) -> LinkKey {
-        self.neighbour_table
-            .insert(NeighbourValue::new(&self.params))
+    pub fn add_neigh(&mut self) -> NeighKey {
+        let key = self.neigh_table.insert(NeighValue::new(&self.params));
+        self.route_table.neigh_prefixes.insert(key, HashSet::new());
+        key
     }
 
     pub fn add_local_route(&mut self, prefix: Ipv6Net) -> bool {
@@ -447,7 +437,7 @@ impl State {
                     None
                 };
 
-                for (key, neigh) in &mut self.neighbour_table {
+                for (key, neigh) in &mut self.neigh_table {
                     let rxcost = neigh.rxcost();
                     let origin_receive_timestamps = neigh.origin_receive_timestamps;
 
@@ -489,36 +479,41 @@ impl State {
                 );
             }
             Timeout::IncomingHello(key) => {
-                let neigh = self.neighbour_table.get_mut(key).unwrap();
+                let neigh = &mut self.neigh_table[key];
+                let cost = neigh.cost();
 
-                let prefixes = if neigh.hello_history.missed() == HelloEffect::Flush {
+                if neigh.hello_history.missed() == HelloEffect::Flush {
                     neigh.hello_timer_key = None;
                     neigh.flush(&mut self.timers);
 
-                    self.remove_neighbour_routes(key)
+                    self.remove_neigh_routes(key);
                 } else {
                     let timeout = neigh.last_hello_interval.unwrap().to_duration();
                     neigh.hello_timer_key =
                         Some(self.timers.insert(Timeout::IncomingHello(key), timeout));
 
-                    self.route_table.neighbour_prefixes(key)
-                };
-
-                self.select_routes(&prefixes);
+                    if neigh.cost() != cost {
+                        self.neigh_cost_changed(key);
+                    }
+                }
             }
             Timeout::IncomingIhu(key) => {
-                let neigh = self.neighbour_table.get_mut(key).unwrap();
+                let neigh = &mut self.neigh_table[key];
+                let cost = neigh.cost();
+
                 neigh.ihu_timer_key = None;
                 neigh.txcost = COST_INFINITY;
 
-                self.select_routes(&self.route_table.neighbour_prefixes(key));
+                if neigh.cost() != cost {
+                    self.neigh_cost_changed(key);
+                }
             }
             Timeout::SourceGc(key) => {
                 assert!(self.source_table.remove(&key).is_some());
             }
             Timeout::RouteExpiry(prefix, key) => {
                 assert!(self.route_table.remove(&prefix, key).is_some());
-                self.select_routes(&[prefix]);
+                self.select_route(prefix, key);
             }
             Timeout::RouteHold(prefix) => {
                 let table = self.route_table.by_prefix.get_mut(&prefix).unwrap();
@@ -526,7 +521,7 @@ impl State {
 
                 self.outputs.push_back(Output::RouteRemove(prefix));
 
-                if table.table.is_empty() {
+                if table.routes.is_empty() {
                     // Nothing is left to keep the entry for.
                     self.route_table.by_prefix.remove(&prefix);
                 } else {
@@ -534,23 +529,25 @@ impl State {
                     table.update = None;
                 }
             }
-            Timeout::SeqnoRequest(_key) => todo!(),
+            Timeout::SeqnoRequest(_source_key) => todo!(),
             Timeout::OutgoingPacket(key) => {
-                let buf = &mut self.neighbour_table.get_mut(key).unwrap().packet_buf;
+                let buf = &mut self.neigh_table[key].packet_buf;
                 buf.flush_timer_key = None;
                 buf.flush(key, &mut self.outputs);
             }
         }
     }
 
-    pub fn handle_packet(&mut self, key: LinkKey, buf: &[u8]) {
-        self.receive_timestamp = timestamp_now();
-
+    pub fn handle_packet(&mut self, key: NeighKey, buf: &[u8]) {
         // Malformed packets, and TLVs that fail to decode or are otherwise
         // ignored, are silently ignored (RFC 8966 §4.2, §4.3, §4.4, §4.6).
         let Some(decoder) = PacketDecoder::new(buf) else {
             return;
         };
+
+        self.receive_timestamp = timestamp_now();
+
+        let cost = self.neigh_table[key].cost();
 
         for res in decoder {
             let Ok(item) = res else {
@@ -573,7 +570,7 @@ impl State {
             const ALPHA: f64 = 0.836;
 
             if d <= T && dp <= T {
-                let rtt = &mut self.neighbour_table.get_mut(key).unwrap().rtt;
+                let rtt = &mut self.neigh_table[key].rtt;
                 let rtt_n = d.saturating_sub(dp) as f64;
 
                 if let Some(rtt) = rtt {
@@ -585,15 +582,16 @@ impl State {
             }
         }
 
+        if self.neigh_table[key].cost() != cost {
+            self.neigh_cost_changed(key);
+        }
+
         self.hello_timestamp = None;
         self.ihu_timestamps = None;
-
-        let prefixes: Vec<_> = self.updated_prefixes.drain().collect();
-        self.select_routes(&prefixes);
     }
 
-    fn handle_tlv(&mut self, key: LinkKey, tlv: &Tlv) {
-        let neigh = self.neighbour_table.get_mut(key).unwrap();
+    fn handle_tlv(&mut self, key: NeighKey, tlv: &Tlv) {
+        let neigh = &mut self.neigh_table[key];
 
         match *tlv {
             Tlv::Pad1 | Tlv::PadN { .. } | Tlv::RouterId { .. } => {}
@@ -644,10 +642,6 @@ impl State {
                     neigh.origin_receive_timestamps = Some((t, self.receive_timestamp));
                     self.hello_timestamp = Some(t);
                 }
-
-                // The link cost may change.
-                let prefixes = self.route_table.neighbour_prefixes(key);
-                self.updated_prefixes.extend(prefixes);
             }
             Tlv::Ihu {
                 ae: _,
@@ -672,10 +666,6 @@ impl State {
                 }
 
                 neigh.txcost = rxcost;
-
-                // The link cost may change.
-                let prefixes = self.route_table.neighbour_prefixes(key);
-                self.updated_prefixes.extend(prefixes);
             }
             Tlv::RouteRequest { ae, plen, prefix } => {
                 self.handle_route_request(key, ae, plen, prefix);
@@ -685,7 +675,7 @@ impl State {
     }
 
     /// Answers a route request (RFC 8966 §3.8.1.1, RFC 9229 §2.3).
-    fn handle_route_request(&mut self, key: LinkKey, ae: Ae, plen: u8, prefix: [u8; 16]) {
+    fn handle_route_request(&mut self, key: NeighKey, ae: Ae, plen: u8, prefix: [u8; 16]) {
         if ae == Ae::Wildcard {
             // TODO: Full route table dumps SHOULD be rate-limited.
             self.dump_routes(Some(key));
@@ -721,8 +711,7 @@ impl State {
             router_id: Some(router_id),
         };
 
-        let neigh = self.neighbour_table.get_mut(key).unwrap();
-        neigh.packet_buf.put(
+        self.neigh_table[key].packet_buf.put(
             key,
             &mut self.outputs,
             &mut self.timers,
@@ -731,7 +720,7 @@ impl State {
         );
     }
 
-    fn handle_update(&mut self, neigh: LinkKey, update: &Update) {
+    fn handle_update(&mut self, key: NeighKey, update: &Update) {
         let Update {
             ae,
             plen,
@@ -745,8 +734,7 @@ impl State {
         if ae == Ae::Wildcard {
             // Wildcard retraction.
             assert_eq!(metric, METRIC_INFINITY);
-            let prefixes = self.remove_neighbour_routes(neigh);
-            self.updated_prefixes.extend(prefixes);
+            self.remove_neigh_routes(key);
             return;
         }
 
@@ -757,9 +745,9 @@ impl State {
         let prefix = Ipv6Net::new_assert(Ipv6Addr::from_octets(prefix), plen);
 
         if metric == METRIC_INFINITY {
-            if let Some(route) = self.route_table.remove(&prefix, neigh) {
+            if let Some(route) = self.route_table.remove(&prefix, key) {
                 self.timers.remove(&route.expiry_timer_key);
-                self.updated_prefixes.insert(prefix);
+                self.select_route(prefix, key);
             }
             return;
         }
@@ -772,7 +760,7 @@ impl State {
 
         if let Some(route) = self
             .route_table
-            .get_or_insert_with(prefix, neigh, || RouteValue {
+            .get_or_insert_with(prefix, key, || RouteValue {
                 router_id,
                 advertised_metric: metric,
                 metric: METRIC_INFINITY,
@@ -782,7 +770,7 @@ impl State {
                 feasible: false,
                 expiry_timer_key: self
                     .timers
-                    .insert(Timeout::RouteExpiry(prefix, neigh), expiry_time),
+                    .insert(Timeout::RouteExpiry(prefix, key), expiry_time),
             })
         {
             route.router_id = router_id;
@@ -792,174 +780,173 @@ impl State {
             self.timers.reset(&route.expiry_timer_key, expiry_time);
         }
 
-        self.updated_prefixes.insert(prefix);
+        self.select_route(prefix, key);
     }
 
-    /// Removes the routes through a neighbour along with their expiry timers,
-    /// returning their prefixes.
-    fn remove_neighbour_routes(&mut self, neigh: LinkKey) -> Vec<Ipv6Net> {
-        let Some(prefixes) = self.route_table.neigh_prefixes.get_mut(neigh) else {
-            return Vec::new();
-        };
-
-        let mut removed = Vec::with_capacity(prefixes.len());
-        for prefix in prefixes.drain() {
-            let table = self.route_table.by_prefix.get_mut(&prefix).unwrap();
-            let route = table.table.remove(neigh).unwrap();
+    fn remove_neigh_routes(&mut self, key: NeighKey) {
+        let prefixes = mem::take(&mut self.route_table.neigh_prefixes[key]);
+        for prefix in &prefixes {
+            let table = self.route_table.by_prefix.get_mut(prefix).unwrap();
+            let route = table.routes.remove(key).unwrap();
             self.timers.remove(&route.expiry_timer_key);
-            removed.push(prefix);
+
+            self.select_route(*prefix, key);
         }
-        removed
     }
 
-    /// Runs route selection (RFC 8966 §3.6) for the given prefixes, after updating
-    /// the metric and feasibility of their routes.
-    fn select_routes(&mut self, prefixes: &[Ipv6Net]) {
+    fn neigh_cost_changed(&mut self, key: NeighKey) {
+        let prefixes = mem::take(&mut self.route_table.neigh_prefixes[key]);
+        for prefix in &prefixes {
+            self.select_route(*prefix, key);
+        }
+        self.route_table.neigh_prefixes[key] = prefixes;
+    }
+
+    /// Runs route selection (RFC 8966 §3.6) for the given prefix, after updating
+    /// the metric and feasibility of its routes.
+    fn select_route(&mut self, prefix: Ipv6Net, changed: NeighKey) {
         let tau = self
             .params
             .get_duration(DurationKey::RouteHysteresisTimeConstant);
         let now = Instant::now();
 
-        for &prefix in prefixes {
-            let table = self.route_table.by_prefix.get_mut(&prefix).unwrap();
+        let table = self.route_table.by_prefix.get_mut(&prefix).unwrap();
 
-            let k = (-(now - table.metric_smoothed_at).div_duration_f64(tau)).exp_m1();
-            table.metric_smoothed_at = now;
+        let k = (-(now - table.metric_smoothed_at).div_duration_f64(tau)).exp_m1();
+        table.metric_smoothed_at = now;
 
-            for (neigh, route) in &mut table.table {
-                // Route hysteresis (RFC 8966 Appendix A.3):
-                //  α = 1 - exp(-ΔT / τ)
-                // ms = α m + (1 - α) ms
-                //    = ms + expm1(-ΔT / τ) * (ms - m)
-                route.metric_smoothed += k * (route.metric_smoothed - route.metric as f64);
+        for (key, route) in &mut table.routes {
+            // Route hysteresis (RFC 8966 Appendix A.3):
+            //  α = 1 - exp(-ΔT / τ)
+            // ms = α m + (1 - α) ms
+            //    = ms + expm1(-ΔT / τ) * (ms - m)
+            route.metric_smoothed += k * (route.metric_smoothed - route.metric as f64);
 
-                let cost = self.neighbour_table[neigh].cost();
-                route.metric = route.advertised_metric.saturating_add(cost);
+            let cost = self.neigh_table[key].cost();
+            route.metric = route.advertised_metric.saturating_add(cost);
 
-                // The feasibility distances change as updates are sent,
-                // so a route may become unfeasible after it is received.
-                route.feasible = self
-                    .source_table
-                    .get(&SourceKey {
-                        prefix,
-                        router_id: route.router_id,
-                    })
-                    .is_none_or(|source| {
-                        source.seqno.lt(route.seqno)
-                            || (route.seqno == source.seqno
-                                && route.advertised_metric < source.metric)
-                    });
-            }
+            // The feasibility distances change as updates are sent,
+            // so a route may become unfeasible after it is received.
+            route.feasible = self
+                .source_table
+                .get(&SourceKey {
+                    prefix,
+                    router_id: route.router_id,
+                })
+                .is_none_or(|source| {
+                    source.seqno.lt(route.seqno)
+                        || (route.seqno == source.seqno && route.advertised_metric < source.metric)
+                });
+        }
 
-            if table.state == RouteState::Local {
-                continue;
-            }
+        if table.state == RouteState::Local {
+            return;
+        }
 
-            let usable = |r: &RouteValue| r.feasible && r.metric != METRIC_INFINITY;
+        let usable = |r: &RouteValue| r.feasible && r.metric != METRIC_INFINITY;
 
-            let current = match table.state {
-                RouteState::Selected(neigh) => table
-                    .table
-                    .get(neigh)
-                    .filter(|r| usable(r))
-                    .map(|r| (neigh, r)),
-                _ => None,
-            };
+        let current = match table.state {
+            RouteState::Selected(key) => table
+                .routes
+                .get(key)
+                .filter(|r| usable(r))
+                .map(|r| (key, r)),
+            _ => None,
+        };
 
-            // If no route to a given destination is selected,
-            // then select the route with the smallest metric,
-            // ignoring the smoothed metric. If a route R is selected,
-            // then switch to a route R' only when both m(R') < m(R) and ms(R') < ms(R).
-            let selection = if let Some((_, route)) = current {
-                table
-                    .table
-                    .iter()
-                    .filter(|(_, r)| {
-                        r.feasible
-                            && r.metric < route.metric
-                            && r.metric_smoothed < route.metric_smoothed
-                    })
-                    .min_by(|(ka, ra), (kb, rb)| {
-                        ra.metric_smoothed
-                            .total_cmp(&rb.metric_smoothed)
-                            .then(ra.metric.cmp(&rb.metric))
-                            .then(ka.cmp(kb))
-                    })
-                    .or(current)
-            } else {
-                table
-                    .table
-                    .iter()
-                    .filter(|(_, r)| usable(r))
-                    .min_by(|(ka, ra), (kb, rb)| {
-                        ra.metric
-                            .cmp(&rb.metric)
-                            .then(ra.metric_smoothed.total_cmp(&rb.metric_smoothed))
-                            .then(ka.cmp(kb))
-                    })
-            };
+        // If no route to a given destination is selected,
+        // then select the route with the smallest metric,
+        // ignoring the smoothed metric. If a route R is selected,
+        // then switch to a route R' only when both m(R') < m(R) and ms(R') < ms(R).
+        let selection = if let Some((_, route)) = current {
+            table
+                .routes
+                .iter()
+                .filter(|(_, r)| {
+                    r.feasible
+                        && r.metric < route.metric
+                        && r.metric_smoothed < route.metric_smoothed
+                })
+                .min_by(|(ka, ra), (kb, rb)| {
+                    ra.metric_smoothed
+                        .total_cmp(&rb.metric_smoothed)
+                        .then(ra.metric.cmp(&rb.metric))
+                        .then(ka.cmp(kb))
+                })
+                .or(current)
+        } else {
+            table
+                .routes
+                .iter()
+                .filter(|(_, r)| usable(r))
+                .min_by(|(ka, ra), (kb, rb)| {
+                    ra.metric
+                        .cmp(&rb.metric)
+                        .then(ra.metric_smoothed.total_cmp(&rb.metric_smoothed))
+                        .then(ka.cmp(kb))
+                })
+        };
 
-            let mut update_urgent = None;
+        let mut update_urgent = None;
 
-            if let Some((neigh, route)) = selection {
-                match table.state {
-                    RouteState::Local => unreachable!(),
-                    RouteState::Selected(_) => {
-                        let (old_router_id, _, _) = table.update.unwrap();
-                        if route.router_id != old_router_id {
-                            // Router-id changed. Send an urgent triggered update.
-                            update_urgent = Some(true);
-                        }
-                    }
-                    RouteState::Held(key) => {
-                        self.timers.remove(&key);
-                        // New route ending a hold. Send a triggered update.
-                        update_urgent = Some(false);
-                    }
-                    RouteState::Removed => {
-                        // New route. Send a triggered update.
-                        update_urgent = Some(false);
+        if let Some((key, route)) = selection {
+            match table.state {
+                RouteState::Local => unreachable!(),
+                RouteState::Selected(_) => {
+                    let (old_router_id, ..) = table.update.unwrap();
+                    if route.router_id != old_router_id {
+                        // Router-id changed. Send an urgent triggered update.
+                        update_urgent = Some(true);
                     }
                 }
-
-                if table.state != RouteState::Selected(neigh) {
-                    self.outputs.push_back(Output::RouteSelect(prefix, neigh));
+                RouteState::Held(key) => {
+                    self.timers.remove(&key);
+                    // New route ending a hold. Send a triggered update.
+                    update_urgent = Some(false);
                 }
-
-                table.state = RouteState::Selected(neigh);
-                table.update = Some((route.router_id, route.seqno, route.metric));
-            } else if let RouteState::Selected(_) = table.state {
-                // Retraction. Send a triggered update.
-                update_urgent = Some(false);
-
-                self.outputs.push_back(Output::RouteHold(prefix));
-
-                table.state = RouteState::Held(self.timers.insert(
-                    Timeout::RouteHold(prefix),
-                    self.params.get_duration(DurationKey::RouteHoldTime),
-                ));
-                table.update.as_mut().unwrap().2 = METRIC_INFINITY;
+                RouteState::Removed => {
+                    // New route. Send a triggered update.
+                    update_urgent = Some(false);
+                }
             }
 
-            // A removed prefix without routes has nothing left to keep its entry for.
-            let empty = table.state == RouteState::Removed && table.table.is_empty();
-
-            if let Some(urgent) = update_urgent {
-                let (router_id, seqno, metric) = table.update.unwrap();
-                let next_hop = selection.map(|t| t.0);
-                self.send_triggered_update(urgent, next_hop, prefix, router_id, seqno, metric);
+            if table.state != RouteState::Selected(key) {
+                self.outputs.push_back(Output::RouteSelect(prefix, key));
             }
 
-            if empty {
-                self.route_table.by_prefix.remove(&prefix);
-            }
+            table.state = RouteState::Selected(key);
+            table.update = Some((route.router_id, route.seqno, route.metric));
+        } else if let RouteState::Selected(_) = table.state {
+            // Retraction. Send a triggered update.
+            update_urgent = Some(false);
+
+            self.outputs.push_back(Output::RouteHold(prefix));
+
+            table.state = RouteState::Held(self.timers.insert(
+                Timeout::RouteHold(prefix),
+                self.params.get_duration(DurationKey::RouteHoldTime),
+            ));
+            table.update.as_mut().unwrap().2 = METRIC_INFINITY;
+        }
+
+        // A removed prefix without routes has nothing left to keep its entry for.
+        let empty = table.state == RouteState::Removed && table.routes.is_empty();
+
+        if let Some(urgent) = update_urgent {
+            let (router_id, seqno, metric) = table.update.unwrap();
+            let next_hop = selection.map(|t| t.0);
+            self.send_triggered_update(urgent, next_hop, prefix, router_id, seqno, metric);
+        }
+
+        if empty {
+            self.route_table.by_prefix.remove(&prefix);
         }
     }
 
     fn send_triggered_update(
         &mut self,
         urgent: bool,
-        next_hop: Option<LinkKey>,
+        next_hop: Option<NeighKey>,
         prefix: Ipv6Net,
         router_id: RouterId,
         seqno: Seqno,
@@ -979,7 +966,7 @@ impl State {
 
         let urgent_timeout = urgent.then(|| self.params.get_duration(DurationKey::UrgentTimeout));
 
-        for (key, neigh) in &mut self.neighbour_table {
+        for (key, neigh) in &mut self.neigh_table {
             // Split horizon (RFC 8966 §3.7.4).
             if next_hop == Some(key) {
                 continue;
@@ -1001,7 +988,7 @@ impl State {
 
     /// Sends a full dump of the routes that this node advertises,
     /// to every neighbour or to the given one.
-    fn dump_routes(&mut self, to: Option<LinkKey>) {
+    fn dump_routes(&mut self, to: Option<NeighKey>) {
         struct Update {
             prefix: Ipv6Net,
             router_id: RouterId,
@@ -1076,7 +1063,7 @@ impl State {
                 router_id: Some(router_id),
             };
 
-            let mut put_update = |key, neigh: &mut NeighbourValue| {
+            let mut put_update = |key, neigh: &mut NeighValue| {
                 neigh.packet_buf.put(
                     key,
                     &mut self.outputs,
@@ -1087,10 +1074,9 @@ impl State {
             };
 
             if let Some(key) = to {
-                let neigh = self.neighbour_table.get_mut(key).unwrap();
-                put_update(key, neigh);
+                put_update(key, &mut self.neigh_table[key]);
             } else {
-                for (key, neigh) in &mut self.neighbour_table {
+                for (key, neigh) in &mut self.neigh_table {
                     // Split horizon (RFC 8966 §3.7.4).
                     if state != RouteState::Selected(key) {
                         put_update(key, neigh);
