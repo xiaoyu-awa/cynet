@@ -1133,10 +1133,10 @@ impl State {
             .route_table
             .by_prefix
             .iter()
-            .filter_map(|(prefix, table)| {
+            .filter_map(|(&prefix, table)| {
                 self.update_for_prefix(table)
                     .map(|(router_id, seqno, metric)| Update {
-                        prefix: *prefix,
+                        prefix,
                         router_id,
                         seqno,
                         metric,

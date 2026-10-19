@@ -34,16 +34,13 @@ impl Params {
     pub fn set_hello_interval(&mut self, i: Interval) -> &mut Self {
         const MAX_I: u16 = u16::MAX / 4;
 
-        assert!(
-            i.get() <= MAX_I,
-            "Hello interval should not be larger than 163.83s"
-        );
+        assert!(i.get() <= MAX_I, "Hello interval should not exceed 163.83s");
 
         self.hello_interval = i;
         self.ihu_interval = Interval::new(i.get() * 3).unwrap();
         self.update_interval = Interval::new(i.get() * 4).unwrap();
         // 3 times the Hello interval, in microseconds.
-        self.tau = u32::from(i.get()) * 3 * 10_000;
+        self.tau = i.get() as u32 * 3 * 10_000;
         self
     }
 
