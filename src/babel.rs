@@ -7,6 +7,7 @@ mod tests;
 
 use std::{
     assert_matches,
+    cell::Cell,
     cmp::Ordering,
     collections::{HashMap, HashSet, VecDeque, hash_map},
     hash::Hash,
@@ -74,6 +75,8 @@ impl<K: Copy + Eq + Hash> NeighKeyMap<K> {
 struct NeighValue {
     hello_history: HelloHistory,
     txcost: u16,
+    /// The link cost, as last computed by [`Self::update_cost`].
+    cost: u16,
     last_hello_interval: Option<Interval>,
     hello_timer_key: Option<TimerKey>,
     ihu_timer_key: Option<TimerKey>,
@@ -87,6 +90,7 @@ impl NeighValue {
         Self {
             hello_history: HelloHistory::new(),
             txcost: COST_INFINITY,
+            cost: COST_INFINITY,
             last_hello_interval: None,
             hello_timer_key: None,
             ihu_timer_key: None,
@@ -144,15 +148,18 @@ impl NeighValue {
         penalty.round_ties_even() as u16
     }
 
-    /// Computes the link cost: infinite if the rxcost or the txcost is, and otherwise
-    /// the txcost as with k-out-of-j link sensing (RFC 8966 Appendix A.2.1), plus the
-    /// RTT penalty (RFC 9616 §4.2).
-    fn cost(&self) -> u16 {
-        if self.rxcost() == COST_INFINITY {
-            return COST_INFINITY;
-        }
-        // The cost MUST be strictly positive (RFC 8966 §3.4.3).
-        self.txcost.saturating_add(self.rtt_penalty()).max(1)
+    /// Updates the link cost: infinite if the rxcost is infinite, and otherwise
+    /// the txcost as with k-out-of-j link sensing (RFC 8966 Appendix A.2.1), plus
+    /// the RTT penalty (RFC 9616 §4.2). Returns whether the cost has changed.
+    fn update_cost(&mut self) -> bool {
+        let old_cost = self.cost;
+        self.cost = if self.rxcost() == COST_INFINITY {
+            COST_INFINITY
+        } else {
+            // The cost MUST be strictly positive (RFC 8966 §3.4.3).
+            self.txcost.saturating_add(self.rtt_penalty()).max(1)
+        };
+        self.cost != old_cost
     }
 }
 
@@ -171,11 +178,69 @@ struct SourceValue {
 struct RouteValue {
     router_id: RouterId,
     advertised_metric: u16,
-    metric: u16,
-    metric_smoothed: f64,
+    // These are kept in cells and can be modified through a shared borrow, so that
+    // `select_route` can update them up front and keep the borrow for later comparison.
+    metric: Cell<u16>,
+    /// The smoothed metric at `metric_smoothed_at`, since when `metric` has not changed.
+    metric_smoothed: Cell<f32>,
+    /// A timestamp, as returned by [`timestamp_now`].
+    metric_smoothed_at: Cell<u32>,
     seqno: Seqno,
-    feasible: bool,
     expiry_timer_key: TimerKey,
+}
+
+impl RouteValue {
+    /// Returns the smoothed metric at `now`, smoothing the metric exponentially with
+    /// the time constant `tau` (RFC 8966 Appendix A.3).
+    fn ms_at(&self, now: u32, tau: u32) -> f32 {
+        let ms = self.metric_smoothed.get();
+        let dt = now.wrapping_sub(self.metric_smoothed_at.get());
+        if dt == 0 {
+            return ms;
+        }
+        // Since the metric m has been constant since t0:
+        // ms(t) = m + (ms(t0) - m) exp(-(t - t0) / τ)
+        let m = self.metric.get() as f32;
+        m + (ms - m) * (-(dt as f32) / (tau as f32)).exp()
+    }
+
+    /// Sets the metric at `now`, after smoothing the previous one up to then.
+    /// This must be done whenever the route is updated.
+    fn set_metric(&self, metric: u16, now: u32, tau: u32) {
+        // Timestamps wrap around every 2^32 µs, about 72 minutes. A route is updated
+        // within its expiry time, at most 3.5 × 655.35 s, about 38 minutes, or removed,
+        // so re-anchoring once older than 2^30 µs keeps the anchor within range.
+        const MAX_ANCHOR_AGE: u32 = 1 << 30;
+
+        if metric == self.metric.get()
+            && now.wrapping_sub(self.metric_smoothed_at.get()) < MAX_ANCHOR_AGE
+        {
+            // The smoothed metric continues to follow the same curve.
+            return;
+        }
+        self.metric_smoothed.set(self.ms_at(now, tau));
+        self.metric_smoothed_at.set(now);
+        self.metric.set(metric);
+    }
+
+    /// Checks whether the route is feasible (RFC 8966 §3.5.1). The feasibility
+    /// distances change as updates are sent, so this is checked whenever it matters.
+    fn is_feasible(&self, prefix: Ipv6Net, source_table: &HashMap<SourceKey, SourceValue>) -> bool {
+        let key = SourceKey {
+            prefix,
+            router_id: self.router_id,
+        };
+        source_table.get(&key).is_none_or(|source| {
+            source.seqno.lt(self.seqno)
+                || (self.seqno == source.seqno && self.advertised_metric < source.metric)
+        })
+    }
+
+    /// Checks whether the route may be selected, that is, whether it is feasible and its
+    /// metric is finite (RFC 8966 §3.6).
+    fn is_usable(&self, prefix: Ipv6Net, source_table: &HashMap<SourceKey, SourceValue>) -> bool {
+        self.metric.get() != METRIC_INFINITY && self.is_feasible(prefix, source_table)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -190,7 +255,6 @@ struct PrefixRouteTable {
     routes: SparseSecondaryMap<NeighKey, RouteValue>,
     state: RouteState,
     update: Option<(RouterId, Seqno, u16)>,
-    metric_smoothed_at: Instant,
 }
 
 impl PrefixRouteTable {
@@ -199,7 +263,6 @@ impl PrefixRouteTable {
             routes: SparseSecondaryMap::new(),
             state: RouteState::Removed,
             update: None,
-            metric_smoothed_at: Instant::now(),
         }
     }
 }
@@ -365,8 +428,17 @@ pub struct State {
     pending_seqno_request_table: HashMap<SourceKey, PendingSeqnoRequestValue>,
     outputs: VecDeque<Output>,
     timers: DelayQueue<Timeout>,
+    /// The current timestamp, as returned by [`timestamp_now`],
+    /// taken as a packet or a timeout starts being handled.
+    /// For a packet, it is the receive timestamp (RFC 9616 §3.1).
+    now: u32,
     // Temporary states for each received packet.
-    receive_timestamp: u32,
+    /// The prefixes whose routes through the sender have been added, modified or removed
+    /// by updates other than wildcard retractions. One prefix may appear more than once.
+    updated_prefixes: Vec<Ipv6Net>,
+    /// The prefixes whose routes through the sender have been removed
+    /// by the first wildcard retraction, if any.
+    wildcard_retracted_prefixes: Option<HashSet<Ipv6Net>>,
     hello_timestamp: Option<u32>,
     ihu_timestamps: Option<(u32, u32)>,
 }
@@ -394,7 +466,9 @@ impl State {
             pending_seqno_request_table: HashMap::new(),
             outputs: VecDeque::new(),
             timers,
-            receive_timestamp: 0,
+            now: 0,
+            updated_prefixes: Vec::new(),
+            wildcard_retracted_prefixes: None,
             hello_timestamp: None,
             ihu_timestamps: None,
         }
@@ -421,6 +495,8 @@ impl State {
     }
 
     pub fn handle_timeout(&mut self, timeout: Timeout) {
+        self.now = timestamp_now();
+
         match timeout {
             Timeout::OutgoingHello => {
                 let hello_tlv = Tlv::Hello {
@@ -480,40 +556,41 @@ impl State {
             }
             Timeout::IncomingHello(key) => {
                 let neigh = &mut self.neigh_table[key];
-                let cost = neigh.cost();
 
                 if neigh.hello_history.missed() == HelloEffect::Flush {
                     neigh.hello_timer_key = None;
                     neigh.flush(&mut self.timers);
 
-                    self.remove_neigh_routes(key);
+                    for prefix in self.remove_neigh_routes(key) {
+                        self.select_route(prefix, Some(key));
+                    }
                 } else {
                     let timeout = neigh.last_hello_interval.unwrap().to_duration();
                     neigh.hello_timer_key =
                         Some(self.timers.insert(Timeout::IncomingHello(key), timeout));
 
-                    if neigh.cost() != cost {
+                    if neigh.update_cost() {
                         self.neigh_cost_changed(key);
                     }
                 }
             }
             Timeout::IncomingIhu(key) => {
                 let neigh = &mut self.neigh_table[key];
-                let cost = neigh.cost();
 
                 neigh.ihu_timer_key = None;
                 neigh.txcost = COST_INFINITY;
 
-                if neigh.cost() != cost {
+                if neigh.update_cost() {
                     self.neigh_cost_changed(key);
                 }
             }
             Timeout::SourceGc(key) => {
                 assert!(self.source_table.remove(&key).is_some());
+                self.select_route(key.prefix, None);
             }
             Timeout::RouteExpiry(prefix, key) => {
                 assert!(self.route_table.remove(&prefix, key).is_some());
-                self.select_route(prefix, key);
+                self.select_route(prefix, Some(key));
             }
             Timeout::RouteHold(prefix) => {
                 let table = self.route_table.by_prefix.get_mut(&prefix).unwrap();
@@ -545,9 +622,7 @@ impl State {
             return;
         };
 
-        self.receive_timestamp = timestamp_now();
-
-        let cost = self.neigh_table[key].cost();
+        self.now = timestamp_now();
 
         for res in decoder {
             let Ok(item) = res else {
@@ -561,7 +636,7 @@ impl State {
 
         // Delay-based metric extension (RFC 9616).
         if let (Some(t2p), Some((t1, t1p))) = (self.hello_timestamp, self.ihu_timestamps) {
-            let t2 = self.receive_timestamp;
+            let t2 = self.now;
 
             let d = t2.wrapping_sub(t1);
             let dp = t2p.wrapping_sub(t1p);
@@ -582,9 +657,32 @@ impl State {
             }
         }
 
-        if self.neigh_table[key].cost() != cost {
+        // Route selection waits until the whole packet has been handled, so that it uses
+        // the link cost as changed by the packet's Hellos, IHUs and timestamps. It runs
+        // first for every route through the sender if the cost has changed, as they all
+        // have a new metric now.
+        if self.neigh_table[key].update_cost() {
             self.neigh_cost_changed(key);
         }
+
+        // Then for the prefixes retracted by the first wildcard retraction, if any.
+        if let Some(prefixes) = self.wildcard_retracted_prefixes.take() {
+            for prefix in prefixes {
+                self.select_route(prefix, Some(key));
+            }
+        }
+
+        // And finally for the prefixes updated by non-wildcard updates. Selection may
+        // run more than once for a prefix, but running again is harmless: nothing has
+        // changed since the last run, so it makes the same choice and outputs nothing.
+        // It is also rare: it only happens in a packet that both changes the link cost
+        // and carries updates, or one that updates a prefix more than once.
+        // Deduplication, by contrast, would cost something on every packet.
+        let mut prefixes = mem::take(&mut self.updated_prefixes);
+        for prefix in prefixes.drain(..) {
+            self.select_route(prefix, Some(key));
+        }
+        self.updated_prefixes = prefixes;
 
         self.hello_timestamp = None;
         self.ihu_timestamps = None;
@@ -639,7 +737,7 @@ impl State {
                 }
 
                 if let Some(t) = transmit_timestamp {
-                    neigh.origin_receive_timestamps = Some((t, self.receive_timestamp));
+                    neigh.origin_receive_timestamps = Some((t, self.now));
                     self.hello_timestamp = Some(t);
                 }
             }
@@ -720,6 +818,8 @@ impl State {
         );
     }
 
+    /// Handles an update (RFC 8966 §3.5.3), recording its prefix for route selection at
+    /// the end of the packet.
     fn handle_update(&mut self, key: NeighKey, update: &Update) {
         let Update {
             ae,
@@ -734,7 +834,15 @@ impl State {
         if ae == Ae::Wildcard {
             // Wildcard retraction.
             assert_eq!(metric, METRIC_INFINITY);
-            self.remove_neigh_routes(key);
+
+            let prefixes = self.remove_neigh_routes(key);
+
+            // If this is not the first wildcard retraction in the packet, it only removes
+            // routes added by updates since the first one, whose prefixes are already
+            // recorded in `updated_prefixes`, so we don't need to record them again.
+            if self.wildcard_retracted_prefixes.is_none() {
+                self.wildcard_retracted_prefixes = Some(prefixes);
+            }
             return;
         }
 
@@ -747,7 +855,7 @@ impl State {
         if metric == METRIC_INFINITY {
             if let Some(route) = self.route_table.remove(&prefix, key) {
                 self.timers.remove(&route.expiry_timer_key);
-                self.select_route(prefix, key);
+                self.updated_prefixes.push(prefix);
             }
             return;
         }
@@ -763,11 +871,10 @@ impl State {
             .get_or_insert_with(prefix, key, || RouteValue {
                 router_id,
                 advertised_metric: metric,
-                metric: METRIC_INFINITY,
-                metric_smoothed: METRIC_INFINITY as f64,
+                metric: Cell::new(METRIC_INFINITY),
+                metric_smoothed: Cell::new(METRIC_INFINITY as f32),
+                metric_smoothed_at: Cell::new(self.now),
                 seqno,
-                // Computed at route selection.
-                feasible: false,
                 expiry_timer_key: self
                     .timers
                     .insert(Timeout::RouteExpiry(prefix, key), expiry_time),
@@ -780,111 +887,107 @@ impl State {
             self.timers.reset(&route.expiry_timer_key, expiry_time);
         }
 
-        self.select_route(prefix, key);
+        self.updated_prefixes.push(prefix);
     }
 
-    fn remove_neigh_routes(&mut self, key: NeighKey) {
+    /// Removes the routes through a neighbour along with their expiry timers,
+    /// returning their prefixes.
+    fn remove_neigh_routes(&mut self, key: NeighKey) -> HashSet<Ipv6Net> {
         let prefixes = mem::take(&mut self.route_table.neigh_prefixes[key]);
         for prefix in &prefixes {
             let table = self.route_table.by_prefix.get_mut(prefix).unwrap();
             let route = table.routes.remove(key).unwrap();
             self.timers.remove(&route.expiry_timer_key);
-
-            self.select_route(*prefix, key);
         }
+        prefixes
     }
 
     fn neigh_cost_changed(&mut self, key: NeighKey) {
         let prefixes = mem::take(&mut self.route_table.neigh_prefixes[key]);
         for prefix in &prefixes {
-            self.select_route(*prefix, key);
+            self.select_route(*prefix, Some(key));
         }
         self.route_table.neigh_prefixes[key] = prefixes;
     }
 
-    /// Runs route selection (RFC 8966 §3.6) for the given prefix, after updating
-    /// the metric and feasibility of its routes.
-    fn select_route(&mut self, prefix: Ipv6Net, changed: NeighKey) {
-        let tau = self
-            .params
-            .get_duration(DurationKey::RouteHysteresisTimeConstant);
-        let now = Instant::now();
+    /// Runs route selection (RFC 8966 §3.6) for a prefix, after its route through the
+    /// `changed` neighbour has been added, modified or removed, or that neighbour's link
+    /// cost has changed, or, with no `changed` neighbour, after a source table entry for
+    /// the prefix has expired.
+    ///
+    /// Selection is incremental. While the selected route or the changed one is usable,
+    /// only these two are compared, with hysteresis. All routes are considered only when
+    /// the selected route changes and becomes unusable, or when a source table entry
+    /// expires while nothing is selected. A better route that has not changed is only
+    /// switched to when it is next updated, which its neighbour does at least once per
+    /// Update interval.
+    fn select_route(&mut self, prefix: Ipv6Net, changed: Option<NeighKey>) {
+        // A prefix may have no entry: a source table entry can outlive it, and selection
+        // may have already removed it for a prefix recorded more than once in a packet.
+        let Some(table) = self.route_table.by_prefix.get_mut(&prefix) else {
+            return;
+        };
 
-        let table = self.route_table.by_prefix.get_mut(&prefix).unwrap();
+        // The route through the changed neighbour, unless it has been removed.
+        let changed_route = changed.and_then(|key| table.routes.get(key));
 
-        let k = (-(now - table.metric_smoothed_at).div_duration_f64(tau)).exp_m1();
-        table.metric_smoothed_at = now;
-
-        for (key, route) in &mut table.routes {
-            // Route hysteresis (RFC 8966 Appendix A.3):
-            //  α = 1 - exp(-ΔT / τ)
-            // ms = α m + (1 - α) ms
-            //    = ms + expm1(-ΔT / τ) * (ms - m)
-            route.metric_smoothed += k * (route.metric_smoothed - route.metric as f64);
-
-            let cost = self.neigh_table[key].cost();
-            route.metric = route.advertised_metric.saturating_add(cost);
-
-            // The feasibility distances change as updates are sent,
-            // so a route may become unfeasible after it is received.
-            route.feasible = self
-                .source_table
-                .get(&SourceKey {
-                    prefix,
-                    router_id: route.router_id,
-                })
-                .is_none_or(|source| {
-                    source.seqno.lt(route.seqno)
-                        || (route.seqno == source.seqno && route.advertised_metric < source.metric)
-                });
+        if let (Some(key), Some(route)) = (changed, changed_route) {
+            let cost = self.neigh_table[key].cost;
+            let metric = route.advertised_metric.saturating_add(cost);
+            route.set_metric(metric, self.now, self.params.get_tau());
         }
 
         if table.state == RouteState::Local {
             return;
         }
 
-        let usable = |r: &RouteValue| r.feasible && r.metric != METRIC_INFINITY;
-
-        let current = match table.state {
-            RouteState::Selected(key) => table
-                .routes
-                .get(key)
-                .filter(|r| usable(r))
-                .map(|r| (key, r)),
-            _ => None,
-        };
-
-        // If no route to a given destination is selected,
-        // then select the route with the smallest metric,
-        // ignoring the smoothed metric. If a route R is selected,
-        // then switch to a route R' only when both m(R') < m(R) and ms(R') < ms(R).
-        let selection = if let Some((_, route)) = current {
-            table
-                .routes
-                .iter()
-                .filter(|(_, r)| {
-                    r.feasible
-                        && r.metric < route.metric
-                        && r.metric_smoothed < route.metric_smoothed
-                })
-                .min_by(|(ka, ra), (kb, rb)| {
-                    ra.metric_smoothed
-                        .total_cmp(&rb.metric_smoothed)
-                        .then(ra.metric.cmp(&rb.metric))
-                        .then(ka.cmp(kb))
-                })
-                .or(current)
-        } else {
+        let usable = |r: &RouteValue| r.is_usable(prefix, &self.source_table);
+        let best_usable = || {
+            // If no route to a given destination is selected,
+            // then select the route with the smallest metric,
+            // ignoring the smoothed metric.
             table
                 .routes
                 .iter()
                 .filter(|(_, r)| usable(r))
-                .min_by(|(ka, ra), (kb, rb)| {
-                    ra.metric
-                        .cmp(&rb.metric)
-                        .then(ra.metric_smoothed.total_cmp(&rb.metric_smoothed))
-                        .then(ka.cmp(kb))
-                })
+                .min_by(|(ka, ra), (kb, rb)| ra.metric.cmp(&rb.metric).then(ka.cmp(kb)))
+        };
+
+        // The route through the changed neighbour, if it is still there and usable.
+        let candidate = changed.zip(changed_route).filter(|(_, r)| usable(r));
+
+        let selection = match table.state {
+            RouteState::Local => unreachable!(),
+            // The selected route has not changed, so it is still usable: only advertising
+            // tightens feasibility, and advertising the selected route keeps it feasible.
+            // This includes the expiry of a source table entry, with no changed route.
+            RouteState::Selected(key) if changed != Some(key) => {
+                let selected = &table.routes[key];
+                debug_assert!(usable(selected));
+
+                let ms = |r: &RouteValue| r.ms_at(self.now, self.params.get_tau());
+
+                // If a route R is selected, then switch to a route R' only when both
+                // m(R') < m(R) and ms(R') < ms(R).
+                if let Some((_, route)) = candidate
+                    && route.metric < selected.metric
+                    && ms(route) < ms(selected)
+                {
+                    candidate
+                } else {
+                    Some((key, selected))
+                }
+            }
+            // The selected route has changed. Keep it if it is still usable, or else
+            // select the best usable route.
+            RouteState::Selected(_) => candidate.or_else(best_usable),
+            // Nothing is selected, so no route is usable: one only becomes usable without
+            // changing as its source table entry expires. So select the changed route if
+            // it is usable, or after such an expiry, the best usable route.
+            RouteState::Held(_) | RouteState::Removed => match changed {
+                Some(_) => candidate,
+                None => best_usable(),
+            },
         };
 
         let mut update_urgent = None;
@@ -895,17 +998,21 @@ impl State {
                 RouteState::Selected(_) => {
                     let (old_router_id, ..) = table.update.unwrap();
                     if route.router_id != old_router_id {
-                        // Router-id changed. Send an urgent triggered update.
+                        // Whenever it changes the selected router-id for a given destination,
+                        // a node MUST send an update as an urgent TLV (RFC 8966 §3.7.2).
                         update_urgent = Some(true);
                     }
                 }
                 RouteState::Held(key) => {
                     self.timers.remove(&key);
-                    // New route ending a hold. Send a triggered update.
+                    // The prefix is reachable again after a retraction. A node MAY send a
+                    // triggered update when the metric for a given prefix changes in a
+                    // significant manner (RFC 8966 §3.7.2), so tell neighbours now rather
+                    // than at the next periodic update.
                     update_urgent = Some(false);
                 }
                 RouteState::Removed => {
-                    // New route. Send a triggered update.
+                    // The prefix is newly reachable, so likewise announce it now.
                     update_urgent = Some(false);
                 }
             }
@@ -915,9 +1022,10 @@ impl State {
             }
 
             table.state = RouteState::Selected(key);
-            table.update = Some((route.router_id, route.seqno, route.metric));
+            table.update = Some((route.router_id, route.seqno, route.metric.get()));
         } else if let RouteState::Selected(_) = table.state {
-            // Retraction. Send a triggered update.
+            // When a route is retracted, a node SHOULD send a triggered update
+            // (RFC 8966 §3.7.2).
             update_urgent = Some(false);
 
             self.outputs.push_back(Output::RouteHold(prefix));

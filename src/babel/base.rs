@@ -123,7 +123,7 @@ const NANOS_PER_CENTI: u32 = 10_000_000;
 const CENTIS_PER_SEC: u64 = 100;
 
 impl Interval {
-    /// Creates an `Interval` from a `u16`, returning `None` if it equals `0`.
+    /// Creates an `Interval` of `n` centiseconds, returning `None` if it equals `0`.
     pub fn new(n: u16) -> Option<Self> {
         NonZeroU16::new(n).map(Self)
     }
@@ -146,9 +146,7 @@ impl Interval {
     pub fn from_duration(d: Duration) -> Option<Self> {
         const MAX_D: Duration = Duration::from_nanos(655_359_999_999);
 
-        if d.as_secs() <= MAX_D.as_secs()
-            && (d.as_secs() != MAX_D.as_secs() || d.subsec_nanos() <= MAX_D.subsec_nanos())
-        {
+        if d <= MAX_D {
             let centis = d.as_secs() as u16 * CENTIS_PER_SEC as u16
                 + (d.subsec_nanos() / NANOS_PER_CENTI) as u16;
             NonZeroU16::new(centis).map(Self)

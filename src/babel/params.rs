@@ -4,14 +4,20 @@ use crate::babel::base::Interval;
 
 pub struct Params {
     mtu: u16,
-    hello_interval: Duration,
+    hello_interval: Interval,
+    ihu_interval: Interval,
+    update_interval: Interval,
+    tau: u32,
 }
 
 impl Params {
     pub fn new() -> Self {
         Self {
             mtu: 1400,
-            hello_interval: Duration::from_secs(4),
+            hello_interval: Interval::new(400).unwrap(),
+            ihu_interval: Interval::new(400 * 3).unwrap(),
+            update_interval: Interval::new(400 * 4).unwrap(),
+            tau: 4_000_000 * 3,
         }
     }
 
@@ -25,45 +31,40 @@ impl Params {
         self
     }
 
-    pub fn set_hello_interval(&mut self, d: Duration) -> &mut Self {
-        self.hello_interval = d;
-        for key in [IntervalKey::Hello, IntervalKey::Ihu, IntervalKey::Update] {
-            // Verify all intervals are within range.
-            let _ = self.get_interval(key);
-        }
+    pub fn set_hello_interval(&mut self, i: Interval) -> &mut Self {
+        const MAX_I: u16 = u16::MAX / 4;
+
+        assert!(
+            i.get() <= MAX_I,
+            "Hello interval should not be larger than 163.83s"
+        );
+
+        self.hello_interval = i;
+        self.ihu_interval = Interval::new(i.get() * 3).unwrap();
+        self.update_interval = Interval::new(i.get() * 4).unwrap();
+        // 3 times the Hello interval, in microseconds.
+        self.tau = u32::from(i.get()) * 3 * 10_000;
         self
     }
 
     pub fn get_duration(&self, key: DurationKey) -> Duration {
         match key {
-            DurationKey::HelloInterval => self.hello_interval,
-            DurationKey::IhuInterval => {
-                self.hello_interval * self.get_u8(U8Key::HellosPerIhu) as u32
-            }
-            DurationKey::UpdateInterval => self.hello_interval * 4,
+            DurationKey::HelloInterval => self.hello_interval.to_duration(),
+            DurationKey::IhuInterval => self.ihu_interval.to_duration(),
+            DurationKey::UpdateInterval => self.update_interval.to_duration(),
             DurationKey::InitialRequestTimeout => Duration::from_secs(2),
             DurationKey::UrgentTimeout => Duration::from_millis(200),
             DurationKey::SourceGcTime => Duration::from_mins(3),
-            DurationKey::RouteHoldTime => self.hello_interval * 4 * 4,
-            DurationKey::RouteHysteresisTimeConstant => self.hello_interval * 3,
+            DurationKey::RouteHoldTime => self.update_interval.to_duration() * 4,
         }
     }
 
     pub fn get_interval(&self, key: IntervalKey) -> Interval {
-        let dur_key = match key {
-            IntervalKey::Hello => DurationKey::HelloInterval,
-            IntervalKey::Ihu => DurationKey::IhuInterval,
-            IntervalKey::Update => DurationKey::UpdateInterval,
-        };
-        let int = Interval::from_duration(self.get_duration(dur_key))
-            .expect("interval should be within range");
-
-        assert_ne!(
-            (key, int.get()),
-            (IntervalKey::Update, u16::MAX),
-            "Update interval should not be 0xFFFF"
-        );
-        int
+        match key {
+            IntervalKey::Hello => self.hello_interval,
+            IntervalKey::Ihu => self.ihu_interval,
+            IntervalKey::Update => self.update_interval,
+        }
     }
 
     pub fn get_f64(&self, key: F64Key) -> f64 {
@@ -81,6 +82,12 @@ impl Params {
             U8Key::HellosPerIhu => 3,
             U8Key::RequestMaxResends => 3,
         }
+    }
+
+    /// Returns the time constant for route hysteresis, in microseconds.
+    /// Defaults to 3 times the Hello interval.
+    pub fn get_tau(&self) -> u32 {
+        self.tau
     }
 }
 
@@ -100,8 +107,6 @@ pub enum DurationKey {
     SourceGcTime,
     /// Route hold time. Defaults to 4 times the Update interval.
     RouteHoldTime,
-    /// Route hysteresis time constant. Defaults to 3 times the Hello interval.
-    RouteHysteresisTimeConstant,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
