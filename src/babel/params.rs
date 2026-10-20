@@ -69,8 +69,6 @@ impl Params {
             F64Key::IhuHoldTimeMultiplier => 3.5,
             F64Key::RouteExpiryTimeMultiplier => 3.5,
             F64Key::RequestBackoffFactor => 2.0,
-            F64Key::HelloTimeoutMultiplier => 1.5,
-            F64Key::BufferTimeoutMultiplier => 0.5,
         }
     }
 
@@ -125,12 +123,6 @@ pub enum F64Key {
     /// Request timeout, relative to the previous Request timeout
     /// when a request is resent. Defaults to 2.0.
     RequestBackoffFactor,
-    /// The maximum timeout within which a Hello TLV should be received,
-    /// relative to the advertised Hello interval. Defaults to 1.5.
-    HelloTimeoutMultiplier,
-    /// The maximum timeout within which a TLV should be sent out, relative to
-    /// the Hello interval or the Acknowledgement Request interval. Defaults to 0.5.
-    BufferTimeoutMultiplier,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

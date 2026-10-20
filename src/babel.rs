@@ -8,11 +8,11 @@ mod tests;
 use std::{
     assert_matches,
     cell::Cell,
-    cmp::Ordering,
     collections::{HashMap, HashSet, VecDeque, hash_map},
     hash::Hash,
     mem,
     net::Ipv6Addr,
+    num::NonZeroU8,
     task::{Context, Poll},
     time::Duration,
 };
@@ -251,10 +251,27 @@ enum RouteState {
     Removed,
 }
 
+impl RouteState {
+    /// Returns the selected next-hop neighbour, if any.
+    fn selected(self) -> Option<NeighKey> {
+        match self {
+            Self::Selected(key) => Some(key),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Advert {
+    router_id: RouterId,
+    seqno: Seqno,
+    metric: u16,
+}
+
 struct PrefixRouteTable {
     routes: SparseSecondaryMap<NeighKey, RouteValue>,
     state: RouteState,
-    update: Option<(RouterId, Seqno, u16)>,
+    advert: Option<Advert>,
 }
 
 impl PrefixRouteTable {
@@ -262,7 +279,7 @@ impl PrefixRouteTable {
         Self {
             routes: SparseSecondaryMap::new(),
             state: RouteState::Removed,
-            update: None,
+            advert: None,
         }
     }
 }
@@ -355,10 +372,19 @@ impl PacketBuf {
     ) {
         let was_empty = self.encoder.is_empty();
 
+        // In all other cases, the TLV SHOULD be sent out within one-half of the
+        // Multicast Hello interval (RFC 8966 §3.1).
+        //
+        // We take half of that and multiply it by 0.75 ~ 1.25, as outgoing TLVs SHOULD
+        // be sent with a random delay (RFC 8966 §3.1).
+        //
+        // A Hello then waits at most 0.3125 Hello intervals, so consecutive Hellos
+        // are at most 1.3125 intervals apart, within the 1.5 intervals after which a
+        // neighbour counts a Hello as missed.
         let timeout = || {
             params
                 .get_duration(DurationKey::HelloInterval)
-                .mul_f64(params.get_f64(F64Key::BufferTimeoutMultiplier))
+                .mul_f64(rand::random_range(0.1875..=0.3125))
         };
 
         if !f(&mut self.encoder) {
@@ -386,6 +412,8 @@ impl PacketBuf {
 
         let key = self.flush_timer_key.unwrap();
 
+        // Take half of the timeout and add some jitter as in `put`.
+        let timeout = timeout.mul_f64(rand::random_range(0.375..=0.625));
         let new_deadline = Instant::now() + timeout;
         let deadline = timers.deadline(&key);
 
@@ -603,7 +631,7 @@ impl State {
                     self.route_table.by_prefix.remove(&prefix);
                 } else {
                     table.state = RouteState::Removed;
-                    table.update = None;
+                    table.advert = None;
                 }
             }
             Timeout::SeqnoRequest(_source_key) => todo!(),
@@ -615,7 +643,7 @@ impl State {
         }
     }
 
-    pub fn handle_packet(&mut self, key: NeighKey, buf: &[u8]) {
+    pub fn handle_packet(&mut self, from: NeighKey, buf: &[u8]) {
         // Malformed packets, and TLVs that fail to decode or are otherwise
         // ignored, are silently ignored (RFC 8966 §4.2, §4.3, §4.4, §4.6).
         let Some(decoder) = PacketDecoder::new(buf) else {
@@ -629,8 +657,8 @@ impl State {
                 continue;
             };
             match item {
-                PacketItem::Tlv(tlv) => self.handle_tlv(key, &tlv),
-                PacketItem::Update(update) => self.handle_update(key, &update),
+                PacketItem::Tlv(tlv) => self.handle_tlv(from, &tlv),
+                PacketItem::Update(update) => self.handle_update(from, &update),
             }
         }
 
@@ -645,7 +673,7 @@ impl State {
             const ALPHA: f64 = 0.836;
 
             if d <= T && dp <= T {
-                let rtt = &mut self.neigh_table[key].rtt;
+                let rtt = &mut self.neigh_table[from].rtt;
                 let rtt_n = d.saturating_sub(dp) as f64;
 
                 if let Some(rtt) = rtt {
@@ -661,14 +689,14 @@ impl State {
         // the link cost as changed by the packet's Hellos, IHUs and timestamps. It runs
         // first for every route through the sender if the cost has changed, as they all
         // have a new metric now.
-        if self.neigh_table[key].update_cost() {
-            self.neigh_cost_changed(key);
+        if self.neigh_table[from].update_cost() {
+            self.neigh_cost_changed(from);
         }
 
         // Then for the prefixes retracted by the first wildcard retraction, if any.
         if let Some(prefixes) = self.wildcard_retracted_prefixes.take() {
             for prefix in prefixes {
-                self.select_route(prefix, Some(key));
+                self.select_route(prefix, Some(from));
             }
         }
 
@@ -680,7 +708,7 @@ impl State {
         // Deduplication, by contrast, would cost something on every packet.
         let mut prefixes = mem::take(&mut self.updated_prefixes);
         for prefix in prefixes.drain(..) {
-            self.select_route(prefix, Some(key));
+            self.select_route(prefix, Some(from));
         }
         self.updated_prefixes = prefixes;
 
@@ -688,26 +716,14 @@ impl State {
         self.ihu_timestamps = None;
     }
 
-    fn handle_tlv(&mut self, key: NeighKey, tlv: &Tlv) {
-        let neigh = &mut self.neigh_table[key];
-
+    fn handle_tlv(&mut self, from: NeighKey, tlv: &Tlv) {
         match *tlv {
             Tlv::Pad1 | Tlv::PadN { .. } | Tlv::RouterId { .. } => {}
             Tlv::Update { .. } => unreachable!(),
             Tlv::AcknowledgementRequest { opaque, interval } => {
-                neigh.packet_buf.put(
-                    key,
-                    &mut self.outputs,
-                    &mut self.timers,
-                    &self.params,
-                    |e| e.put_tlv(&Tlv::Acknowledgement { opaque }),
-                );
-
-                let timeout = interval
-                    .to_duration()
-                    .mul_f64(self.params.get_f64(F64Key::BufferTimeoutMultiplier));
-
-                neigh.packet_buf.schedule_flush(&mut self.timers, timeout);
+                let timeout = interval.to_duration();
+                let tlv = Tlv::Acknowledgement { opaque };
+                self.send(Some(from), None, Some(timeout), &PacketItem::Tlv(tlv));
             }
             Tlv::Acknowledgement { .. } => {
                 // Ignore it as we never send a request.
@@ -717,6 +733,8 @@ impl State {
                 interval,
                 transmit_timestamp,
             } => {
+                let neigh = &mut self.neigh_table[from];
+
                 if neigh.hello_history.received(seqno) == HelloEffect::Flush {
                     neigh.flush(&mut self.timers);
                 }
@@ -724,15 +742,16 @@ impl State {
                 if let Some(interval) = interval {
                     neigh.last_hello_interval = Some(interval);
 
-                    let timeout = interval
-                        .to_duration()
-                        .mul_f64(self.params.get_f64(F64Key::HelloTimeoutMultiplier));
+                    // Reset the neighbour's hello timer to 1.5 times the advertised
+                    // Interval (the extra margin allows for delay due to jitter)
+                    // (RFC 8966 Appendix A.1). See also `PacketBuf::put`.
+                    let timeout = interval.to_duration().mul_f64(1.5);
 
                     if let Some(timer_key) = neigh.hello_timer_key {
                         self.timers.reset(&timer_key, timeout);
                     } else {
                         neigh.hello_timer_key =
-                            Some(self.timers.insert(Timeout::IncomingHello(key), timeout));
+                            Some(self.timers.insert(Timeout::IncomingHello(from), timeout));
                     }
                 }
 
@@ -748,6 +767,8 @@ impl State {
                 address: _,
                 origin_receive_timestamps,
             } => {
+                let neigh = &mut self.neigh_table[from];
+
                 let timeout = interval
                     .to_duration()
                     .mul_f64(self.params.get_f64(F64Key::IhuHoldTimeMultiplier));
@@ -756,7 +777,7 @@ impl State {
                     self.timers.reset(&timer_key, timeout);
                 } else {
                     neigh.ihu_timer_key =
-                        Some(self.timers.insert(Timeout::IncomingIhu(key), timeout));
+                        Some(self.timers.insert(Timeout::IncomingIhu(from), timeout));
                 }
 
                 if let Some(ts) = origin_receive_timestamps {
@@ -766,61 +787,152 @@ impl State {
                 neigh.txcost = rxcost;
             }
             Tlv::RouteRequest { ae, plen, prefix } => {
-                self.handle_route_request(key, ae, plen, prefix);
+                self.handle_route_request(from, ae, plen, prefix);
             }
-            Tlv::SeqnoRequest { .. } => todo!(),
+            Tlv::SeqnoRequest {
+                ae,
+                plen,
+                seqno,
+                hop_count,
+                router_id,
+                prefix,
+            } => {
+                if ae != Ae::Ipv6 {
+                    return;
+                }
+                let prefix = Ipv6Net::new_assert(Ipv6Addr::from_octets(prefix), plen);
+                self.handle_seqno_request(from, seqno, hop_count, router_id, prefix);
+            }
         }
     }
 
     /// Answers a route request (RFC 8966 §3.8.1.1, RFC 9229 §2.3).
-    fn handle_route_request(&mut self, key: NeighKey, ae: Ae, plen: u8, prefix: [u8; 16]) {
+    fn handle_route_request(&mut self, from: NeighKey, ae: Ae, plen: u8, prefix: [u8; 16]) {
         if ae == Ae::Wildcard {
             // TODO: Full route table dumps SHOULD be rate-limited.
-            self.dump_routes(Some(key));
+            self.dump_routes(Some(from));
             return;
         }
 
-        let update = match ae {
+        let advert = match ae {
             Ae::Ipv6 => {
                 let prefix = Ipv6Net::new_assert(Ipv6Addr::from_octets(prefix), plen);
                 let table = self.route_table.by_prefix.get(&prefix);
-                let update = table.and_then(|table| self.update_for_prefix(table));
+                let advert = table.and_then(|table| self.advert_for_prefix(table));
 
-                if let Some((router_id, seqno, metric)) = update {
-                    self.update_source_table(prefix, router_id, seqno, metric);
+                if let Some(advert) = advert {
+                    self.update_source_table(prefix, advert);
                 }
-                update
+                advert
             }
             Ae::Ipv4 | Ae::V4ViaV6 => None,
             Ae::Wildcard | Ae::LinkLocalIpv6 => unreachable!(),
         };
 
         // The local router-id and seqno are used for retracting an unknown route.
-        let (router_id, seqno, metric) =
-            update.unwrap_or((self.router_id, self.seqno, METRIC_INFINITY));
+        let advert = advert.unwrap_or(Advert {
+            router_id: self.router_id,
+            seqno: self.seqno,
+            metric: METRIC_INFINITY,
+        });
 
         let update = Update {
             ae,
             plen,
             interval: self.params.get_interval(IntervalKey::Update),
-            seqno,
-            metric,
+            seqno: advert.seqno,
+            metric: advert.metric,
             prefix,
-            router_id: Some(router_id),
+            router_id: Some(advert.router_id),
         };
 
-        self.neigh_table[key].packet_buf.put(
-            key,
-            &mut self.outputs,
-            &mut self.timers,
-            &self.params,
-            |e| e.put_update(&update),
-        );
+        self.send(Some(from), None, None, &PacketItem::Update(update));
+    }
+
+    /// Answers a seqno request (RFC 8966 §3.8.1.2).
+    fn handle_seqno_request(
+        &mut self,
+        from: NeighKey,
+        seqno: Seqno,
+        hop_count: NonZeroU8,
+        router_id: RouterId,
+        prefix: Ipv6Net,
+    ) {
+        let Some(table) = self.route_table.by_prefix.get(&prefix) else {
+            return;
+        };
+
+        let Some(mut advert) = self.advert_for_prefix(table) else {
+            return;
+        };
+
+        if advert.metric == METRIC_INFINITY {
+            return;
+        }
+
+        if advert.router_id != router_id || !advert.seqno.lt(seqno) {
+            self.send_update(Some(from), None, true, prefix, advert);
+            return;
+        } else if self.router_id == router_id {
+            self.seqno += 1;
+            advert.seqno = self.seqno;
+
+            self.send_update(Some(from), None, true, prefix, advert);
+            return;
+        }
+
+        let Some(hop_count) = NonZeroU8::new(hop_count.get() - 1) else {
+            return;
+        };
+
+        // TODO: A node SHOULD compare every incoming seqno request against its list of
+        // recently forwarded seqno requests and avoid forwarding the request if it is
+        // redundant (i.e., if the node has recently sent a request with the same prefix,
+        // router-id, and a seqno that is not smaller modulo 2^16).
+
+        // Forward the request to the next hop of a route that is not through the requester,
+        // a feasible one if there is any, with the smallest metric.
+        let feasible = |r: &RouteValue| r.is_feasible(prefix, &self.source_table);
+        let Some((to, _)) = table
+            .routes
+            .iter()
+            .filter(|&(k, _)| k != from)
+            .min_by_key(|&(k, r)| (!feasible(r), r.metric.get(), k))
+        else {
+            return;
+        };
+
+        self.send_seqno_request(Some(to), true, prefix, router_id, seqno, Some(hop_count));
+    }
+
+    fn send_seqno_request(
+        &mut self,
+        to: Option<NeighKey>,
+        urgent: bool,
+        prefix: Ipv6Net,
+        router_id: RouterId,
+        seqno: Seqno,
+        hop_count: Option<NonZeroU8>,
+    ) {
+        const DEFAULT_HOP_COUNT: NonZeroU8 = NonZeroU8::new(64).unwrap();
+
+        let timeout = urgent.then(|| self.params.get_duration(DurationKey::UrgentTimeout));
+
+        let tlv = Tlv::SeqnoRequest {
+            ae: Ae::Ipv6,
+            plen: prefix.prefix_len(),
+            seqno,
+            hop_count: hop_count.unwrap_or(DEFAULT_HOP_COUNT),
+            router_id,
+            prefix: prefix.addr().octets(),
+        };
+
+        self.send(to, None, timeout, &PacketItem::Tlv(tlv));
     }
 
     /// Handles an update (RFC 8966 §3.5.3), recording its prefix for route selection at
     /// the end of the packet.
-    fn handle_update(&mut self, key: NeighKey, update: &Update) {
+    fn handle_update(&mut self, from: NeighKey, update: &Update) {
         let Update {
             ae,
             plen,
@@ -835,7 +947,7 @@ impl State {
             // Wildcard retraction.
             assert_eq!(metric, METRIC_INFINITY);
 
-            let prefixes = self.remove_neigh_routes(key);
+            let prefixes = self.remove_neigh_routes(from);
 
             // If this is not the first wildcard retraction in the packet, it only removes
             // routes added by updates since the first one, whose prefixes are already
@@ -853,7 +965,7 @@ impl State {
         let prefix = Ipv6Net::new_assert(Ipv6Addr::from_octets(prefix), plen);
 
         if metric == METRIC_INFINITY {
-            if let Some(route) = self.route_table.remove(&prefix, key) {
+            if let Some(route) = self.route_table.remove(&prefix, from) {
                 self.timers.remove(&route.expiry_timer_key);
                 self.updated_prefixes.push(prefix);
             }
@@ -862,13 +974,18 @@ impl State {
 
         let router_id = router_id.unwrap();
 
+        if router_id == self.router_id {
+            // Do not maintain a route supposedly to the node itself.
+            return;
+        }
+
         let expiry_time = interval
             .to_duration()
             .mul_f64(self.params.get_f64(F64Key::RouteExpiryTimeMultiplier));
 
         if let Some(route) = self
             .route_table
-            .get_or_insert_with(prefix, key, || RouteValue {
+            .get_or_insert_with(prefix, from, || RouteValue {
                 router_id,
                 advertised_metric: metric,
                 metric: Cell::new(METRIC_INFINITY),
@@ -877,7 +994,7 @@ impl State {
                 seqno,
                 expiry_timer_key: self
                     .timers
-                    .insert(Timeout::RouteExpiry(prefix, key), expiry_time),
+                    .insert(Timeout::RouteExpiry(prefix, from), expiry_time),
             })
         {
             route.router_id = router_id;
@@ -943,14 +1060,13 @@ impl State {
 
         let usable = |r: &RouteValue| r.is_usable(prefix, &self.source_table);
         let best_usable = || {
-            // If no route to a given destination is selected,
-            // then select the route with the smallest metric,
-            // ignoring the smoothed metric.
+            // If no route to a given destination is selected, then select the route with
+            // the smallest metric, ignoring the smoothed metric.
             table
                 .routes
                 .iter()
                 .filter(|(_, r)| usable(r))
-                .min_by(|(ka, ra), (kb, rb)| ra.metric.cmp(&rb.metric).then(ka.cmp(kb)))
+                .min_by_key(|&(k, r)| (r.metric.get(), k))
         };
 
         // The route through the changed neighbour, if it is still there and usable.
@@ -996,7 +1112,7 @@ impl State {
             match table.state {
                 RouteState::Local => unreachable!(),
                 RouteState::Selected(_) => {
-                    let (old_router_id, ..) = table.update.unwrap();
+                    let old_router_id = table.advert.unwrap().router_id;
                     if route.router_id != old_router_id {
                         // Whenever it changes the selected router-id for a given destination,
                         // a node MUST send an update as an urgent TLV (RFC 8966 §3.7.2).
@@ -1022,7 +1138,11 @@ impl State {
             }
 
             table.state = RouteState::Selected(key);
-            table.update = Some((route.router_id, route.seqno, route.metric.get()));
+            table.advert = Some(Advert {
+                router_id: route.router_id,
+                seqno: route.seqno,
+                metric: route.metric.get(),
+            });
         } else if let RouteState::Selected(_) = table.state {
             // When a route is retracted, a node SHOULD send a triggered update
             // (RFC 8966 §3.7.2).
@@ -1034,16 +1154,17 @@ impl State {
                 Timeout::RouteHold(prefix),
                 self.params.get_duration(DurationKey::RouteHoldTime),
             ));
-            table.update.as_mut().unwrap().2 = METRIC_INFINITY;
+            table.advert.as_mut().unwrap().metric = METRIC_INFINITY;
         }
 
         // A removed prefix without routes has nothing left to keep its entry for.
         let empty = table.state == RouteState::Removed && table.routes.is_empty();
 
         if let Some(urgent) = update_urgent {
-            let (router_id, seqno, metric) = table.update.unwrap();
-            let next_hop = selection.map(|t| t.0);
-            self.send_triggered_update(urgent, next_hop, prefix, router_id, seqno, metric);
+            // Split horizon (RFC 8966 §3.7.4).
+            let not_to = table.state.selected();
+            let advert = table.advert.unwrap();
+            self.send_update(None, not_to, urgent, prefix, advert);
         }
 
         if empty {
@@ -1051,47 +1172,29 @@ impl State {
         }
     }
 
-    fn send_triggered_update(
+    fn send_update(
         &mut self,
+        to: Option<NeighKey>,
+        not_to: Option<NeighKey>,
         urgent: bool,
-        next_hop: Option<NeighKey>,
         prefix: Ipv6Net,
-        router_id: RouterId,
-        seqno: Seqno,
-        metric: u16,
+        advert: Advert,
     ) {
-        self.update_source_table(prefix, router_id, seqno, metric);
+        self.update_source_table(prefix, advert);
+
+        let timeout = urgent.then(|| self.params.get_duration(DurationKey::UrgentTimeout));
 
         let update = Update {
             ae: Ae::Ipv6,
             plen: prefix.prefix_len(),
             interval: self.params.get_interval(IntervalKey::Update),
-            seqno,
-            metric,
+            seqno: advert.seqno,
+            metric: advert.metric,
             prefix: prefix.addr().octets(),
-            router_id: Some(router_id),
+            router_id: Some(advert.router_id),
         };
 
-        let urgent_timeout = urgent.then(|| self.params.get_duration(DurationKey::UrgentTimeout));
-
-        for (key, neigh) in &mut self.neigh_table {
-            // Split horizon (RFC 8966 §3.7.4).
-            if next_hop == Some(key) {
-                continue;
-            }
-
-            neigh.packet_buf.put(
-                key,
-                &mut self.outputs,
-                &mut self.timers,
-                &self.params,
-                |e| e.put_update(&update),
-            );
-
-            if let Some(timeout) = urgent_timeout {
-                neigh.packet_buf.schedule_flush(&mut self.timers, timeout);
-            }
-        }
+        self.send(to, not_to, timeout, &PacketItem::Update(update));
     }
 
     /// Sends a full dump of the routes that this node advertises,
@@ -1102,31 +1205,7 @@ impl State {
             router_id: RouterId,
             seqno: Seqno,
             metric: u16,
-            router_id_omitted: bool,
-        }
-
-        impl Ord for Update {
-            fn cmp(&self, other: &Self) -> Ordering {
-                self.router_id
-                    .cmp(&other.router_id)
-                    .then(other.router_id_omitted.cmp(&self.router_id_omitted))
-                    .then(self.prefix.addr().cmp(&other.prefix.addr()))
-                    .then(self.prefix.prefix_len().cmp(&other.prefix.prefix_len()))
-            }
-        }
-
-        impl PartialOrd for Update {
-            fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-                Some(self.cmp(other))
-            }
-        }
-
-        impl Eq for Update {}
-
-        impl PartialEq for Update {
-            fn eq(&self, other: &Self) -> bool {
-                self.prefix == other.prefix && self.router_id == other.router_id
-            }
+            not_to: Option<NeighKey>,
         }
 
         let mut updates: Vec<_> = self
@@ -1134,84 +1213,93 @@ impl State {
             .by_prefix
             .iter()
             .filter_map(|(&prefix, table)| {
-                self.update_for_prefix(table)
-                    .map(|(router_id, seqno, metric)| Update {
-                        prefix,
-                        router_id,
-                        seqno,
-                        metric,
-                        router_id_omitted: router_id.get() == prefix.addr().to_bits() as u64,
-                    })
+                self.advert_for_prefix(table).map(|advert| Update {
+                    prefix,
+                    router_id: advert.router_id,
+                    seqno: advert.seqno,
+                    metric: advert.metric,
+                    // Split horizon (RFC 8966 §3.7.4).
+                    not_to: table.state.selected(),
+                })
             })
             .collect();
 
-        updates.sort_unstable();
+        // By router-id, those with the router-id omitted first, then by prefix, whose
+        // derived order is by address, then by length.
+        updates.sort_unstable_by_key(|u| {
+            let omitted = u.router_id.get() == u.prefix.addr().to_bits() as u64;
+            (u.router_id, !omitted, u.prefix)
+        });
 
-        let interval = self.params.get_interval(IntervalKey::Update);
-
-        for Update {
-            prefix,
-            router_id,
-            seqno,
-            metric,
-            ..
-        } in updates
-        {
-            let state = self.route_table.by_prefix[&prefix].state;
-
-            self.update_source_table(prefix, router_id, seqno, metric);
-
-            let update = packet::Update {
-                ae: Ae::Ipv6,
-                plen: prefix.prefix_len(),
-                interval,
-                seqno,
-                metric,
-                prefix: prefix.addr().octets(),
-                router_id: Some(router_id),
+        for u in updates {
+            let advert = Advert {
+                router_id: u.router_id,
+                seqno: u.seqno,
+                metric: u.metric,
             };
+            self.send_update(to, u.not_to, false, u.prefix, advert);
+        }
+    }
 
-            let mut put_update = |key, neigh: &mut NeighValue| {
-                neigh.packet_buf.put(
-                    key,
-                    &mut self.outputs,
-                    &mut self.timers,
-                    &self.params,
-                    |e| e.put_update(&update),
-                )
-            };
+    fn send(
+        &mut self,
+        to: Option<NeighKey>,
+        not_to: Option<NeighKey>,
+        timeout: Option<Duration>,
+        item: &PacketItem,
+    ) {
+        let mut send = |key, neigh: &mut NeighValue| {
+            neigh.packet_buf.put(
+                key,
+                &mut self.outputs,
+                &mut self.timers,
+                &self.params,
+                |e| match item {
+                    PacketItem::Tlv(tlv) => e.put_tlv(tlv),
+                    PacketItem::Update(update) => e.put_update(update),
+                },
+            );
 
-            if let Some(key) = to {
-                put_update(key, &mut self.neigh_table[key]);
-            } else {
-                for (key, neigh) in &mut self.neigh_table {
-                    // Split horizon (RFC 8966 §3.7.4).
-                    if state != RouteState::Selected(key) {
-                        put_update(key, neigh);
-                    }
+            if let Some(timeout) = timeout {
+                neigh.packet_buf.schedule_flush(&mut self.timers, timeout);
+            }
+        };
+
+        if let Some(key) = to {
+            if not_to != Some(key) {
+                send(key, &mut self.neigh_table[key]);
+            }
+        } else {
+            for (key, neigh) in &mut self.neigh_table {
+                if not_to != Some(key) {
+                    send(key, neigh);
                 }
             }
         }
     }
 
-    /// Returns the router-id, seqno, and metric to send in an update for the prefix,
+    /// Returns the router-id, seqno, and metric to advertise for the prefix,
     /// or the local router-id and seqno and a zero metric for a local route,
     /// or `None` for a removed route.
-    fn update_for_prefix(&self, table: &PrefixRouteTable) -> Option<(RouterId, Seqno, u16)> {
+    fn advert_for_prefix(&self, table: &PrefixRouteTable) -> Option<Advert> {
         match table.state {
             // A route injected by this node (RFC 8966 §3.7).
-            RouteState::Local => Some((self.router_id, self.seqno, 0)),
-            _ => table.update,
+            RouteState::Local => Some(Advert {
+                router_id: self.router_id,
+                seqno: self.seqno,
+                metric: 0,
+            }),
+            _ => table.advert,
         }
     }
 
-    fn update_source_table(
-        &mut self,
-        prefix: Ipv6Net,
-        router_id: RouterId,
-        seqno: Seqno,
-        metric: u16,
-    ) {
+    fn update_source_table(&mut self, prefix: Ipv6Net, advert: Advert) {
+        let Advert {
+            router_id,
+            seqno,
+            metric,
+        } = advert;
+
         if metric != METRIC_INFINITY {
             let key = SourceKey { prefix, router_id };
             let gc_time = self.params.get_duration(DurationKey::SourceGcTime);

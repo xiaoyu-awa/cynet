@@ -1684,11 +1684,21 @@ async fn wildcard_route_requests_are_answered_with_full_dumps() {
     net.run_for(Duration::from_secs(3)).await;
 
     // A dump of both prefixes, in whichever order.
-    let mut prefixes: Vec<_> = (updates_sent(&net, 0, 9, start).into_iter())
-        .map(|update| (update.plen, update.prefix))
-        .collect();
-    prefixes.sort();
+    let dumped = |net: &Net, to, start| {
+        let mut prefixes: Vec<_> = (updates_sent(net, 0, to, start).into_iter())
+            .map(|update| (update.plen, update.prefix))
+            .collect();
+        prefixes.sort();
+        prefixes
+    };
     let [local, learnt] = [local, learnt].map(|p| (p.prefix_len(), p.addr().octets()));
-    assert_eq!(prefixes, [local, learnt]);
+    assert_eq!(dumped(&net, 9, start), [local, learnt]);
     assert_eq!(updates_sent(&net, 0, 1, start), []);
+
+    // So is one from the neighbour that a route was learnt from, but without that route,
+    // as in periodic dumps (RFC 8966 §3.7.4).
+    let start = Instant::now();
+    net.inject(1, 0, &route_request(Ae::Wildcard, 0, &[]));
+    net.run_for(Duration::from_secs(3)).await;
+    assert_eq!(dumped(&net, 1, start), [local]);
 }
