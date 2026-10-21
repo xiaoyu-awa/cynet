@@ -47,7 +47,6 @@ impl Params {
     pub fn get_duration(&self, key: DurationKey) -> Duration {
         match key {
             DurationKey::HelloInterval => self.hello_interval.to_duration(),
-            DurationKey::IhuInterval => self.ihu_interval.to_duration(),
             DurationKey::UpdateInterval => self.update_interval.to_duration(),
             DurationKey::InitialRequestTimeout => Duration::from_secs(2),
             DurationKey::UrgentTimeout => Duration::from_millis(200),
@@ -90,8 +89,6 @@ impl Params {
 pub enum DurationKey {
     /// Hello interval. Defaults to 4 seconds.
     HelloInterval,
-    /// IHU interval. Defaults to 3 times the Hello interval.
-    IhuInterval,
     /// Update interval. Defaults to 4 times the Hello interval.
     UpdateInterval,
     /// Initial request timeout. Defaults to 2 seconds.

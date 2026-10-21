@@ -243,11 +243,12 @@ impl RouteValue {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum RouteState {
     Local,
     Selected(NeighKey),
     Held(TimerKey),
+    #[default]
     Removed,
 }
 
@@ -268,42 +269,28 @@ struct Advert {
     metric: u16,
 }
 
+#[derive(Default)]
 struct PrefixRouteTable {
     routes: SparseSecondaryMap<NeighKey, RouteValue>,
     state: RouteState,
     advert: Option<Advert>,
 }
 
-impl PrefixRouteTable {
-    fn new() -> Self {
-        Self {
-            routes: SparseSecondaryMap::new(),
-            state: RouteState::Removed,
-            advert: None,
-        }
-    }
-}
-
+#[derive(Default)]
 struct RouteTable {
     by_prefix: HashMap<Ipv6Net, PrefixRouteTable>,
     neigh_prefixes: SecondaryMap<NeighKey, HashSet<Ipv6Net>>,
 }
 
 impl RouteTable {
-    fn new() -> Self {
-        Self {
-            by_prefix: HashMap::new(),
-            neigh_prefixes: SecondaryMap::new(),
-        }
-    }
-
     fn insert_local(&mut self, prefix: Ipv6Net) -> bool {
         match self.by_prefix.entry(prefix) {
             hash_map::Entry::Occupied(_) => false,
             hash_map::Entry::Vacant(e) => {
-                let mut table = PrefixRouteTable::new();
-                table.state = RouteState::Local;
-                e.insert(table);
+                e.insert(PrefixRouteTable {
+                    state: RouteState::Local,
+                    ..Default::default()
+                });
                 true
             }
         }
@@ -315,10 +302,7 @@ impl RouteTable {
         key: NeighKey,
         f: impl FnOnce() -> RouteValue,
     ) -> Option<&mut RouteValue> {
-        let table = self
-            .by_prefix
-            .entry(prefix)
-            .or_insert_with(PrefixRouteTable::new);
+        let table = self.by_prefix.entry(prefix).or_default();
 
         match table.routes.entry(key).unwrap() {
             sparse_secondary::Entry::Occupied(e) => Some(e.into_mut()),
@@ -357,8 +341,7 @@ impl PacketBuf {
             "empty buffer should not be flushed"
         );
 
-        let buf = self.encoder.finalize().to_vec().into_boxed_slice();
-        outputs.push_back(Output::Packet(key, buf));
+        outputs.push_back(Output::Packet(key, self.encoder.finalize().into()));
         self.encoder.clear();
     }
 
@@ -490,7 +473,7 @@ impl State {
             update_timer_key,
             neigh_table: SlotMap::with_key(),
             source_table: HashMap::new(),
-            route_table: RouteTable::new(),
+            route_table: RouteTable::default(),
             pending_seqno_request_table: HashMap::new(),
             outputs: VecDeque::new(),
             timers,
@@ -676,12 +659,8 @@ impl State {
                 let rtt = &mut self.neigh_table[from].rtt;
                 let rtt_n = d.saturating_sub(dp) as f64;
 
-                if let Some(rtt) = rtt {
-                    // RTT := α RTT + (1 - α) RTTn
-                    *rtt = ALPHA * (*rtt - rtt_n) + rtt_n;
-                } else {
-                    *rtt = Some(rtt_n);
-                }
+                // RTT := α RTT + (1 - α) RTTn, starting from the first sample.
+                *rtt = Some(rtt.map_or(rtt_n, |rtt| ALPHA * (rtt - rtt_n) + rtt_n));
             }
         }
 
@@ -1045,10 +1024,10 @@ impl State {
             return;
         };
 
-        // The route through the changed neighbour, unless it has been removed.
-        let changed_route = changed.and_then(|key| table.routes.get(key));
+        // The route through the changed neighbour, with its key, unless it has been removed.
+        let changed_route = changed.and_then(|key| table.routes.get(key).map(|r| (key, r)));
 
-        if let (Some(key), Some(route)) = (changed, changed_route) {
+        if let Some((key, route)) = changed_route {
             let cost = self.neigh_table[key].cost;
             let metric = route.advertised_metric.saturating_add(cost);
             route.set_metric(metric, self.now, self.params.get_tau());
@@ -1070,7 +1049,7 @@ impl State {
         };
 
         // The route through the changed neighbour, if it is still there and usable.
-        let candidate = changed.zip(changed_route).filter(|(_, r)| usable(r));
+        let candidate = changed_route.filter(|(_, r)| usable(r));
 
         let selection = match table.state {
             RouteState::Local => unreachable!(),
@@ -1300,28 +1279,32 @@ impl State {
             metric,
         } = advert;
 
-        if metric != METRIC_INFINITY {
-            let key = SourceKey { prefix, router_id };
-            let gc_time = self.params.get_duration(DurationKey::SourceGcTime);
+        // Only updates with a finite metric, not retractions, are recorded
+        // (RFC 8966 §3.7.3).
+        if metric == METRIC_INFINITY {
+            return;
+        }
 
-            match self.source_table.entry(key) {
-                hash_map::Entry::Occupied(e) => {
-                    let v = e.into_mut();
-                    if v.seqno.lt(seqno) {
-                        v.seqno = seqno;
-                        v.metric = metric;
-                    } else if v.seqno == seqno && v.metric > metric {
-                        v.metric = metric;
-                    }
-                    self.timers.reset(&v.gc_timer_key, gc_time);
+        let key = SourceKey { prefix, router_id };
+        let gc_time = self.params.get_duration(DurationKey::SourceGcTime);
+
+        match self.source_table.entry(key) {
+            hash_map::Entry::Occupied(e) => {
+                let v = e.into_mut();
+                if v.seqno.lt(seqno) {
+                    v.seqno = seqno;
+                    v.metric = metric;
+                } else if v.seqno == seqno && v.metric > metric {
+                    v.metric = metric;
                 }
-                hash_map::Entry::Vacant(e) => {
-                    e.insert(SourceValue {
-                        seqno,
-                        metric,
-                        gc_timer_key: self.timers.insert(Timeout::SourceGc(key), gc_time),
-                    });
-                }
+                self.timers.reset(&v.gc_timer_key, gc_time);
+            }
+            hash_map::Entry::Vacant(e) => {
+                e.insert(SourceValue {
+                    seqno,
+                    metric,
+                    gc_timer_key: self.timers.insert(Timeout::SourceGc(key), gc_time),
+                });
             }
         }
     }
