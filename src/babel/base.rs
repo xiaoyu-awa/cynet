@@ -189,6 +189,7 @@ impl HelloHistory {
     }
 
     /// Returns the expected seqno.
+    #[cfg(test)]
     pub fn expected_seqno(&self) -> Seqno {
         self.ne
     }

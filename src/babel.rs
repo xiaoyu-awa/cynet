@@ -31,6 +31,12 @@ use crate::babel::{
     params::{DurationKey, F64Key, IntervalKey, Params, U8Key},
 };
 
+/// How far the seqno of a seqno request may exceed its source's seqno for the source to
+/// answer it, as in babeld. A larger difference most likely means that the source lost
+/// its seqno by rebooting. Requests for unfeasible routes are then not sent, no request
+/// is answered, and the stale source table entries are left to expire.
+const MAX_SEQNO_GAP: i16 = 100;
+
 slotmap::new_key_type! {
     /// Identifies a neighbour internally.
     pub struct NeighKey;
@@ -43,7 +49,9 @@ pub struct NeighKeyMap<K> {
     outward: SecondaryMap<NeighKey, K>,
 }
 
-impl<K: Copy + Eq + Hash> NeighKeyMap<K> {
+impl<K: Clone + Eq + Hash> NeighKeyMap<K> {
+    /// Creates an empty `NeighKeyMap`.
+    #[expect(clippy::new_without_default)]
     pub fn new() -> Self {
         Self {
             inward: HashMap::new(),
@@ -51,28 +59,28 @@ impl<K: Copy + Eq + Hash> NeighKeyMap<K> {
         }
     }
 
-    /// Maps `external` and `internal` to each other. Neither may be mapped already.
+    /// Maps `external` and `internal` to each other. Neither may be already mapped.
     pub fn insert(&mut self, external: K, internal: NeighKey) {
         assert!(
             !self.inward.contains_key(&external) && !self.outward.contains_key(internal),
-            "keys should not be mapped already"
+            "keys should not be already mapped"
         );
-        self.inward.insert(external, internal);
+        self.inward.insert(external.clone(), internal);
         self.outward.insert(internal, external);
     }
 
     /// Returns the corresponding internal key, if any.
-    pub fn internal(&self, external: K) -> Option<NeighKey> {
-        self.inward.get(&external).copied()
+    pub fn internal(&self, external: &K) -> Option<NeighKey> {
+        self.inward.get(external).copied()
     }
 
     /// Returns the corresponding external key, if any.
-    pub fn external(&self, internal: NeighKey) -> Option<K> {
-        self.outward.get(internal).copied()
+    pub fn external(&self, internal: NeighKey) -> Option<&K> {
+        self.outward.get(internal)
     }
 }
 
-struct NeighValue {
+struct NeighEntry {
     hello_history: HelloHistory,
     txcost: u16,
     /// The link cost, as last computed by [`Self::update_cost`].
@@ -85,7 +93,7 @@ struct NeighValue {
     rtt: Option<f64>,
 }
 
-impl NeighValue {
+impl NeighEntry {
     fn new(params: &Params) -> Self {
         Self {
             hello_history: HelloHistory::new(),
@@ -104,9 +112,9 @@ impl NeighValue {
         }
     }
 
-    /// Flushes the neighbour entry, except for the Hello history, which accounts for
-    /// the Hello that caused the flush, if any, and the packet buffer, whose TLVs are
-    /// still to be sent.
+    /// Flushes the neighbour entry, except for the Hello history, which records
+    /// the Hello, if any, that caused the flush, and the packet buffer, the TLVs
+    /// in which, if any, are still to be sent.
     fn flush(&mut self, timers: &mut DelayQueue<Timeout>) {
         if let Some(key) = self.hello_timer_key.take() {
             timers.remove(&key);
@@ -121,7 +129,7 @@ impl NeighValue {
     }
 
     /// Computes the rxcost by 2-out-of-3 link sensing with a nominal cost of 96
-    /// (RFC 8966 Appendix A.2.1, Appendix B).
+    /// (RFC 8966 Appendix A.2.1).
     fn rxcost(&self) -> u16 {
         const NOMINAL_COST: u16 = 96;
 
@@ -133,7 +141,7 @@ impl NeighValue {
         }
     }
 
-    /// Maps the smoothed RTT to a penalty: none up to rtt-min, rising linearly
+    /// Maps the smoothed RTT to a penalty: zero penalty up to rtt-min, rising linearly
     /// to max-rtt-penalty at rtt-max, and constant above (RFC 9616 §4.2).
     fn rtt_penalty(&self) -> u16 {
         const RTT_MIN: f64 = 10_000.0;
@@ -148,9 +156,9 @@ impl NeighValue {
         penalty.round_ties_even() as u16
     }
 
-    /// Updates the link cost: infinite if the rxcost is infinite, and otherwise
-    /// the txcost as with k-out-of-j link sensing (RFC 8966 Appendix A.2.1), plus
-    /// the RTT penalty (RFC 9616 §4.2). Returns whether the cost has changed.
+    /// Updates the link cost to infinity if the rxcost is infinite, or otherwise to
+    /// the txcost plus the RTT penalty (RFC 9616 §4.2), returning whether the cost
+    /// has changed.
     fn update_cost(&mut self) -> bool {
         let old_cost = self.cost;
         self.cost = if self.rxcost() == COST_INFINITY {
@@ -163,19 +171,20 @@ impl NeighValue {
     }
 }
 
+/// Identifies a source of routing information (destination of data traffic).
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct SourceKey {
     prefix: Ipv6Net,
     router_id: RouterId,
 }
 
-struct SourceValue {
+struct SourceEntry {
     seqno: Seqno,
     metric: u16,
     gc_timer_key: TimerKey,
 }
 
-struct RouteValue {
+struct RouteEntry {
     router_id: RouterId,
     advertised_metric: u16,
     // These are kept in cells and can be modified through a shared borrow, so that
@@ -189,7 +198,7 @@ struct RouteValue {
     expiry_timer_key: TimerKey,
 }
 
-impl RouteValue {
+impl RouteEntry {
     /// Returns the smoothed metric at `now`, smoothing the metric exponentially with
     /// the time constant `tau` (RFC 8966 Appendix A.3).
     fn ms_at(&self, now: u32, tau: u32) -> f32 {
@@ -223,33 +232,55 @@ impl RouteValue {
         self.metric.set(metric);
     }
 
-    /// Checks whether the route is feasible (RFC 8966 §3.5.1). The feasibility
-    /// distances change as updates are sent, so this is checked whenever it matters.
-    fn is_feasible(&self, prefix: Ipv6Net, source_table: &HashMap<SourceKey, SourceValue>) -> bool {
+    /// Checks whether the route is feasible (see [`update_feasible`]).
+    fn is_feasible(&self, prefix: Ipv6Net, source_table: &HashMap<SourceKey, SourceEntry>) -> bool {
         let key = SourceKey {
             prefix,
             router_id: self.router_id,
         };
-        source_table.get(&key).is_none_or(|source| {
-            source.seqno.lt(self.seqno)
-                || (self.seqno == source.seqno && self.advertised_metric < source.metric)
-        })
+        update_feasible(source_table, key, self.seqno, self.advertised_metric)
     }
 
     /// Checks whether the route may be selected, that is, whether it is feasible and its
     /// metric is finite (RFC 8966 §3.6).
-    fn is_usable(&self, prefix: Ipv6Net, source_table: &HashMap<SourceKey, SourceValue>) -> bool {
+    fn is_usable(&self, prefix: Ipv6Net, source_table: &HashMap<SourceKey, SourceEntry>) -> bool {
         self.metric.get() != METRIC_INFINITY && self.is_feasible(prefix, source_table)
     }
 }
 
+/// Checks whether an update for a source with the given seqno and finite metric is
+/// feasible (RFC 8966 §3.5.1). The feasibility distances change as updates are sent, so
+/// this is checked whenever it matters.
+fn update_feasible(
+    source_table: &HashMap<SourceKey, SourceEntry>,
+    key: SourceKey,
+    seqno: Seqno,
+    metric: u16,
+) -> bool {
+    source_table.get(&key).is_none_or(|source| {
+        source.seqno.lt(seqno) || (seqno == source.seqno && metric < source.metric)
+    })
+}
+
+/// The routing state for a prefix.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum RouteState {
-    Local,
+    /// A route for the prefix is injected into the Babel domain by the local node.
+    Injected,
+    /// The route through this neighbour is selected for the prefix.
+    /// Its metric is finite, and it is feasible.
     Selected(NeighKey),
+    /// The prefix is held, with an unreachable route installed (RFC 8966 §3.5.4), after
+    /// the selected route was lost with no other to select. It is retracted at once and
+    /// in every periodic update, until a route is selected or this timer expires. When
+    /// it expires, if ever, a neighbour running this code will have expired any route for
+    /// the prefix through this node, and any other still routing it through this node
+    /// must have missed every retraction while it was held.
     Held(TimerKey),
+    /// No route to the prefix is selected. The entry is kept only for fallback routes,
+    /// and removed once there is no fallback route left.
     #[default]
-    Removed,
+    None,
 }
 
 impl RouteState {
@@ -270,25 +301,37 @@ struct Advert {
 }
 
 #[derive(Default)]
-struct PrefixRouteTable {
-    routes: SparseSecondaryMap<NeighKey, RouteValue>,
+struct PrefixRouteEntry {
+    routes: SparseSecondaryMap<NeighKey, RouteEntry>,
     state: RouteState,
+    /// Advertisement for a selected or held route: the selected route's router-id, seqno,
+    /// and metric, kept with an infinite metric while held. `None` for an injected route
+    /// or when no route to the prefix is selected. An injected route is advertised with
+    /// this node's router-id and seqno instead (see [`State::advert_for_prefix`]).
     advert: Option<Advert>,
+}
+
+impl PrefixRouteEntry {
+    /// Checks whether no route to the prefix is selected and no fallback route exists,
+    /// so that the entry can be safely removed.
+    fn is_empty(&self) -> bool {
+        self.state == RouteState::None && self.routes.is_empty()
+    }
 }
 
 #[derive(Default)]
 struct RouteTable {
-    by_prefix: HashMap<Ipv6Net, PrefixRouteTable>,
+    prefix_entries: HashMap<Ipv6Net, PrefixRouteEntry>,
     neigh_prefixes: SecondaryMap<NeighKey, HashSet<Ipv6Net>>,
 }
 
 impl RouteTable {
-    fn insert_local(&mut self, prefix: Ipv6Net) -> bool {
-        match self.by_prefix.entry(prefix) {
+    fn inject(&mut self, prefix: Ipv6Net) -> bool {
+        match self.prefix_entries.entry(prefix) {
             hash_map::Entry::Occupied(_) => false,
             hash_map::Entry::Vacant(e) => {
-                e.insert(PrefixRouteTable {
-                    state: RouteState::Local,
+                e.insert(PrefixRouteEntry {
+                    state: RouteState::Injected,
                     ..Default::default()
                 });
                 true
@@ -296,35 +339,48 @@ impl RouteTable {
         }
     }
 
+    /// Returns the routing state for the prefix, and the route entry for the prefix
+    /// through the neighbour, or `None` if it is not present, in which case
+    /// a new route returned by `f` is inserted.
     fn get_or_insert_with(
         &mut self,
         prefix: Ipv6Net,
         key: NeighKey,
-        f: impl FnOnce() -> RouteValue,
-    ) -> Option<&mut RouteValue> {
-        let table = self.by_prefix.entry(prefix).or_default();
-
-        match table.routes.entry(key).unwrap() {
+        f: impl FnOnce() -> RouteEntry,
+    ) -> (RouteState, Option<&mut RouteEntry>) {
+        let entry = self.prefix_entries.entry(prefix).or_default();
+        let route = match entry.routes.entry(key).unwrap() {
             sparse_secondary::Entry::Occupied(e) => Some(e.into_mut()),
             sparse_secondary::Entry::Vacant(e) => {
                 assert!(self.neigh_prefixes[key].insert(prefix));
                 e.insert(f());
                 None
             }
-        }
+        };
+        (entry.state, route)
     }
 
-    fn remove(&mut self, prefix: &Ipv6Net, key: NeighKey) -> Option<RouteValue> {
-        let route = self.by_prefix.get_mut(prefix)?.routes.remove(key)?;
+    fn remove(&mut self, prefix: &Ipv6Net, key: NeighKey) -> Option<RouteEntry> {
+        let route = self.prefix_entries.get_mut(prefix)?.routes.remove(key)?;
         assert!(self.neigh_prefixes[key].remove(prefix));
         Some(route)
     }
 }
 
-struct PendingSeqnoRequestValue {
+/// A seqno request that this node has recently forwarded, or originated for a route that
+/// it lost. Requests that it originates for unfeasible routes are not recorded.
+///
+/// One entry per prefix is enough: a request is forwarded only when there is a selected
+/// route, and originated only when it is lost, both for its router-id.
+struct SeqnoRequestEntry {
+    router_id: RouterId,
     seqno: Seqno,
-    neigh_key: Option<NeighKey>,
+    /// How many more times the request will be resent while no route to its prefix is
+    /// selected. This also determines its timeout
+    /// (see [`Params::seqno_request_timeout`]).
     resends_left: u8,
+    /// When the request was last sent, as a timestamp.
+    sent_at: u32,
     timer_key: TimerKey,
 }
 
@@ -355,11 +411,9 @@ impl PacketBuf {
     ) {
         let was_empty = self.encoder.is_empty();
 
-        // In all other cases, the TLV SHOULD be sent out within one-half of the
-        // Multicast Hello interval (RFC 8966 §3.1).
-        //
-        // We take half of that and multiply it by 0.75 ~ 1.25, as outgoing TLVs SHOULD
-        // be sent with a random delay (RFC 8966 §3.1).
+        // Usually, a TLV SHOULD be sent within half the Multicast Hello interval (RFC
+        // 8966 §3.1). Take half of that and multiply it by 0.75 ~ 1.25, as outgoing TLVs
+        // SHOULD be sent with a random delay (§3.1).
         //
         // A Hello then waits at most 0.3125 Hello intervals, so consecutive Hellos
         // are at most 1.3125 intervals apart, within the 1.5 intervals after which a
@@ -406,7 +460,7 @@ impl PacketBuf {
     }
 }
 
-pub enum Timeout {
+enum Timeout {
     OutgoingHello,
     OutgoingUpdate,
     IncomingHello(NeighKey),
@@ -414,29 +468,68 @@ pub enum Timeout {
     SourceGc(SourceKey),
     RouteExpiry(Ipv6Net, NeighKey),
     RouteHold(Ipv6Net),
-    SeqnoRequest(SourceKey),
+    SeqnoRequest(Ipv6Net),
     OutgoingPacket(NeighKey),
 }
 
+/// An output of a Babel router.
 pub enum Output {
+    /// Sends a Babel packet to a neighbour.
     Packet(NeighKey, Box<[u8]>),
+    /// Selects a neighbour as the next-hop router to a prefix.
     RouteSelect(Ipv6Net, NeighKey),
+    /// Holds a prefix by installing an unreachable route.
     RouteHold(Ipv6Net),
+    /// Removes the route to a prefix.
     RouteRemove(Ipv6Net),
 }
 
+/// The state of a Babel router.
+///
+/// # Reboots
+///
+/// A node that reboots loses its feasibility distances, so it may select a previously
+/// unfeasible route and create a loop. For example, take this network, where node 0
+/// originates P, and the link between nodes 1 and 3 is slow, so that node 3 routes P
+/// through node 2, and node 2 through node 1:
+///
+/// ```text
+/// 0 --- 1 --- 2
+///        \   /
+///         \ /
+///          3
+/// ```
+///
+/// Should node 1 reboot, and come back while node 0 is unreachable, for example because
+/// the link between them is not up again yet, node 3 still advertises P to node 1, as its
+/// route is not through node 1. Node 1 has no feasibility distance for P left, so it
+/// selects that route, and packets for P go round nodes 1, 3 and 2.
+///
+/// So the routes through a node from before it reboots need to be removed, in three ways.
+/// It sends every neighbour a wildcard retraction as it shuts down (see
+/// [`State::shutdown`]), which removes the routes before it reboots, and another to each
+/// neighbour after rebooting (see [`State::add_neighbour`]), which also covers a crash.
+/// And a neighbour removes the routes as it notices the reboot from the node's Hello
+/// seqno (RFC 8966 Appendix A.1), which covers a node that sends no retraction.
+///
+/// In the extremely rare case where no retraction is delivered and the node's new Hello
+/// seqno happens to be close to the old one, a loop can still form. With neighbours
+/// running this code, it ends when the stale routes expire, 3.5 Update intervals after
+/// the last update received from before the reboot (56 s by default), or sooner if the
+/// prefix becomes reachable again and a node in the loop switches to the new route. No
+/// update from around the loop is feasible, and an unfeasible update for a selected route
+/// is ignored rather than refreshing the route. A neighbour that applies it instead, as
+/// babeld does, can loop until the metric reaches infinity.
 pub struct State {
     params: Params,
     router_id: RouterId,
     seqno: Seqno,
     hello_seqno: Seqno,
-    hello_timer_key: TimerKey,
     hellos_until_ihu: u8,
-    update_timer_key: TimerKey,
-    neigh_table: SlotMap<NeighKey, NeighValue>,
-    source_table: HashMap<SourceKey, SourceValue>,
+    neigh_table: SlotMap<NeighKey, NeighEntry>,
+    source_table: HashMap<SourceKey, SourceEntry>,
     route_table: RouteTable,
-    pending_seqno_request_table: HashMap<SourceKey, PendingSeqnoRequestValue>,
+    seqno_request_table: HashMap<Ipv6Net, SeqnoRequestEntry>,
     outputs: VecDeque<Output>,
     timers: DelayQueue<Timeout>,
     /// The current timestamp, as returned by [`timestamp_now`],
@@ -444,22 +537,23 @@ pub struct State {
     /// For a packet, it is the receive timestamp (RFC 9616 §3.1).
     now: u32,
     // Temporary states for each received packet.
-    /// The prefixes whose routes through the sender have been added, modified or removed
-    /// by updates other than wildcard retractions. One prefix may appear more than once.
+    /// The prefixes whose routes through the sender have been added, modified, or removed
+    /// by the packet. A single prefix may appear more than once.
     updated_prefixes: Vec<Ipv6Net>,
-    /// The prefixes whose routes through the sender have been removed
-    /// by the first wildcard retraction, if any.
-    wildcard_retracted_prefixes: Option<HashSet<Ipv6Net>>,
+    /// The route and seqno requests received, to be handled after route selection.
+    requests: Vec<Tlv>,
     hello_timestamp: Option<u32>,
     ihu_timestamps: Option<(u32, u32)>,
 }
 
 impl State {
+    /// Creates a new `State` with the given parameters, router-id, and seqno (if any).
+    /// Seqno defaults to a random one if not given.
     pub fn new(params: Params, router_id: RouterId, seqno: Option<Seqno>) -> Self {
         let mut timers = DelayQueue::new();
 
-        let hello_timer_key = timers.insert(Timeout::OutgoingHello, Duration::ZERO);
-        let update_timer_key = timers.insert(Timeout::OutgoingUpdate, Duration::ZERO);
+        timers.insert(Timeout::OutgoingHello, Duration::ZERO);
+        timers.insert(Timeout::OutgoingUpdate, Duration::ZERO);
 
         let hellos_until_ihu = params.get_u8(U8Key::HellosPerIhu);
 
@@ -468,31 +562,98 @@ impl State {
             router_id,
             seqno: seqno.unwrap_or_else(|| Seqno::new(rand::random())),
             hello_seqno: Seqno::new(rand::random()),
-            hello_timer_key,
             hellos_until_ihu,
-            update_timer_key,
             neigh_table: SlotMap::with_key(),
             source_table: HashMap::new(),
             route_table: RouteTable::default(),
-            pending_seqno_request_table: HashMap::new(),
+            seqno_request_table: HashMap::new(),
             outputs: VecDeque::new(),
             timers,
             now: 0,
             updated_prefixes: Vec::new(),
-            wildcard_retracted_prefixes: None,
+            requests: Vec::new(),
             hello_timestamp: None,
             ihu_timestamps: None,
         }
     }
 
-    pub fn add_neigh(&mut self) -> NeighKey {
-        let key = self.neigh_table.insert(NeighValue::new(&self.params));
+    /// Adds a neighbour, and sends it a wildcard retraction at once, in a packet of
+    /// its own, so that it removes any route through this node from before a reboot
+    /// (see [Reboots]).
+    ///
+    /// The retraction goes at once, as the neighbour's packets may reach this node from
+    /// now on. If the neighbour is added after others, this node may have learnt routes
+    /// through them already, and the packets could loop until the retraction arrives,
+    /// for example when node 1 adds node 2 after node 3 in the network of [Reboots].
+    ///
+    /// [Reboots]: State#reboots
+    pub fn add_neighbour(&mut self) -> NeighKey {
+        let key = self.neigh_table.insert(NeighEntry::new(&self.params));
         self.route_table.neigh_prefixes.insert(key, HashSet::new());
+
+        let retraction = self.wildcard_retraction();
+        self.send_now(Some(key), |e| e.put_update(&retraction));
+
         key
     }
 
-    pub fn add_local_route(&mut self, prefix: Ipv6Net) -> bool {
-        self.route_table.insert_local(prefix.trunc())
+    /// Injects a route for a prefix that this node originates, returning `false` if the
+    /// route table already has an entry for it, whether injected or learned.
+    ///
+    /// No update is sent for it at once: neighbours first learn of it from the next
+    /// periodic update, up to an Update interval later. Injected routes are meant to be
+    /// added when the node starts, before it has neighbours, which this does not delay.
+    pub fn inject_route(&mut self, prefix: Ipv6Net) -> bool {
+        self.route_table.inject(prefix.trunc())
+    }
+
+    /// Shuts the node down, saying goodbye to every neighbour, and removing every route
+    /// selected or held. Returns the outputs left to handle: any not yet polled, then
+    /// those of the shutdown.
+    ///
+    /// Each neighbour is sent at once a packet of a wildcard retraction and a Hello with
+    /// an interval of 0.1 s, as babeld does, and any other buffered TLVs are dropped. On
+    /// the retraction, it switches to other routes, or holds the prefixes, rather than
+    /// routing through this node until the link fails, and no such route is left to loop
+    /// should this node come back soon (see [Reboots](State#reboots)). It then counts
+    /// this node's Hellos as missed every 0.1 s, so that the link fails after 0.25 s, and
+    /// this node's entry is flushed after 1.65 s, once the 16-Hello history is empty
+    /// (if RFC 8966 Appendix A.1 is exactly implemented).
+    pub fn shutdown(mut self) -> impl Iterator<Item = Output> {
+        let retraction = self.wildcard_retraction();
+        let hello = Tlv::Hello {
+            seqno: self.hello_seqno,
+            interval: Interval::new(10),
+            transmit_timestamp: None,
+        };
+
+        self.send_now(None, |e| {
+            e.clear();
+            assert!(e.put_update(&retraction) && e.put_tlv(&hello));
+            true
+        });
+
+        for (&prefix, entry) in &self.route_table.prefix_entries {
+            if let RouteState::Selected(_) | RouteState::Held(_) = entry.state {
+                self.outputs.push_back(Output::RouteRemove(prefix));
+            }
+        }
+
+        self.outputs.into_iter()
+    }
+
+    /// Returns a wildcard retraction (RFC 8966 §4.6.9), which retracts every route that
+    /// this node has advertised to the neighbour it is sent to.
+    fn wildcard_retraction(&self) -> Update {
+        Update {
+            ae: Ae::Wildcard,
+            plen: 0,
+            interval: self.params.get_interval(IntervalKey::Update),
+            seqno: self.seqno,
+            metric: METRIC_INFINITY,
+            prefix: [0; 16],
+            router_id: None,
+        }
     }
 
     pub fn poll_timeout(&mut self, cx: &mut Context<'_>) -> Poll<Option<Timeout>> {
@@ -501,6 +662,7 @@ impl State {
             .map(|o| o.map(|e| e.into_inner()))
     }
 
+    /// Polls the next output, if any.
     pub fn poll_output(&mut self) -> Option<Output> {
         self.outputs.pop_front()
     }
@@ -552,7 +714,7 @@ impl State {
                 }
 
                 self.hello_seqno += 1;
-                self.hello_timer_key = self.timers.insert(
+                self.timers.insert(
                     Timeout::OutgoingHello,
                     self.params.get_duration(DurationKey::HelloInterval),
                 );
@@ -560,7 +722,7 @@ impl State {
             Timeout::OutgoingUpdate => {
                 self.dump_routes(None);
 
-                self.update_timer_key = self.timers.insert(
+                self.timers.insert(
                     Timeout::OutgoingUpdate,
                     self.params.get_duration(DurationKey::UpdateInterval),
                 );
@@ -604,20 +766,33 @@ impl State {
                 self.select_route(prefix, Some(key));
             }
             Timeout::RouteHold(prefix) => {
-                let table = self.route_table.by_prefix.get_mut(&prefix).unwrap();
-                assert_matches!(table.state, RouteState::Held(_));
+                let entry = self.route_table.prefix_entries.get_mut(&prefix).unwrap();
+                assert_matches!(entry.state, RouteState::Held(_));
 
                 self.outputs.push_back(Output::RouteRemove(prefix));
 
-                if table.routes.is_empty() {
+                if entry.routes.is_empty() {
                     // Nothing is left to keep the entry for.
-                    self.route_table.by_prefix.remove(&prefix);
+                    self.route_table.prefix_entries.remove(&prefix);
                 } else {
-                    table.state = RouteState::Removed;
-                    table.advert = None;
+                    entry.state = RouteState::None;
+                    entry.advert = None;
                 }
             }
-            Timeout::SeqnoRequest(_source_key) => todo!(),
+            Timeout::SeqnoRequest(prefix) => {
+                let request = self.seqno_request_table.remove(&prefix).unwrap();
+                // Only a request that this node originated has resends left, and only
+                // until a route is selected (RFC 8966 §3.8.2.1).
+                if request.resends_left > 0 {
+                    let key = SourceKey {
+                        prefix,
+                        router_id: request.router_id,
+                    };
+                    let resends_left = request.resends_left - 1;
+                    self.record_seqno_request(key, request.seqno, resends_left);
+                    self.send_seqno_request(None, key, request.seqno, None);
+                }
+            }
             Timeout::OutgoingPacket(key) => {
                 let buf = &mut self.neigh_table[key].packet_buf;
                 buf.flush_timer_key = None;
@@ -626,6 +801,7 @@ impl State {
         }
     }
 
+    /// Handles a Babel packet.
     pub fn handle_packet(&mut self, from: NeighKey, buf: &[u8]) {
         // Malformed packets, and TLVs that fail to decode or are otherwise
         // ignored, are silently ignored (RFC 8966 §4.2, §4.3, §4.4, §4.6).
@@ -672,24 +848,27 @@ impl State {
             self.neigh_cost_changed(from);
         }
 
-        // Then for the prefixes retracted by the first wildcard retraction, if any.
-        if let Some(prefixes) = self.wildcard_retracted_prefixes.take() {
-            for prefix in prefixes {
-                self.select_route(prefix, Some(from));
-            }
-        }
-
-        // And finally for the prefixes updated by non-wildcard updates. Selection may
-        // run more than once for a prefix, but running again is harmless: nothing has
-        // changed since the last run, so it makes the same choice and outputs nothing.
-        // It is also rare: it only happens in a packet that both changes the link cost
-        // and carries updates, or one that updates a prefix more than once.
-        // Deduplication, by contrast, would cost something on every packet.
+        // And then for the updated prefixes. Selection may run more than once for a
+        // prefix, but running again is harmless: nothing has changed since the last run,
+        // so it makes the same choice and outputs nothing. It is also rare: it only
+        // happens in a packet that both changes the link cost and carries updates, or one
+        // that updates a prefix more than once.
         let mut prefixes = mem::take(&mut self.updated_prefixes);
         for prefix in prefixes.drain(..) {
             self.select_route(prefix, Some(from));
         }
         self.updated_prefixes = prefixes;
+
+        // Requests are handled against the routes as the packet leaves them. A neighbour
+        // that loses its selected route normally sends a retraction and a seqno request
+        // in one packet. If this node then selects another route, the request is
+        // forwarded along it, and if it selects none, not at all, as this node's own
+        // request for the lost route covers it.
+        let mut requests = mem::take(&mut self.requests);
+        for tlv in requests.drain(..) {
+            self.handle_request(from, &tlv);
+        }
+        self.requests = requests;
 
         self.hello_timestamp = None;
         self.ihu_timestamps = None;
@@ -702,10 +881,10 @@ impl State {
             Tlv::AcknowledgementRequest { opaque, interval } => {
                 let timeout = interval.to_duration();
                 let tlv = Tlv::Acknowledgement { opaque };
-                self.send(Some(from), None, Some(timeout), &PacketItem::Tlv(tlv));
+                self.send(Some(from), Some(timeout), |e| e.put_tlv(&tlv));
             }
             Tlv::Acknowledgement { .. } => {
-                // Ignore it as we never send a request.
+                // Ignore it as we never send an acknowledgement request.
             }
             Tlv::Hello {
                 seqno,
@@ -714,7 +893,11 @@ impl State {
             } => {
                 let neigh = &mut self.neigh_table[from];
 
-                if neigh.hello_history.received(seqno) == HelloEffect::Flush {
+                // A Hello seqno far from the expected one means that the neighbour has
+                // probably rebooted, and its whole entry is flushed (RFC 8966 Appendix
+                // A.1), routes included (see below).
+                let rebooted = neigh.hello_history.received(seqno) == HelloEffect::Flush;
+                if rebooted {
                     neigh.flush(&mut self.timers);
                 }
 
@@ -737,6 +920,25 @@ impl State {
                 if let Some(t) = transmit_timestamp {
                     neigh.origin_receive_timestamps = Some((t, self.now));
                     self.hello_timestamp = Some(t);
+                }
+
+                // Remove the routes learnt from the neighbour before it rebooted. It has
+                // lost its feasibility distances, so they could form loops with the ones
+                // it learns now (see Reboots in the doc of `State`). Routes refreshed by
+                // updates earlier in this packet are kept, as they come from after the
+                // reboot. The prefixes of the others are recorded for route selection at
+                // the end of the packet.
+                if rebooted {
+                    let refreshed: HashSet<_> = self.updated_prefixes.iter().copied().collect();
+                    let stale: Vec<_> = (self.route_table.neigh_prefixes[from].iter())
+                        .filter(|prefix| !refreshed.contains(prefix))
+                        .copied()
+                        .collect();
+                    for prefix in stale {
+                        let route = self.route_table.remove(&prefix, from).unwrap();
+                        self.timers.remove(&route.expiry_timer_key);
+                        self.updated_prefixes.push(prefix);
+                    }
                 }
             }
             Tlv::Ihu {
@@ -765,6 +967,15 @@ impl State {
 
                 neigh.txcost = rxcost;
             }
+            Tlv::RouteRequest { .. } | Tlv::SeqnoRequest { .. } => {
+                self.requests.push(tlv.clone());
+            }
+        }
+    }
+
+    /// Handles a route or seqno request, once the packet's routes have been selected.
+    fn handle_request(&mut self, from: NeighKey, tlv: &Tlv) {
+        match *tlv {
             Tlv::RouteRequest { ae, plen, prefix } => {
                 self.handle_route_request(from, ae, plen, prefix);
             }
@@ -782,6 +993,7 @@ impl State {
                 let prefix = Ipv6Net::new_assert(Ipv6Addr::from_octets(prefix), plen);
                 self.handle_seqno_request(from, seqno, hop_count, router_id, prefix);
             }
+            _ => unreachable!(),
         }
     }
 
@@ -796,8 +1008,8 @@ impl State {
         let advert = match ae {
             Ae::Ipv6 => {
                 let prefix = Ipv6Net::new_assert(Ipv6Addr::from_octets(prefix), plen);
-                let table = self.route_table.by_prefix.get(&prefix);
-                let advert = table.and_then(|table| self.advert_for_prefix(table));
+                let entry = self.route_table.prefix_entries.get(&prefix);
+                let advert = entry.and_then(|e| self.advert_for_prefix(e));
 
                 if let Some(advert) = advert {
                     self.update_source_table(prefix, advert);
@@ -825,7 +1037,7 @@ impl State {
             router_id: Some(advert.router_id),
         };
 
-        self.send(Some(from), None, None, &PacketItem::Update(update));
+        self.send(Some(from), None, |e| e.put_update(&update));
     }
 
     /// Answers a seqno request (RFC 8966 §3.8.1.2).
@@ -837,11 +1049,11 @@ impl State {
         router_id: RouterId,
         prefix: Ipv6Net,
     ) {
-        let Some(table) = self.route_table.by_prefix.get(&prefix) else {
+        let Some(entry) = self.route_table.prefix_entries.get(&prefix) else {
             return;
         };
 
-        let Some(mut advert) = self.advert_for_prefix(table) else {
+        let Some(mut advert) = self.advert_for_prefix(entry) else {
             return;
         };
 
@@ -853,6 +1065,14 @@ impl State {
             self.send_update(Some(from), None, true, prefix, advert);
             return;
         } else if self.router_id == router_id {
+            // A request whose seqno exceeds this node's by more than `MAX_SEQNO_GAP` is
+            // ignored. Raising the seqno by 1 would not satisfy it, but only cost an
+            // urgent update, and keep the requester sending requests when it does not
+            // impose a similar limit on the gap.
+            if seqno - advert.seqno > MAX_SEQNO_GAP {
+                return;
+            }
+
             self.seqno += 1;
             advert.seqno = self.seqno;
 
@@ -864,53 +1084,163 @@ impl State {
             return;
         };
 
-        // TODO: A node SHOULD compare every incoming seqno request against its list of
-        // recently forwarded seqno requests and avoid forwarding the request if it is
-        // redundant (i.e., if the node has recently sent a request with the same prefix,
-        // router-id, and a seqno that is not smaller modulo 2^16).
+        // A node SHOULD compare every incoming seqno request against its list of recently
+        // forwarded seqno requests and avoid forwarding the request if it is redundant
+        // (RFC 8966 §3.8.1.2).
+        let key = SourceKey { prefix, router_id };
+        if self.seqno_request_redundant(key, seqno) {
+            return;
+        }
 
-        // Forward the request to the next hop of a route that is not through the requester,
-        // a feasible one if there is any, with the smallest metric.
-        let feasible = |r: &RouteValue| r.is_feasible(prefix, &self.source_table);
-        let Some((to, _)) = table
-            .routes
-            .iter()
-            .filter(|&(k, _)| k != from)
-            .min_by_key(|&(k, r)| (!feasible(r), r.metric.get(), k))
-        else {
+        // Forward the request to the next hop of the selected route, or if that is the
+        // requester, to the next hop of another route with a finite metric, a feasible
+        // one if there is any, with the smallest metric.
+        //
+        // The selected route comes first because a reply over it is forwarded on as an
+        // urgent TLV. However, the selected route can be through the requester, mostly
+        // when the requester's retraction was lost. For example, take this network, where
+        // node 0 originates P, and the link between nodes 0 and 2 is slow, so that node 2
+        // routes P through node 1:
+        //
+        //     0 --- 1
+        //      \   /
+        //       \ /
+        //        2
+        //
+        // Should the link between nodes 0 and 1 fail, node 1 normally sends a retraction
+        // and a seqno request in one packet to node 2. If the packet is lost, the
+        // request's first resend, 2 s later, usually reaches node 2 before the retraction
+        // is repeated, while node 2 still routes P through node 1. Node 2 then forwards
+        // it to node 0, whose reply gives node 2's route through node 0 the new seqno.
+        // Once node 2 learns of the loss and switches to that route, the new
+        // advertisement satisfies the forwarded request, so node 2 sends it to node 1 as
+        // an urgent TLV, and with the new seqno, node 1 accepts it at once.
+        //
+        // So the other route is the one that selection would pick next: the reply updates
+        // it, and is forwarded on once it is selected. Unlike in selection, the route may
+        // be unfeasible, which the reply can fix, but its metric must be finite:
+        // feasibility ignores the link cost, so a route over a failed link would
+        // otherwise come first.
+        let feasible = |r: &RouteEntry| r.is_feasible(prefix, &self.source_table);
+        let to = entry.state.selected().filter(|&k| k != from).or_else(|| {
+            entry
+                .routes
+                .iter()
+                .filter(|&(k, r)| k != from && r.metric.get() != METRIC_INFINITY)
+                .min_by_key(|&(k, r)| (!feasible(r), r.metric.get(), k))
+                .map(|(k, _)| k)
+        });
+        let Some(to) = to else {
             return;
         };
 
-        self.send_seqno_request(Some(to), true, prefix, router_id, seqno, Some(hop_count));
+        self.record_seqno_request(key, seqno, 0);
+        self.send_seqno_request(Some(to), key, seqno, Some(hop_count));
     }
 
+    /// Records a seqno request that this node sends: to resend it up to `resends_left`
+    /// times while no route to its prefix is selected, to tell redundant requests, and
+    /// to send an update that satisfies it as an urgent TLV (RFC 8966 §3.8.1.2).
+    fn record_seqno_request(&mut self, key: SourceKey, seqno: Seqno, resends_left: u8) {
+        let request = SeqnoRequestEntry {
+            router_id: key.router_id,
+            seqno,
+            resends_left,
+            sent_at: self.now,
+            timer_key: self.timers.insert(
+                Timeout::SeqnoRequest(key.prefix),
+                self.params.seqno_request_timeout(resends_left),
+            ),
+        };
+
+        // A request replaces any pending one for the same prefix, which has the same
+        // router-id (see `SeqnoRequestEntry`). One with a seqno no smaller covers the
+        // replaced one, as any reply to it satisfies both. One with a smaller seqno is
+        // only forwarded once the replaced one is past the redundancy window, unanswered
+        // and most likely lost, and its requester's resend asks again.
+        //
+        // A request with resends left is never replaced: it is pending only while no
+        // route is selected, when no request is forwarded, and requests for unfeasible
+        // routes are not recorded.
+        if let Some(old) = self.seqno_request_table.insert(key.prefix, request) {
+            debug_assert_eq!(old.router_id, key.router_id);
+            debug_assert_eq!(old.resends_left, 0);
+            self.timers.remove(&old.timer_key);
+        }
+    }
+
+    /// Sends the neighbour that advertised an unfeasible route, with `advertised_seqno`,
+    /// a seqno request for a feasible update (RFC 8966 §3.8.2.2), with the seqno in the
+    /// source table plus 1, which has an entry as the route is unfeasible. For the
+    /// selected route, whose unfeasible updates are ignored, the reply also keeps the
+    /// route from expiring.
+    ///
+    /// The request is not recorded, as it would replace any request for a lost route that
+    /// is still to be resent, and no neighbour asked for its reply.
+    ///
+    /// It is only sent if its seqno exceeds `advertised_seqno` by at most
+    /// `MAX_SEQNO_GAP`, as the source may otherwise ignore it.
+    fn request_feasible_update(
+        &mut self,
+        neigh_key: NeighKey,
+        source_key: SourceKey,
+        advertised_seqno: Seqno,
+    ) {
+        let seqno = self.source_table[&source_key].seqno + 1;
+        if seqno - advertised_seqno <= MAX_SEQNO_GAP {
+            self.send_seqno_request(Some(neigh_key), source_key, seqno, None);
+        }
+    }
+
+    /// Sends a seqno request, to the given neighbour or to every one.
+    ///
+    /// A forwarded request has its decremented `hop_count`, and a request that this node
+    /// originates has `None`, for a hop count of 64. Either is sent as an urgent TLV: a
+    /// forwarded one SHOULD be (RFC 8966 §3.8.1.2), and an originated one is too, since
+    /// the delay before a non-urgent TLV is sent would make up most of the time to regain
+    /// a lost route.
     fn send_seqno_request(
         &mut self,
         to: Option<NeighKey>,
-        urgent: bool,
-        prefix: Ipv6Net,
-        router_id: RouterId,
+        key: SourceKey,
         seqno: Seqno,
         hop_count: Option<NonZeroU8>,
     ) {
         const DEFAULT_HOP_COUNT: NonZeroU8 = NonZeroU8::new(64).unwrap();
 
-        let timeout = urgent.then(|| self.params.get_duration(DurationKey::UrgentTimeout));
+        let timeout = self.params.get_duration(DurationKey::UrgentTimeout);
 
         let tlv = Tlv::SeqnoRequest {
             ae: Ae::Ipv6,
-            plen: prefix.prefix_len(),
+            plen: key.prefix.prefix_len(),
             seqno,
             hop_count: hop_count.unwrap_or(DEFAULT_HOP_COUNT),
-            router_id,
-            prefix: prefix.addr().octets(),
+            router_id: key.router_id,
+            prefix: key.prefix.addr().octets(),
         };
 
-        self.send(to, None, timeout, &PacketItem::Tlv(tlv));
+        self.send(to, Some(timeout), |e| e.put_tlv(&tlv));
     }
 
-    /// Handles an update (RFC 8966 §3.5.3), recording its prefix for route selection at
-    /// the end of the packet.
+    /// Checks whether a seqno request is redundant (RFC 8966 §3.8.1.2): whether this node
+    /// has a pending request for the same source, with a seqno no smaller than `seqno`,
+    /// sent less than half the initial request timeout ago.
+    ///
+    /// That window, 1 s by default, is shorter than the time before a requester first
+    /// resends a request, so the resend is forwarded too, making up for a lost copy.
+    fn seqno_request_redundant(&self, key: SourceKey, seqno: Seqno) -> bool {
+        let window = self.params.get_duration(DurationKey::InitialRequestTimeout) / 2;
+        self.seqno_request_table
+            .get(&key.prefix)
+            .is_some_and(|request| {
+                debug_assert!(request.router_id == key.router_id);
+                !request.seqno.lt(seqno)
+                    && self.now.wrapping_sub(request.sent_at) < window.as_micros() as u32
+            })
+    }
+
+    /// Handles an update (RFC 8966 §3.5.3), recording the prefix of any route it changes
+    /// for route selection at the end of the packet.
     fn handle_update(&mut self, from: NeighKey, update: &Update) {
         let Update {
             ae,
@@ -927,13 +1257,7 @@ impl State {
             assert_eq!(metric, METRIC_INFINITY);
 
             let prefixes = self.remove_neigh_routes(from);
-
-            // If this is not the first wildcard retraction in the packet, it only removes
-            // routes added by updates since the first one, whose prefixes are already
-            // recorded in `updated_prefixes`, so we don't need to record them again.
-            if self.wildcard_retracted_prefixes.is_none() {
-                self.wildcard_retracted_prefixes = Some(prefixes);
-            }
+            self.updated_prefixes.extend(prefixes);
             return;
         }
 
@@ -962,9 +1286,9 @@ impl State {
             .to_duration()
             .mul_f64(self.params.get_f64(F64Key::RouteExpiryTimeMultiplier));
 
-        if let Some(route) = self
+        let (state, route) = self
             .route_table
-            .get_or_insert_with(prefix, from, || RouteValue {
+            .get_or_insert_with(prefix, from, || RouteEntry {
                 router_id,
                 advertised_metric: metric,
                 metric: Cell::new(METRIC_INFINITY),
@@ -974,8 +1298,29 @@ impl State {
                 expiry_timer_key: self
                     .timers
                     .insert(Timeout::RouteExpiry(prefix, from), expiry_time),
-            })
-        {
+            });
+
+        if let Some(route) = route {
+            // An unfeasible update for the selected route, with an unchanged router-id,
+            // is ignored, as RFC 8966 §3.5.3 allows, rather than applied, which would
+            // unselect the route and can turn a mere rise in its metric into a hold. A
+            // seqno request is sent instead (§3.8.2.2), and until a feasible update
+            // comes, the route keeps its old metric.
+            //
+            // babeld instead applies the update and keeps the route. That is loop-free as
+            // long as the neighbour keeps its feasibility distances, but after it
+            // reboots, the update refreshes a stale route through it, so that a loop can
+            // last until the metric reaches infinity. An ignored update leaves such a
+            // route to expire (see Reboots in the doc of `State`).
+            let key = SourceKey { prefix, router_id };
+            if state == RouteState::Selected(from)
+                && route.router_id == router_id
+                && !update_feasible(&self.source_table, key, seqno, metric)
+            {
+                self.request_feasible_update(from, key, seqno);
+                return;
+            }
+
             route.router_id = router_id;
             route.advertised_metric = metric;
             route.seqno = seqno;
@@ -991,8 +1336,8 @@ impl State {
     fn remove_neigh_routes(&mut self, key: NeighKey) -> HashSet<Ipv6Net> {
         let prefixes = mem::take(&mut self.route_table.neigh_prefixes[key]);
         for prefix in &prefixes {
-            let table = self.route_table.by_prefix.get_mut(prefix).unwrap();
-            let route = table.routes.remove(key).unwrap();
+            let entry = self.route_table.prefix_entries.get_mut(prefix).unwrap();
+            let route = entry.routes.remove(key).unwrap();
             self.timers.remove(&route.expiry_timer_key);
         }
         prefixes
@@ -1007,7 +1352,7 @@ impl State {
     }
 
     /// Runs route selection (RFC 8966 §3.6) for a prefix, after its route through the
-    /// `changed` neighbour has been added, modified or removed, or that neighbour's link
+    /// `changed` neighbour has been added, modified, or removed, or that neighbour's link
     /// cost has changed, or, with no `changed` neighbour, after a source table entry for
     /// the prefix has expired.
     ///
@@ -1020,12 +1365,12 @@ impl State {
     fn select_route(&mut self, prefix: Ipv6Net, changed: Option<NeighKey>) {
         // A prefix may have no entry: a source table entry can outlive it, and selection
         // may have already removed it for a prefix recorded more than once in a packet.
-        let Some(table) = self.route_table.by_prefix.get_mut(&prefix) else {
+        let Some(entry) = self.route_table.prefix_entries.get_mut(&prefix) else {
             return;
         };
 
-        // The route through the changed neighbour, with its key, unless it has been removed.
-        let changed_route = changed.and_then(|key| table.routes.get(key).map(|r| (key, r)));
+        // The route through the changed neighbour, with its key, if it is not removed.
+        let changed_route = changed.and_then(|k| entry.routes.get(k).map(|r| (k, r)));
 
         if let Some((key, route)) = changed_route {
             let cost = self.neigh_table[key].cost;
@@ -1033,124 +1378,245 @@ impl State {
             route.set_metric(metric, self.now, self.params.get_tau());
         }
 
-        if table.state == RouteState::Local {
+        if entry.state == RouteState::Injected {
             return;
         }
 
-        let usable = |r: &RouteValue| r.is_usable(prefix, &self.source_table);
         let best_usable = || {
             // If no route to a given destination is selected, then select the route with
             // the smallest metric, ignoring the smoothed metric.
-            table
+            entry
                 .routes
                 .iter()
-                .filter(|(_, r)| usable(r))
+                .filter(|(_, r)| r.is_usable(prefix, &self.source_table))
                 .min_by_key(|&(k, r)| (r.metric.get(), k))
         };
 
-        // The route through the changed neighbour, if it is still there and usable.
-        let candidate = changed_route.filter(|(_, r)| usable(r));
+        // The route through the changed neighbour, if it is still there with a finite
+        // metric, and whether it is also feasible, and so usable.
+        let candidate = changed_route.filter(|(_, r)| r.metric.get() != METRIC_INFINITY);
+        let candidate_feasible =
+            candidate.is_some_and(|(_, r)| r.is_feasible(prefix, &self.source_table));
 
-        let selection = match table.state {
-            RouteState::Local => unreachable!(),
-            // The selected route has not changed, so it is still usable: only advertising
-            // tightens feasibility, and advertising the selected route keeps it feasible.
-            // This includes the expiry of a source table entry, with no changed route.
+        // The route to select, and the candidate if it is selected, or would be selected
+        // if it were feasible. In the latter case, a node SHOULD send a seqno request to
+        // the neighbour that advertised it (RFC 8966 §3.8.2.2, with Erratum 7373).
+        let (selection, wanted) = match entry.state {
+            RouteState::Injected => unreachable!(),
+            // The selected route has not changed, so it is still usable. Its metric is
+            // still finite, and it is still feasible: only advertising tightens
+            // feasibility, and advertising the selected route keeps it feasible.
+            // This includes a source table entry expiring, with no changed route.
             RouteState::Selected(key) if changed != Some(key) => {
-                let selected = &table.routes[key];
-                debug_assert!(usable(selected));
+                let selected = &entry.routes[key];
+                debug_assert!(selected.is_usable(prefix, &self.source_table));
 
-                let ms = |r: &RouteValue| r.ms_at(self.now, self.params.get_tau());
+                let ms = |r: &RouteEntry| r.ms_at(self.now, self.params.get_tau());
 
                 // If a route R is selected, then switch to a route R' only when both
                 // m(R') < m(R) and ms(R') < ms(R).
-                if let Some((_, route)) = candidate
-                    && route.metric < selected.metric
-                    && ms(route) < ms(selected)
-                {
-                    candidate
-                } else {
-                    Some((key, selected))
-                }
+                let better =
+                    candidate.filter(|(_, r)| r.metric < selected.metric && ms(r) < ms(selected));
+                let selection = better
+                    .filter(|_| candidate_feasible)
+                    .or(Some((key, selected)));
+                (selection, better)
             }
             // The selected route has changed. Keep it if it is still usable, or else
-            // select the best usable route.
-            RouteState::Selected(_) => candidate.or_else(best_usable),
+            // select the best usable route. An unfeasible update for it with an unchanged
+            // router-id was ignored (see `handle_update`), so it is unfeasible here only
+            // if its router-id has changed, making it a route for another source, or if
+            // an update added it anew after a retraction in the same packet. Either way,
+            // it is unselected, as RFC 8966 requires (§3.5.3, §3.6).
+            RouteState::Selected(_) => {
+                let kept = candidate.filter(|_| candidate_feasible);
+                (kept.or_else(best_usable), candidate)
+            }
             // Nothing is selected, so no route is usable: one only becomes usable without
             // changing as its source table entry expires. So select the changed route if
             // it is usable, or after such an expiry, the best usable route.
-            RouteState::Held(_) | RouteState::Removed => match changed {
-                Some(_) => candidate,
-                None => best_usable(),
+            RouteState::Held(_) | RouteState::None => match changed {
+                Some(_) => (candidate.filter(|_| candidate_feasible), candidate),
+                None => (best_usable(), None),
             },
         };
 
-        let mut update_urgent = None;
+        // The wanted candidate's neighbour, router-id, and seqno, if it is unfeasible.
+        let unfeasible_wanted = wanted
+            .filter(|_| !candidate_feasible)
+            .map(|(k, r)| (k, r.router_id, r.seqno));
+
+        // Whether to send a triggered update, which always goes out as an urgent TLV.
+        // RFC 8966 requires urgency only when the selected router-id changes (§3.7.2),
+        // and recommends it only for the reply to a forwarded seqno request (§3.8.1.2).
+        // A retraction or the update for a newly reachable prefix is sent urgently too,
+        // saving about 0.9 s per hop by default when they spread.
+        let mut trigger_update = false;
+
+        // The router-id of the lost route, if any.
+        let mut lost_router_id = None;
 
         if let Some((key, route)) = selection {
-            match table.state {
-                RouteState::Local => unreachable!(),
+            match entry.state {
+                RouteState::Injected => unreachable!(),
+                // The prefix is still reachable, possibly with another router-id.
                 RouteState::Selected(_) => {
-                    let old_router_id = table.advert.unwrap().router_id;
-                    if route.router_id != old_router_id {
-                        // Whenever it changes the selected router-id for a given destination,
-                        // a node MUST send an update as an urgent TLV (RFC 8966 §3.7.2).
-                        update_urgent = Some(true);
-                    }
+                    trigger_update = route.router_id != entry.advert.unwrap().router_id;
                 }
-                RouteState::Held(key) => {
-                    self.timers.remove(&key);
-                    // The prefix is reachable again after a retraction. A node MAY send a
-                    // triggered update when the metric for a given prefix changes in a
-                    // significant manner (RFC 8966 §3.7.2), so tell neighbours now rather
-                    // than at the next periodic update.
-                    update_urgent = Some(false);
+                // The prefix is newly reachable after a retraction.
+                RouteState::Held(timer_key) => {
+                    self.timers.remove(&timer_key);
+                    trigger_update = true;
                 }
-                RouteState::Removed => {
-                    // The prefix is newly reachable, so likewise announce it now.
-                    update_urgent = Some(false);
-                }
+                // The prefix is newly reachable.
+                RouteState::None => trigger_update = true,
             }
 
-            if table.state != RouteState::Selected(key) {
+            // A route is selected for a prefix that had none, so this node no longer
+            // needs a new seqno, and stops resending any request that it originated for
+            // the lost route (RFC 8966 §3.8.2.1). The request is kept as long as if its
+            // last send had been its last resend, to tell redundant requests and to
+            // forward a reply (§3.8.1.2). Its timer was set at that send.
+            if !matches!(entry.state, RouteState::Selected(_))
+                && let Some(request) = self.seqno_request_table.get_mut(&prefix)
+            {
+                let new_deadline = self.timers.deadline(&request.timer_key)
+                    + self.params.seqno_request_timeout(0)
+                    - self.params.seqno_request_timeout(request.resends_left);
+                request.resends_left = 0;
+                self.timers.reset_at(&request.timer_key, new_deadline);
+            }
+
+            if entry.state != RouteState::Selected(key) {
                 self.outputs.push_back(Output::RouteSelect(prefix, key));
             }
 
-            table.state = RouteState::Selected(key);
-            table.advert = Some(Advert {
+            entry.state = RouteState::Selected(key);
+
+            let advert = Advert {
                 router_id: route.router_id,
                 seqno: route.seqno,
                 metric: route.metric.get(),
-            });
-        } else if let RouteState::Selected(_) = table.state {
-            // When a route is retracted, a node SHOULD send a triggered update
-            // (RFC 8966 §3.7.2).
-            update_urgent = Some(false);
+            };
+
+            // The reply to a pending seqno request is forwarded as a triggered update.
+            // As this node only advertises its selected route, it forwards a reply by
+            // advertising the route that the reply updated, once that route is selected,
+            // so a triggered update goes out whenever the advertisement satisfies the
+            // pending request. A request that this node originated is treated the same,
+            // as it may have replaced a forwarded one.
+            //
+            // An update with a finite metric satisfies a request if the router-ids differ
+            // or the update's seqno is no less (§4.6.11).
+            if let Some(request) = self.seqno_request_table.get(&prefix)
+                && (request.router_id != advert.router_id || !advert.seqno.lt(request.seqno))
+            {
+                let request = self.seqno_request_table.remove(&prefix).unwrap();
+                self.timers.remove(&request.timer_key);
+                trigger_update = true;
+            }
+
+            entry.advert = Some(advert);
+        } else if let RouteState::Selected(_) = entry.state {
+            // The prefix is retracted and no longer reachable.
+            trigger_update = true;
 
             self.outputs.push_back(Output::RouteHold(prefix));
 
-            table.state = RouteState::Held(self.timers.insert(
+            entry.state = RouteState::Held(self.timers.insert(
                 Timeout::RouteHold(prefix),
                 self.params.get_duration(DurationKey::RouteHoldTime),
             ));
-            table.advert.as_mut().unwrap().metric = METRIC_INFINITY;
+
+            let advert = entry.advert.as_mut().unwrap();
+            advert.metric = METRIC_INFINITY;
+            lost_router_id = Some(advert.router_id);
         }
 
-        // A removed prefix without routes has nothing left to keep its entry for.
-        let empty = table.state == RouteState::Removed && table.routes.is_empty();
+        let triggered_update =
+            trigger_update.then(|| (entry.state.selected(), entry.advert.unwrap()));
 
-        if let Some(urgent) = update_urgent {
-            // Split horizon (RFC 8966 §3.7.4).
-            let not_to = table.state.selected();
-            let advert = table.advert.unwrap();
-            self.send_update(None, not_to, urgent, prefix, advert);
+        if entry.is_empty() {
+            // Nothing is left to keep the entry for.
+            self.route_table.prefix_entries.remove(&prefix);
         }
 
-        if empty {
-            self.route_table.by_prefix.remove(&prefix);
+        if let Some((not_to, advert)) = triggered_update {
+            self.send_update(None, not_to, true, prefix, advert);
+        }
+
+        // A node that has lost all feasible routes to a given destination but still has
+        // unexpired unfeasible routes to that destination MUST send a seqno request; if
+        // it doesn't have any such routes, it MAY still send a seqno request. The
+        // router-id of the request is set to the router-id of the route that it has just
+        // lost, and the requested seqno is the value contained in the source table plus 1
+        // (RFC 8966 §3.8.2.1). The lost route has been advertised, so the source table
+        // has an entry.
+        if let Some(router_id) = lost_router_id {
+            let key = SourceKey { prefix, router_id };
+            let seqno = self.source_table[&key].seqno + 1;
+            let resends_left = self.params.get_u8(U8Key::RequestMaxResends);
+
+            // It MUST be sent to at least one of the neighbours that advertised the
+            // unfeasible routes, and SHOULD be sent to all of them. Sending it to every
+            // neighbour does so.
+            self.record_seqno_request(key, seqno, resends_left);
+            self.send_seqno_request(None, key, seqno, None);
+        }
+
+        // Request a new seqno from the neighbour that advertised an unfeasible route
+        // that would be selected if it were feasible.
+        if let Some((neigh_key, router_id, seqno)) = unfeasible_wanted {
+            let source_key = SourceKey { prefix, router_id };
+            self.request_feasible_update(neigh_key, source_key, seqno);
         }
     }
 
+    /// Sends a full dump of the routes that this node advertises,
+    /// to every neighbour or to the given one.
+    fn dump_routes(&mut self, to: Option<NeighKey>) {
+        struct Update {
+            prefix: Ipv6Net,
+            router_id: RouterId,
+            seqno: Seqno,
+            metric: u16,
+            not_to: Option<NeighKey>,
+        }
+
+        let mut updates: Vec<_> = self
+            .route_table
+            .prefix_entries
+            .iter()
+            .filter_map(|(&prefix, entry)| {
+                self.advert_for_prefix(entry).map(|advert| Update {
+                    prefix,
+                    router_id: advert.router_id,
+                    seqno: advert.seqno,
+                    metric: advert.metric,
+                    not_to: entry.state.selected(),
+                })
+            })
+            .collect();
+
+        // By router-id, those with the router-id omitted first, then by prefix, whose
+        // derived order is by address, then by length.
+        updates.sort_unstable_by_key(|u| {
+            let omitted = u.router_id.get() == u.prefix.addr().to_bits() as u64;
+            (u.router_id, !omitted, u.prefix)
+        });
+
+        for u in updates {
+            let advert = Advert {
+                router_id: u.router_id,
+                seqno: u.seqno,
+                metric: u.metric,
+            };
+            self.send_update(to, u.not_to, false, u.prefix, advert);
+        }
+    }
+
+    /// Sends an update to the given neighbour or to every one, except `not_to` for split
+    /// horizon (RFC 8966 §3.7.4), as an urgent TLV if `urgent`, or else as usual.
     fn send_update(
         &mut self,
         to: Option<NeighKey>,
@@ -1173,72 +1639,14 @@ impl State {
             router_id: Some(advert.router_id),
         };
 
-        self.send(to, not_to, timeout, &PacketItem::Update(update));
-    }
-
-    /// Sends a full dump of the routes that this node advertises,
-    /// to every neighbour or to the given one.
-    fn dump_routes(&mut self, to: Option<NeighKey>) {
-        struct Update {
-            prefix: Ipv6Net,
-            router_id: RouterId,
-            seqno: Seqno,
-            metric: u16,
-            not_to: Option<NeighKey>,
-        }
-
-        let mut updates: Vec<_> = self
-            .route_table
-            .by_prefix
-            .iter()
-            .filter_map(|(&prefix, table)| {
-                self.advert_for_prefix(table).map(|advert| Update {
-                    prefix,
-                    router_id: advert.router_id,
-                    seqno: advert.seqno,
-                    metric: advert.metric,
-                    // Split horizon (RFC 8966 §3.7.4).
-                    not_to: table.state.selected(),
-                })
-            })
-            .collect();
-
-        // By router-id, those with the router-id omitted first, then by prefix, whose
-        // derived order is by address, then by length.
-        updates.sort_unstable_by_key(|u| {
-            let omitted = u.router_id.get() == u.prefix.addr().to_bits() as u64;
-            (u.router_id, !omitted, u.prefix)
-        });
-
-        for u in updates {
-            let advert = Advert {
-                router_id: u.router_id,
-                seqno: u.seqno,
-                metric: u.metric,
-            };
-            self.send_update(to, u.not_to, false, u.prefix, advert);
-        }
-    }
-
-    fn send(
-        &mut self,
-        to: Option<NeighKey>,
-        not_to: Option<NeighKey>,
-        timeout: Option<Duration>,
-        item: &PacketItem,
-    ) {
-        let mut send = |key, neigh: &mut NeighValue| {
+        let mut send = |key, neigh: &mut NeighEntry| {
             neigh.packet_buf.put(
                 key,
                 &mut self.outputs,
                 &mut self.timers,
                 &self.params,
-                |e| match item {
-                    PacketItem::Tlv(tlv) => e.put_tlv(tlv),
-                    PacketItem::Update(update) => e.put_update(update),
-                },
+                |e| e.put_update(&update),
             );
-
             if let Some(timeout) = timeout {
                 neigh.packet_buf.schedule_flush(&mut self.timers, timeout);
             }
@@ -1257,18 +1665,67 @@ impl State {
         }
     }
 
+    /// Puts what `f` encodes in the packet buffer of the given neighbour or of every one,
+    /// to be sent within `timeout` if any, or else as usual.
+    ///
+    /// `f` returns whether what it encodes fits in the buffer. If not, it must have
+    /// encoded nothing, and is called again once the buffer is flushed. So it must encode
+    /// several TLVs all at once or not at all, as [`PacketEncoder::put_tlvs`] does.
+    fn send(
+        &mut self,
+        to: Option<NeighKey>,
+        timeout: Option<Duration>,
+        f: impl Fn(&mut PacketEncoder) -> bool,
+    ) {
+        let mut send = |key, neigh: &mut NeighEntry| {
+            let buf = &mut neigh.packet_buf;
+            buf.put(key, &mut self.outputs, &mut self.timers, &self.params, &f);
+            if let Some(timeout) = timeout {
+                buf.schedule_flush(&mut self.timers, timeout);
+            }
+        };
+
+        if let Some(key) = to {
+            send(key, &mut self.neigh_table[key]);
+        } else {
+            for (key, neigh) in &mut self.neigh_table {
+                send(key, neigh);
+            }
+        }
+    }
+
+    /// Puts what `f` encodes in the packet buffer of the given neighbour or of every one,
+    /// as [`State::send`] does, and sends the buffer at once.
+    fn send_now(&mut self, to: Option<NeighKey>, f: impl Fn(&mut PacketEncoder) -> bool) {
+        let mut send = |key, neigh: &mut NeighEntry| {
+            let buf = &mut neigh.packet_buf;
+            buf.put(key, &mut self.outputs, &mut self.timers, &self.params, &f);
+            self.timers.remove(&buf.flush_timer_key.take().unwrap());
+            buf.flush(key, &mut self.outputs);
+        };
+
+        if let Some(key) = to {
+            send(key, &mut self.neigh_table[key]);
+        } else {
+            for (key, neigh) in &mut self.neigh_table {
+                send(key, neigh);
+            }
+        }
+    }
+
     /// Returns the router-id, seqno, and metric to advertise for the prefix,
-    /// or the local router-id and seqno and a zero metric for a local route,
-    /// or `None` for a removed route.
-    fn advert_for_prefix(&self, table: &PrefixRouteTable) -> Option<Advert> {
-        match table.state {
+    /// or the local router-id, seqno, and a zero metric for an injected route,
+    /// or the last advertised router-id, seqno, and an infinite metric for a held prefix,
+    /// or `None` when no route to the prefix is selected.
+    fn advert_for_prefix(&self, entry: &PrefixRouteEntry) -> Option<Advert> {
+        match entry.state {
             // A route injected by this node (RFC 8966 §3.7).
-            RouteState::Local => Some(Advert {
+            RouteState::Injected => Some(Advert {
                 router_id: self.router_id,
                 seqno: self.seqno,
                 metric: 0,
             }),
-            _ => table.advert,
+            _ => entry.advert,
         }
     }
 
@@ -1290,17 +1747,17 @@ impl State {
 
         match self.source_table.entry(key) {
             hash_map::Entry::Occupied(e) => {
-                let v = e.into_mut();
-                if v.seqno.lt(seqno) {
-                    v.seqno = seqno;
-                    v.metric = metric;
-                } else if v.seqno == seqno && v.metric > metric {
-                    v.metric = metric;
+                let source = e.into_mut();
+                if source.seqno.lt(seqno) {
+                    source.seqno = seqno;
+                    source.metric = metric;
+                } else if source.seqno == seqno && source.metric > metric {
+                    source.metric = metric;
                 }
-                self.timers.reset(&v.gc_timer_key, gc_time);
+                self.timers.reset(&source.gc_timer_key, gc_time);
             }
             hash_map::Entry::Vacant(e) => {
-                e.insert(SourceValue {
+                e.insert(SourceEntry {
                     seqno,
                     metric,
                     gc_timer_key: self.timers.insert(Timeout::SourceGc(key), gc_time),

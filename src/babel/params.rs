@@ -83,6 +83,17 @@ impl Params {
     pub fn get_tau(&self) -> u32 {
         self.tau
     }
+
+    /// Returns the timeout of a seqno request with `resends_left` resends left: how long
+    /// it waits before the next resend, or after the last one, how long it is kept. This
+    /// is the initial request timeout, doubled every time the request has been resent
+    /// (RFC 8966 Appendix B).
+    pub fn seqno_request_timeout(&self, resends_left: u8) -> Duration {
+        let resends = self.get_u8(U8Key::RequestMaxResends) - resends_left;
+        let factor = self.get_f64(F64Key::RequestBackoffFactor);
+        self.get_duration(DurationKey::InitialRequestTimeout)
+            .mul_f64(factor.powi(resends.into()))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
