@@ -3,10 +3,10 @@ pub mod tlv;
 #[cfg(test)]
 mod tests;
 
-use std::{array, num::NonZeroUsize};
+use std::{array, num::NonZeroUsize, time::Instant};
 
 use crate::babel::{
-    base::{Ae, Interval, METRIC_INFINITY, RouterId, Seqno, timestamp_now},
+    base::{Ae, Interval, METRIC_INFINITY, RouterId, Seqno, timestamp},
     packet::tlv::{StateModifier, Tlv, TlvDecodeError, UpdateFlags, mask_prefix, octets},
 };
 
@@ -57,6 +57,33 @@ pub enum PacketItem {
 pub enum PacketDecodeError {
     Stateless(TlvDecodeError),
     Stateful(Tlv),
+}
+
+/// An encoded packet, whose Hello's Transmit Timestamp, if any, is left to be filled in
+/// just before the packet is sent (RFC 9616 §3.2).
+#[derive(Clone, Debug)]
+pub struct Packet {
+    buf: Box<[u8]>,
+    /// The offset of the Transmit Timestamp, if any.
+    timestamp_offset: Option<NonZeroUsize>,
+}
+
+impl Packet {
+    /// Fills in the Transmit Timestamp, if any, with `at`, the time the packet is sent,
+    /// and returns the packet's octets.
+    pub fn timestamp(&mut self, at: Instant) -> &[u8] {
+        if let Some(offset) = self.timestamp_offset {
+            let i = offset.get();
+            self.buf[i..i + 4].copy_from_slice(&timestamp(at).to_be_bytes());
+        }
+        &self.buf
+    }
+
+    /// Returns the packet's octets, with the Transmit Timestamp, if any, left as it is.
+    #[cfg(test)]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.buf
+    }
 }
 
 pub struct PacketEncoder {
@@ -114,13 +141,12 @@ impl PacketEncoder {
     /// Router-Id and Update TLVs modify the parser state, which the encoder tracks
     /// for compression, so they must be put with [`put_update`] instead.
     ///
-    /// A Hello's Transmit Timestamp, if any, is a placeholder that is overwritten with
-    /// the current time when [`finalize`] is called. An IHU carrying timestamps MUST be
+    /// A Hello's Transmit Timestamp, if any, is a placeholder, to be filled in as the
+    /// packet is sent (see [`Packet::timestamp`]). An IHU carrying timestamps MUST be
     /// sent in a packet that also contains a timestamped Hello (RFC 9616 §3.2), so it
     /// must be put after one, either in an earlier call or earlier in `tlvs`.
     ///
     /// [`put_update`]: Self::put_update
-    /// [`finalize`]: Self::finalize
     #[must_use]
     pub fn put_tlvs(&mut self, tlvs: &[Tlv]) -> bool {
         let mut len = self.len;
@@ -314,17 +340,16 @@ impl PacketEncoder {
         true
     }
 
-    pub fn finalize(&mut self) -> &[u8] {
+    /// Finalizes the packet, leaving its Transmit Timestamp, if any, to be filled in as
+    /// it is sent (see [`Packet::timestamp`]).
+    pub fn finalize(&mut self) -> Packet {
         let body_len = self.len as u16 - 4;
         self.buf[2..4].copy_from_slice(&body_len.to_be_bytes());
 
-        if let Some(timestamp_offset) = self.timestamp_offset {
-            let i = timestamp_offset.get();
-            let t = timestamp_now();
-            self.buf[i..i + 4].copy_from_slice(&t.to_be_bytes());
+        Packet {
+            buf: self.buf[..self.len].into(),
+            timestamp_offset: self.timestamp_offset,
         }
-
-        &self.buf[..self.len]
     }
 
     pub fn clear(&mut self) {

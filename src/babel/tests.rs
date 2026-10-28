@@ -1,7 +1,6 @@
-use std::{array::from_ref, collections::BTreeMap, future::poll_fn, pin::Pin, task::Poll};
+use std::{array::from_ref, collections::BTreeMap};
 
 use rand::{RngExt, SeedableRng, rngs::StdRng};
-use tokio::time::{Sleep, sleep_until, timeout_at};
 
 use super::*;
 
@@ -15,9 +14,14 @@ fn prefix(s: &str) -> Ipv6Net {
     s.parse().unwrap()
 }
 
-/// Creates a new state for node `i`.
-fn state(i: usize) -> State {
-    State::new(Params::new(), RouterId::new((i + 1) as u64).unwrap(), None)
+/// Creates a new state for node `i`, starting at `now`.
+fn state(i: usize, now: Instant) -> State {
+    State::new(
+        now,
+        Params::new(),
+        RouterId::new((i + 1) as u64).unwrap(),
+        None,
+    )
 }
 
 /// A packet sent by a node, whether or not it was delivered.
@@ -44,18 +48,21 @@ struct FibChange {
 }
 
 enum Event {
-    Timeout(usize, Timeout),
+    Timeout(usize),
     Arrival(usize, usize, Box<[u8]>),
 }
 
 /// Returns what arrives of a packet sent from one node to another, if anything.
-type Filter = fn(usize, usize, Box<[u8]>) -> Option<Box<[u8]>>;
+type Filter = fn(usize, usize, Packet) -> Option<Packet>;
 
-/// Nodes connected by point-to-point links, driven by a paused clock.
+/// Nodes connected by point-to-point links, driven by a clock of their own, which jumps from
+/// each event to the next.
 ///
 /// Whenever a forwarding table changes, they are all checked to be free of loops.
 /// After every event, the node's route table is checked to keep no empty entries.
 struct Net {
+    /// The current time, which only moves forward.
+    now: Instant,
     nodes: Vec<State>,
     /// Whether each node is stopped: its timers do not fire, and it loses the packets that
     /// reach it.
@@ -76,8 +83,6 @@ struct Net {
     transmitted: u64,
     /// When the last packet sent over each link arrives, or arrived.
     last_arrivals: HashMap<(usize, usize), Instant>,
-    /// A timer for the next arrival, once a packet has been in flight.
-    arrival_timer: Option<Pin<Box<Sleep>>>,
     sent: Vec<Sent>,
     /// The prefixes each node originates.
     locals: Vec<Vec<Ipv6Net>>,
@@ -87,17 +92,19 @@ struct Net {
 
 impl Net {
     fn new(n: usize) -> Self {
+        // The clock starts at the real time, from which only the simulation moves it.
+        let now = Instant::now();
         Self {
-            nodes: (0..n).map(state).collect(),
+            now,
+            nodes: (0..n).map(|i| state(i, now)).collect(),
             stopped: vec![false; n],
             key_maps: (0..n).map(|_| NeighKeyMap::new()).collect(),
             links: HashMap::new(),
             jitter: Duration::ZERO,
-            filter: |_, _, buf| Some(buf),
+            filter: |_, _, packet| Some(packet),
             in_flight: BTreeMap::new(),
             transmitted: 0,
             last_arrivals: HashMap::new(),
-            arrival_timer: None,
             sent: Vec::new(),
             locals: vec![Vec::new(); n],
             fibs: vec![HashMap::new(); n],
@@ -108,7 +115,7 @@ impl Net {
     /// Adds node `j` as a neighbour of node `i`, which may be outside the simulation, and
     /// sends the wildcard retraction that node `i` outputs for it.
     fn add_neighbour(&mut self, i: usize, j: usize) {
-        let key = self.nodes[i].add_neighbour();
+        let key = self.nodes[i].add_neighbour(self.now);
         self.key_maps[i].insert(j, key);
         self.process_outputs(i);
     }
@@ -123,9 +130,9 @@ impl Net {
     /// Restarts node `i` as `state`, which has no neighbours yet. The node is stopped for a
     /// second first, longer than any link's latency here, so that the packets it sent before
     /// arrive before any that it sends after, as a real restart takes longer too.
-    async fn restart(&mut self, i: usize, state: State) {
+    fn restart(&mut self, i: usize, state: State) {
         self.stopped[i] = true;
-        self.run_for(Duration::from_secs(1)).await;
+        self.run_for(Duration::from_secs(1));
         self.stopped[i] = false;
         self.nodes[i] = state;
         self.key_maps[i] = NeighKeyMap::new();
@@ -136,9 +143,9 @@ impl Net {
     /// good, as its process exits. A new state, never to run, takes the place of the old one.
     fn shutdown(&mut self, i: usize) {
         self.stopped[i] = true;
-        let node = mem::replace(&mut self.nodes[i], state(i));
+        let node = mem::replace(&mut self.nodes[i], state(i, self.now));
         let mut fib_changed = false;
-        for output in node.shutdown() {
+        for output in node.shutdown(self.now) {
             fib_changed |= self.process_output(i, output);
         }
         if fib_changed {
@@ -163,47 +170,50 @@ impl Net {
     }
 
     /// Runs the network for `duration`, handling every event in order.
-    async fn run_for(&mut self, duration: Duration) {
-        let deadline = Instant::now() + duration;
-        while let Ok(event) = timeout_at(deadline, self.next_event()).await {
+    fn run_for(&mut self, duration: Duration) {
+        let deadline = self.now + duration;
+        while let Some(event) = self.next_event(deadline) {
             self.handle(event);
         }
     }
 
-    async fn next_event(&mut self) -> Event {
-        poll_fn(|cx| {
-            let nodes = self.nodes.iter_mut().zip(&self.stopped).enumerate();
-            for (i, (node, &stopped)) in nodes {
-                if !stopped && let Poll::Ready(Some(timeout)) = node.poll_timeout(cx) {
-                    return Poll::Ready(Event::Timeout(i, timeout));
-                }
-            }
-            if let Some((&(arrival, _), _)) = self.in_flight.first_key_value() {
-                let timer = self
-                    .arrival_timer
-                    .get_or_insert_with(|| Box::pin(sleep_until(arrival)));
-                if timer.deadline() != arrival {
-                    timer.as_mut().reset(arrival);
-                }
-                if timer.as_mut().poll(cx).is_ready() {
-                    return Poll::Ready(self.in_flight.pop_first().unwrap().1);
-                }
-            }
-            Poll::Pending
+    /// Advances the clock to the next event, the earliest of the running nodes' timeouts and
+    /// the packet arrivals, and returns it, or to `deadline` if that comes first. Timeouts come
+    /// before arrivals at the same time, and lower nodes before higher ones. A timeout of a
+    /// node that was stopped may be past, and is then handled at once.
+    fn next_event(&mut self, deadline: Instant) -> Option<Event> {
+        let nodes = self.nodes.iter_mut().zip(&self.stopped).enumerate();
+        let timeout = nodes
+            .filter(|(_, (_, stopped))| !**stopped)
+            .filter_map(|(i, (node, _))| Some((node.poll_timeout()?, i)))
+            .min();
+        let arrival = self.in_flight.first_key_value().map(|(&(t, _), _)| t);
+
+        let time = [timeout.map(|(t, _)| t), arrival]
+            .into_iter()
+            .flatten()
+            .min();
+        let Some(time) = time.filter(|&t| t <= deadline) else {
+            self.now = deadline;
+            return None;
+        };
+        self.now = self.now.max(time);
+        Some(match timeout {
+            Some((t, i)) if t == time => Event::Timeout(i),
+            _ => self.in_flight.pop_first().unwrap().1,
         })
-        .await
     }
 
     fn handle(&mut self, event: Event) {
         let i = match event {
-            Event::Timeout(i, timeout) => {
-                self.nodes[i].handle_timeout(timeout);
+            Event::Timeout(i) => {
+                self.nodes[i].handle_timeout(self.now);
                 i
             }
             Event::Arrival(_, to, _) if self.stopped[to] => return,
             Event::Arrival(from, to, buf) => {
                 let key = self.key(to, from);
-                self.nodes[to].handle_packet(key, &buf);
+                self.nodes[to].handle_packet(self.now, self.now, key, &buf);
                 to
             }
         };
@@ -213,7 +223,7 @@ impl Net {
     /// Hands a packet to node `to` as if it came from node `from`.
     fn inject(&mut self, from: usize, to: usize, buf: &[u8]) {
         let key = self.key(to, from);
-        self.nodes[to].handle_packet(key, buf);
+        self.nodes[to].handle_packet(self.now, self.now, key, buf);
         self.process_outputs(to);
     }
 
@@ -243,8 +253,8 @@ impl Net {
     /// output to its forwarding table, returning whether the table changed.
     fn process_output(&mut self, from: usize, output: Output) -> bool {
         let (prefix, entry) = match output {
-            Output::Packet(dst, buf) => {
-                self.transmit(from, self.index(from, dst), buf);
+            Output::Packet(dst, packet) => {
+                self.transmit(from, self.index(from, dst), packet);
                 return false;
             }
             Output::RouteSelect(prefix, neigh) => (prefix, Some(Fib::Via(self.index(from, neigh)))),
@@ -268,7 +278,7 @@ impl Net {
         };
 
         self.fib_changes.push(FibChange {
-            time: Instant::now(),
+            time: self.now,
             node: from,
             prefix,
             entry,
@@ -276,11 +286,12 @@ impl Net {
         true
     }
 
-    fn transmit(&mut self, from: usize, to: usize, buf: Box<[u8]>) {
+    /// Sends a packet over a link, if it is up, timestamping it as it is sent.
+    fn transmit(&mut self, from: usize, to: usize, mut packet: Packet) {
         if let Some(&latency) = self.links.get(&(from, to))
-            && let Some(buf) = (self.filter)(from, to, buf.clone())
+            && let Some(mut packet) = (self.filter)(from, to, packet.clone())
         {
-            let mut arrival = Instant::now() + latency;
+            let mut arrival = self.now + latency;
             if self.jitter.is_zero() {
                 // Not before the previous packet, should the latency have dropped since.
                 let last = self.last_arrivals.entry((from, to)).or_insert(arrival);
@@ -290,14 +301,15 @@ impl Net {
                 arrival += self.jitter.mul_f64(rand::random());
             }
             let key = (arrival, self.transmitted);
+            let buf = packet.timestamp(self.now).into();
             self.in_flight.insert(key, Event::Arrival(from, to, buf));
             self.transmitted += 1;
         }
         self.sent.push(Sent {
-            time: Instant::now(),
+            time: self.now,
             from,
             to,
-            buf,
+            buf: packet.timestamp(self.now).into(),
         });
     }
 
@@ -428,9 +440,10 @@ fn is_for(update: &Update, prefix: Ipv6Net) -> bool {
 }
 
 /// Re-encodes a packet without its retractions.
-fn without_retractions(buf: Box<[u8]>) -> Box<[u8]> {
+fn without_retractions(packet: Packet) -> Packet {
+    let buf = packet.as_bytes();
     let mut encoder = PacketEncoder::new(buf.len() + 512);
-    for item in PacketDecoder::new(&buf).unwrap() {
+    for item in PacketDecoder::new(buf).unwrap() {
         match item.unwrap() {
             PacketItem::Update(update) if update.metric == METRIC_INFINITY => {}
             PacketItem::Update(update) => assert!(encoder.put_update(&update)),
@@ -439,7 +452,7 @@ fn without_retractions(buf: Box<[u8]>) -> Box<[u8]> {
             PacketItem::Tlv(tlv) => assert!(encoder.put_tlv(&tlv)),
         }
     }
-    encoder.finalize().into()
+    encoder.finalize()
 }
 
 /// A neighbour outside the simulation, whose packets a test scripts.
@@ -483,7 +496,7 @@ impl Scripted {
             assert!(encoder.put_tlv(&ihu(rxcost)));
         }
         self.hello_seqno += 1;
-        encoder.finalize().to_vec()
+        encoder.finalize().as_bytes().to_vec()
     }
 }
 
@@ -537,17 +550,17 @@ fn link_cost() {
     }
 }
 
-#[tokio::test(start_paused = true)]
-async fn neighbours_acquire_each_other() {
+#[test]
+fn neighbours_acquire_each_other() {
     let mut net = Net::new(2);
     net.connect(0, 1, Duration::from_millis(30));
-    net.run_for(Duration::from_secs(20)).await;
+    net.run_for(Duration::from_secs(20));
 
     // An RTT of 60 ms adds 150 × (60 − 10) / (120 − 10) ≈ 68 to the link cost
     // (RFC 9616 §4.2), but not to the rxcost sent to the neighbour. The link
     // then stays up at that cost.
     for _ in 0..60 {
-        net.run_for(Duration::from_secs(1)).await;
+        net.run_for(Duration::from_secs(1));
         for (i, j) in [(0, 1), (1, 0)] {
             assert_eq!(net.neigh(i, j).rtt.map(f64::round), Some(60_000.0));
             assert_eq!(net.costs(i, j), (NOMINAL_COST, NOMINAL_COST, 164));
@@ -555,13 +568,13 @@ async fn neighbours_acquire_each_other() {
     }
 }
 
-#[tokio::test(start_paused = true)]
-async fn hellos_and_ihus_follow_the_rfcs() {
+#[test]
+fn hellos_and_ihus_follow_the_rfcs() {
     const LATENCY: Duration = Duration::from_millis(30);
 
     let mut net = Net::new(2);
     net.connect(0, 1, LATENCY);
-    net.run_for(Duration::from_secs(60)).await;
+    net.run_for(Duration::from_secs(60));
 
     /// Returns the seqno, interval and transmit timestamp of the Hellos among TLVs.
     fn hellos(tlvs: &[Tlv]) -> Vec<(Seqno, Option<Interval>, Option<u32>)> {
@@ -588,8 +601,8 @@ async fn hellos_and_ihus_follow_the_rfcs() {
         .collect();
     let (_, first_arrival) = neighbour_hellos[0];
 
-    // The send time, seqno and transmit timestamp of node 0's Hellos.
-    let mut sent_hellos: Vec<(Instant, Seqno, u32)> = Vec::new();
+    // The seqnos of node 0's Hellos.
+    let mut sent_hellos: Vec<Seqno> = Vec::new();
     let mut sent_ihus = 0;
 
     for sent in net.sent.iter().filter(|sent| sent.from == 0) {
@@ -600,18 +613,15 @@ async fn hellos_and_ihus_follow_the_rfcs() {
         let hellos = hellos(&tlvs);
         assert!(hellos.len() <= 1, "packet should carry at most one Hello");
 
-        if let Some(&(seqno, interval, timestamp)) = hellos.first() {
+        if let Some(&(seqno, interval, transmit_timestamp)) = hellos.first() {
             assert_eq!(interval, Interval::new(400));
-            let timestamp = timestamp.expect("Hello should be timestamped");
+            let transmit_timestamp = transmit_timestamp.expect("Hello should be timestamped");
+            assert_eq!(transmit_timestamp, timestamp(sent.time));
 
-            if let Some(&(first_time, first_seqno, first_timestamp)) = sent_hellos.first() {
+            if let Some(&first_seqno) = sent_hellos.first() {
                 assert_eq!(seqno, first_seqno + sent_hellos.len() as u16);
-                assert_eq!(
-                    timestamp.wrapping_sub(first_timestamp),
-                    (sent.time - first_time).as_micros() as u32
-                );
             }
-            sent_hellos.push((sent.time, seqno, timestamp));
+            sent_hellos.push(seqno);
         }
 
         for tlv in &tlvs {
@@ -652,35 +662,35 @@ async fn hellos_and_ihus_follow_the_rfcs() {
     assert!(sent_hellos.len() >= 14 && sent_ihus >= 4);
 }
 
-#[tokio::test(start_paused = true)]
-async fn one_way_loss_makes_link_unusable() {
+#[test]
+fn one_way_loss_makes_link_unusable() {
     let mut net = Net::new(2);
     net.connect(0, 1, Duration::ZERO);
-    net.run_for(Duration::from_secs(31)).await;
+    net.run_for(Duration::from_secs(31));
 
     // Node 0 stops hearing node 1. Two missed Hellos make its rxcost infinite,
     // which its next IHU tells node 1, and the IHU hold time makes its txcost
     // infinite.
     let latency = net.links.remove(&(1, 0)).unwrap();
-    net.run_for(Duration::from_secs(45)).await;
+    net.run_for(Duration::from_secs(45));
     assert_eq!(net.costs(0, 1), (INF, INF, INF));
     assert_eq!(net.costs(1, 0), (NOMINAL_COST, INF, INF));
 
     net.links.insert((1, 0), latency);
-    net.run_for(Duration::from_secs(30)).await;
+    net.run_for(Duration::from_secs(30));
     assert_eq!(net.costs(0, 1), UP);
     assert_eq!(net.costs(1, 0), UP);
 }
 
-#[tokio::test(start_paused = true)]
-async fn silent_neighbour_is_flushed_and_reacquired() {
+#[test]
+fn silent_neighbour_is_flushed_and_reacquired() {
     let mut net = Net::new(2);
     net.connect(0, 1, Duration::ZERO);
-    net.run_for(Duration::from_secs(31)).await;
+    net.run_for(Duration::from_secs(31));
 
     // 16 missed Hellos empty the history, which flushes the neighbour entry.
     let links = std::mem::take(&mut net.links);
-    net.run_for(Duration::from_secs(80)).await;
+    net.run_for(Duration::from_secs(80));
     for (i, j) in [(0, 1), (1, 0)] {
         let neigh = net.neigh(i, j);
         assert_eq!(neigh.hello_history.bits(), 0);
@@ -689,30 +699,30 @@ async fn silent_neighbour_is_flushed_and_reacquired() {
     }
 
     net.links = links;
-    net.run_for(Duration::from_secs(30)).await;
+    net.run_for(Duration::from_secs(30));
     assert_eq!(net.costs(0, 1), UP);
     assert_eq!(net.costs(1, 0), UP);
 }
 
-#[tokio::test(start_paused = true)]
-async fn rebooted_neighbour_is_reacquired() {
+#[test]
+fn rebooted_neighbour_is_reacquired() {
     let mut net = Net::new(2);
     net.connect(0, 1, Duration::ZERO);
-    net.run_for(Duration::from_secs(31)).await;
+    net.run_for(Duration::from_secs(31));
 
     // Node 1 reboots, and its Hello seqno jumps.
-    let mut node = state(1);
+    let mut node = state(1, net.now);
     node.hello_seqno = net.nodes[1].hello_seqno + 1000;
-    net.restart(1, node).await;
+    net.restart(1, node);
     net.add_neighbour(1, 0);
 
     // Its first Hello flushes node 0's entry for it, restarting the history.
-    net.run_for(Duration::from_secs(3)).await;
+    net.run_for(Duration::from_secs(3));
     let neigh = net.neigh(0, 1);
     assert_eq!(neigh.hello_history.bits(), 0b1);
     assert_eq!((neigh.txcost, neigh.rtt), (INF, None));
 
-    net.run_for(Duration::from_secs(30)).await;
+    net.run_for(Duration::from_secs(30));
     assert_eq!(net.costs(0, 1), UP);
     assert_eq!(net.costs(1, 0), UP);
 }
@@ -728,21 +738,21 @@ fn ihu(rxcost: u16) -> Tlv {
     }
 }
 
-#[tokio::test(start_paused = true)]
-async fn rebooted_neighbour_routes_wait_for_the_link() {
+#[test]
+fn rebooted_neighbour_routes_wait_for_the_link() {
     let p = prefix("fd00:1::/64");
 
     let mut net = Net::new(2);
     net.connect(0, 1, Duration::ZERO);
-    net.run_for(Duration::from_secs(31)).await;
+    net.run_for(Duration::from_secs(31));
 
     // Node 1 reboots, its Hello seqno jumps, and it originates P. It sends node 0 a wildcard
-    // retraction at once (see `State::add_neigh`), then a packet with an update for P and a
+    // retraction at once (see `State::add_neighbour`), then a packet with an update for P and a
     // Hello, which flushes node 0's entry for it, but keeps the route to P that the packet
     // refreshed.
-    let mut node = state(1);
+    let mut node = state(1, net.now);
     node.hello_seqno = net.nodes[1].hello_seqno + 1000;
-    net.restart(1, node).await;
+    net.restart(1, node);
     net.add_neighbour(1, 0);
     net.originate(1, p);
     let changes = net.fib_changes.len();
@@ -750,7 +760,7 @@ async fn rebooted_neighbour_routes_wait_for_the_link() {
     // Routes are selected once the whole packet has been handled, when the link cost is
     // infinite. It stays so until node 0 has received enough Hellos and an IHU, so node 0
     // selects the route only then, and never briefly before.
-    net.run_for(Duration::from_secs(30)).await;
+    net.run_for(Duration::from_secs(30));
     let entries: Vec<_> = net.fib_changes[changes..]
         .iter()
         .filter(|change| (change.node, change.prefix) == (0, p))
@@ -759,26 +769,26 @@ async fn rebooted_neighbour_routes_wait_for_the_link() {
     assert_eq!(entries, [Some(Fib::Via(1))]);
 }
 
-#[tokio::test(start_paused = true)]
-async fn rebooted_neighbour_old_routes_are_held_at_its_first_packet() {
+#[test]
+fn rebooted_neighbour_old_routes_are_held_at_its_first_packet() {
     let p = prefix("fd00:1::/64");
 
     let mut net = Net::new(2);
     net.connect(0, 1, Duration::ZERO);
     net.originate(1, p);
-    net.run_for(Duration::from_secs(31)).await;
+    net.run_for(Duration::from_secs(31));
     assert_eq!(net.fib(0, p), Some(Fib::Via(1)));
 
     // Node 1 reboots without P, and its Hello seqno jumps.
-    let mut node = state(1);
+    let mut node = state(1, net.now);
     node.hello_seqno = net.nodes[1].hello_seqno + 1000;
-    net.restart(1, node).await;
+    net.restart(1, node);
     net.add_neighbour(1, 0);
     net.locals[1].clear();
 
-    // It sends node 0 a wildcard retraction at once (see `State::add_neigh`), which removes
+    // It sends node 0 a wildcard retraction at once (see `State::add_neighbour`), which removes
     // node 0's route to P through it, learnt before the reboot, so P is held at once.
-    net.run_for(Duration::from_millis(1)).await;
+    net.run_for(Duration::from_millis(1));
     assert_eq!(net.fib(0, p), Some(Fib::Unreachable));
     assert!(
         net.nodes[0].route_table.prefix_entries[&p]
@@ -788,26 +798,26 @@ async fn rebooted_neighbour_old_routes_are_held_at_its_first_packet() {
 
     // Its first Hello, flushed within 2 s, flushes node 0's entry for it, so the link cost
     // becomes infinite.
-    net.run_for(Duration::from_secs(3)).await;
+    net.run_for(Duration::from_secs(3));
     assert_eq!(net.costs(0, 1).2, INF);
 }
 
-#[tokio::test(start_paused = true)]
-async fn added_neighbours_are_sent_a_wildcard_retraction_alone_at_once() {
+#[test]
+fn added_neighbours_are_sent_a_wildcard_retraction_alone_at_once() {
     // Node 0 has been running for a while, and has learnt a route from neighbour 9, when it
     // adds neighbour 8. The retraction for neighbour 8 goes in a packet of its own, at once,
-    // rather than with the next packet, up to 1.25 s later (see `State::add_neigh`).
+    // rather than with the next packet, up to 1.25 s later (see `State::add_neighbour`).
     let p = prefix("fd00:9::/64");
     let mut net = Net::new(1);
     net.add_neighbour(0, 9);
     let mut n9 = Scripted::new(9);
     for _ in 0..4 {
         n9.send(&mut net, 0, &[update(p, 42, 1, 100, 0x8000)]);
-        net.run_for(Duration::from_secs(4)).await;
+        net.run_for(Duration::from_secs(4));
     }
     assert_eq!(net.fib(0, p), Some(Fib::Via(9)));
 
-    let start = Instant::now();
+    let start = net.now;
     net.add_neighbour(0, 8);
     let sent: Vec<_> = (net.sent.iter())
         .filter(|sent| sent.from == 0 && sent.time >= start)
@@ -827,8 +837,8 @@ async fn added_neighbours_are_sent_a_wildcard_retraction_alone_at_once() {
     );
 }
 
-#[tokio::test(start_paused = true)]
-async fn shutdown_says_goodbye_and_removes_routes() {
+#[test]
+fn shutdown_says_goodbye_and_removes_routes() {
     let p = prefix("fd00:9::/64");
     let q = prefix("fd00:a::/64");
 
@@ -838,7 +848,7 @@ async fn shutdown_says_goodbye_and_removes_routes() {
     net.add_neighbour(0, 9);
     let (mut n8, mut n9) = (Scripted::new(8), Scripted::new(9));
     let updates9 = [update(p, 42, 1, 100, 0x8000), update(q, 42, 1, 100, 0x8000)];
-    exchange(&mut net, &mut n8, &mut n9, 20, &[], &updates9).await;
+    exchange(&mut net, &mut n8, &mut n9, 20, &[], &updates9);
     n9.send(&mut net, 0, &[update(q, 42, 1, METRIC_INFINITY, 0x8000)]);
     assert_eq!(net.fib(0, p), Some(Fib::Via(9)));
     assert_eq!(net.fib(0, q), Some(Fib::Unreachable));
@@ -880,8 +890,8 @@ async fn shutdown_says_goodbye_and_removes_routes() {
     assert!(net.fibs[0].is_empty());
 }
 
-#[tokio::test(start_paused = true)]
-async fn neighbours_of_a_node_shut_down_switch_at_once_and_flush_it_soon() {
+#[test]
+fn neighbours_of_a_node_shut_down_switch_at_once_and_flush_it_soon() {
     let p = prefix("fd00:2::/64");
 
     // Node 2 originates P, which node 0 reaches through node 1, rather than over its own
@@ -891,32 +901,32 @@ async fn neighbours_of_a_node_shut_down_switch_at_once_and_flush_it_soon() {
         net.connect(a, b, Duration::from_millis(ms));
     }
     net.originate(2, p);
-    net.run_for(Duration::from_secs(200)).await;
+    net.run_for(Duration::from_secs(200));
     assert_eq!(net.path(0, p.addr()), [0, 1, 2]);
 
     // Node 1 shuts down. Its wildcard retraction reaches node 0 10 ms later, and node 0
     // switches to its route through node 2 at once, while the link is still up, rather than
     // once the link fails.
     net.shutdown(1);
-    net.run_for(Duration::from_millis(20)).await;
+    net.run_for(Duration::from_millis(20));
     assert_eq!(net.fib(0, p), Some(Fib::Via(2)));
     assert_ne!(net.costs(0, 1).2, INF);
 
     // With node 1's Hello interval of 0.1 s, node 0 counts a Hello as missed 0.15 s after
     // it, and every 0.1 s after that. The link fails at the second, and node 0 flushes its
     // entry for node 1 at the 16th, once the history is empty, 1.66 s after the shutdown.
-    net.run_for(Duration::from_millis(280)).await;
+    net.run_for(Duration::from_millis(280));
     assert_eq!(net.costs(0, 1).2, INF);
-    net.run_for(Duration::from_millis(1300)).await;
+    net.run_for(Duration::from_millis(1300));
     assert_ne!(net.neigh(0, 1).hello_history.bits(), 0);
-    net.run_for(Duration::from_millis(100)).await;
+    net.run_for(Duration::from_millis(100));
     let neigh = net.neigh(0, 1);
     assert_eq!(neigh.hello_history.bits(), 0);
     assert_eq!((neigh.txcost, neigh.rtt), (INF, None));
 }
 
-#[tokio::test(start_paused = true)]
-async fn unnoticed_restarts_cause_no_loops() {
+#[test]
+fn unnoticed_restarts_cause_no_loops() {
     let p = prefix("fd00::/64");
 
     for secs in 160..180 {
@@ -930,7 +940,7 @@ async fn unnoticed_restarts_cause_no_loops() {
             net.connect(a, b, Duration::from_millis(ms));
         }
         net.originate(0, p);
-        net.run_for(Duration::from_secs(secs)).await;
+        net.run_for(Duration::from_secs(secs));
         assert_eq!(net.path(3, p.addr()), [3, 2, 1, 0]);
 
         // Node 1 restarts, with its Hello seqno where it was, so that its neighbours do not
@@ -938,21 +948,21 @@ async fn unnoticed_restarts_cause_no_loops() {
         // restart, and could form loops with the routes that it learns, as it has lost its
         // feasibility distances: it could learn P from node 3 before node 0, and node 3 then
         // switch to its old route through node 1. But node 1 sends each neighbour a wildcard
-        // retraction (see `State::add_neigh`), which removes them. The harness checks that no
-        // forwarding loop forms meanwhile.
-        let mut node = state(1);
+        // retraction (see `State::add_neighbour`), which removes them. The harness checks that
+        // no forwarding loop forms meanwhile.
+        let mut node = state(1, net.now);
         node.hello_seqno = net.nodes[1].hello_seqno;
-        net.restart(1, node).await;
+        net.restart(1, node);
         for j in [0, 2, 3] {
             net.add_neighbour(1, j);
         }
-        net.run_for(Duration::from_secs(60)).await;
+        net.run_for(Duration::from_secs(60));
         assert_eq!(net.delivered_to(3, p.addr()), Some(0));
     }
 }
 
-#[tokio::test(start_paused = true)]
-async fn restarted_neighbours_routes_are_removed_unless_refreshed() {
+#[test]
+fn restarted_neighbours_routes_are_removed_unless_refreshed() {
     let p = prefix("fd00:9::/64");
     let q = prefix("fd00:a::/64");
 
@@ -963,7 +973,7 @@ async fn restarted_neighbours_routes_are_removed_unless_refreshed() {
     let updates = [update(p, 42, 1, 100, 0x8000), update(q, 42, 1, 100, 0x8000)];
     n9.send(&mut net, 0, &updates);
     for _ in 0..4 {
-        net.run_for(Duration::from_secs(4)).await;
+        net.run_for(Duration::from_secs(4));
         n9.send(&mut net, 0, &[]);
     }
     assert_eq!(net.fib(0, p), Some(Fib::Via(9)));
@@ -984,22 +994,22 @@ async fn restarted_neighbours_routes_are_removed_unless_refreshed() {
 }
 
 /// Sets up node 0 with neighbour 8 up, outside the simulation, and no routes.
-async fn neighbour_8_up() -> Net {
+fn neighbour_8_up() -> Net {
     let mut net = Net::new(1);
     net.add_neighbour(0, 8);
     let mut n8 = Scripted::new(8);
     for _ in 0..4 {
         n8.send(&mut net, 0, &[]);
-        net.run_for(Duration::from_secs(4)).await;
+        net.run_for(Duration::from_secs(4));
     }
     assert_eq!(net.costs(0, 8), UP);
     net
 }
 
-#[tokio::test(start_paused = true)]
-async fn ihu_applies_to_updates_in_the_same_packet() {
+#[test]
+fn ihu_applies_to_updates_in_the_same_packet() {
     let p = prefix("fd00:8::/64");
-    let mut net = neighbour_8_up().await;
+    let mut net = neighbour_8_up();
 
     // Neighbour 8 sends an update for P, followed by an IHU with an infinite rxcost, as
     // it has stopped hearing node 0. The link cost is then infinite, so node 0 does not
@@ -1007,33 +1017,33 @@ async fn ihu_applies_to_updates_in_the_same_packet() {
     let mut encoder = PacketEncoder::new(1400);
     assert!(encoder.put_update(&update(p, 8, 1, 100, 400)));
     assert!(encoder.put_tlv(&ihu(INF)));
-    net.inject(8, 0, encoder.finalize());
+    net.inject(8, 0, encoder.finalize().as_bytes());
     assert_eq!(net.costs(0, 8), (NOMINAL_COST, INF, INF));
     assert!(net.fib_changes.iter().all(|change| change.prefix != p));
 }
 
-#[tokio::test(start_paused = true)]
-async fn announcing_and_retracting_a_prefix_in_one_packet_selects_nothing() {
+#[test]
+fn announcing_and_retracting_a_prefix_in_one_packet_selects_nothing() {
     let p = prefix("fd00:8::/64");
-    let mut net = neighbour_8_up().await;
+    let mut net = neighbour_8_up();
 
     // Neighbour 8 announces P and retracts it in the same packet. Selection then runs for
     // P twice, and the first run removes its entry, which has no routes left.
     let mut encoder = PacketEncoder::new(1400);
     assert!(encoder.put_update(&update(p, 8, 1, 100, 400)));
     assert!(encoder.put_update(&update(p, 8, 1, METRIC_INFINITY, 400)));
-    net.inject(8, 0, encoder.finalize());
+    net.inject(8, 0, encoder.finalize().as_bytes());
     assert!(net.fib_changes.iter().all(|change| change.prefix != p));
     assert!(!net.nodes[0].route_table.prefix_entries.contains_key(&p));
 }
 
-#[tokio::test(start_paused = true)]
-async fn wildcard_retractions_remove_routes_added_between_them() {
+#[test]
+fn wildcard_retractions_remove_routes_added_between_them() {
     let (p, q) = (prefix("fd00:8::/64"), prefix("fd00:88::/64"));
-    let mut net = neighbour_8_up().await;
+    let mut net = neighbour_8_up();
     let mut encoder = PacketEncoder::new(1400);
     assert!(encoder.put_update(&update(q, 8, 1, 100, 400)));
-    net.inject(8, 0, encoder.finalize());
+    net.inject(8, 0, encoder.finalize().as_bytes());
     assert_eq!(net.fib(0, q), Some(Fib::Via(8)));
 
     // Neighbour 8 retracts all its routes, announces P, and retracts all its routes
@@ -1050,14 +1060,14 @@ async fn wildcard_retractions_remove_routes_added_between_them() {
     assert!(encoder.put_update(&wildcard));
     assert!(encoder.put_update(&update(p, 8, 1, 100, 400)));
     assert!(encoder.put_update(&wildcard));
-    net.inject(8, 0, encoder.finalize());
+    net.inject(8, 0, encoder.finalize().as_bytes());
     assert_eq!(net.fib(0, q), Some(Fib::Unreachable));
     assert!(net.fib_changes.iter().all(|change| change.prefix != p));
     assert!(!net.nodes[0].route_table.prefix_entries.contains_key(&p));
 }
 
-#[tokio::test(start_paused = true)]
-async fn acknowledgement_requests_are_answered_in_time() {
+#[test]
+fn acknowledgement_requests_are_answered_in_time() {
     // Node 1 is outside the simulation and only sends the requests.
     let mut net = Net::new(1);
     net.add_neighbour(0, 1);
@@ -1069,9 +1079,9 @@ async fn acknowledgement_requests_are_answered_in_time() {
         assert!(encoder.put_tlv(&Tlv::AcknowledgementRequest { opaque, interval }));
     }
 
-    let start = Instant::now();
-    net.inject(1, 0, encoder.finalize());
-    net.run_for(interval.to_duration()).await;
+    let start = net.now;
+    net.inject(1, 0, encoder.finalize().as_bytes());
+    net.run_for(interval.to_duration());
 
     let mut opaques = Vec::new();
 
@@ -1095,11 +1105,11 @@ async fn acknowledgement_requests_are_answered_in_time() {
     assert_eq!(opaques, Vec::from_iter(0..400));
 }
 
-#[tokio::test(start_paused = true)]
-async fn ignored_packets_and_tlvs_change_nothing() {
+#[test]
+fn ignored_packets_and_tlvs_change_nothing() {
     let mut net = Net::new(2);
     net.connect(0, 1, Duration::ZERO);
-    net.run_for(Duration::from_secs(31)).await;
+    net.run_for(Duration::from_secs(31));
 
     let bits = net.neigh(0, 1).hello_history.bits();
 
@@ -1133,8 +1143,8 @@ async fn ignored_packets_and_tlvs_change_nothing() {
 /// The Route Hold time, which is 4 times the Update interval.
 const ROUTE_HOLD_TIME: Duration = Duration::from_secs(64);
 
-#[tokio::test(start_paused = true)]
-async fn routes_propagate_without_flapping() {
+#[test]
+fn routes_propagate_without_flapping() {
     let p = prefix("fd00:3::/64");
     let router_id = RouterId::new(4).unwrap();
 
@@ -1143,13 +1153,13 @@ async fn routes_propagate_without_flapping() {
         net.connect(i, i + 1, Duration::ZERO);
     }
     net.originate(3, p);
-    net.run_for(Duration::from_secs(60)).await;
+    net.run_for(Duration::from_secs(60));
 
     assert_eq!(net.path(0, p.addr()), [0, 1, 2, 3]);
     let changes = net.fib_changes.len();
 
     // Routes then stay put, beyond the source GC time.
-    net.run_for(Duration::from_secs(300)).await;
+    net.run_for(Duration::from_secs(300));
     assert_eq!(net.fib_changes.len(), changes);
 
     // Each node advertises P with the originator's router-id and seqno, and a metric
@@ -1184,27 +1194,27 @@ async fn routes_propagate_without_flapping() {
     }
 }
 
-#[tokio::test(start_paused = true)]
-async fn failed_link_retracts_routes_and_holds_prefix() {
+#[test]
+fn failed_link_retracts_routes_and_holds_prefix() {
     let p = prefix("fd00:2::/64");
 
     let mut net = Net::new(3);
     net.connect(0, 1, Duration::ZERO);
     net.connect(1, 2, Duration::ZERO);
     net.originate(2, p);
-    net.run_for(Duration::from_secs(60)).await;
+    net.run_for(Duration::from_secs(60));
     assert_eq!(net.path(0, p.addr()), [0, 1, 2]);
 
     // Node 1 loses node 2 after two missed Hellos, and retracts P, which node 0 learns
     // of. Both hold P as unreachable (RFC 8966 §3.5.4).
     net.links.remove(&(1, 2));
     net.links.remove(&(2, 1));
-    let failure = Instant::now();
-    net.run_for(Duration::from_secs(15)).await;
+    let failure = net.now;
+    net.run_for(Duration::from_secs(15));
     assert_eq!(net.fib(1, p), Some(Fib::Unreachable));
     assert_eq!(net.fib(0, p), Some(Fib::Unreachable));
 
-    net.run_for(Duration::from_secs(90)).await;
+    net.run_for(Duration::from_secs(90));
 
     for i in [0, 1] {
         let changes: Vec<_> = (net.fib_changes.iter())
@@ -1241,8 +1251,8 @@ async fn failed_link_retracts_routes_and_holds_prefix() {
     }
 }
 
-#[tokio::test(start_paused = true)]
-async fn held_prefix_outlasts_routes_through_the_node() {
+#[test]
+fn held_prefix_outlasts_routes_through_the_node() {
     let p = prefix("fd00:2::/64");
 
     // Node 0 originates a default route, which covers P.
@@ -1251,22 +1261,22 @@ async fn held_prefix_outlasts_routes_through_the_node() {
     net.connect(1, 2, Duration::ZERO);
     net.originate(0, prefix("::/0"));
     net.originate(2, p);
-    net.run_for(Duration::from_secs(60)).await;
+    net.run_for(Duration::from_secs(60));
     assert_eq!(net.path(0, p.addr()), [0, 1, 2]);
 
     // Node 0 misses node 1's retractions, so it keeps routing P through node 1 until the
     // route expires. Were node 1 to stop holding P before, it would route P along the
     // default route back to node 0, which the forwarding loop check would catch.
-    net.filter = |from, _, buf| {
+    net.filter = |from, _, packet| {
         Some(if from == 1 {
-            without_retractions(buf)
+            without_retractions(packet)
         } else {
-            buf
+            packet
         })
     };
     net.links.remove(&(1, 2));
     net.links.remove(&(2, 1));
-    net.run_for(Duration::from_secs(120)).await;
+    net.run_for(Duration::from_secs(120));
 
     // The first change of node `i` away from routing P through node `i + 1`.
     let change = |i: usize| {
@@ -1288,8 +1298,8 @@ async fn held_prefix_outlasts_routes_through_the_node() {
     assert!(expired.time < removed.time);
 }
 
-#[tokio::test(start_paused = true)]
-async fn unreachable_sources_are_not_counted_to_infinity() {
+#[test]
+fn unreachable_sources_are_not_counted_to_infinity() {
     let p = prefix("fd00::/64");
 
     // As in RFC 8966 §2.3: node 0 originates P, and nodes 2 and 3 reach it through node 1.
@@ -1299,9 +1309,9 @@ async fn unreachable_sources_are_not_counted_to_infinity() {
         net.connect(a, b, Duration::ZERO);
     }
     net.originate(0, p);
-    net.run_for(Duration::from_secs(60)).await;
+    net.run_for(Duration::from_secs(60));
     net.connect(2, 3, Duration::ZERO);
-    net.run_for(Duration::from_secs(60)).await;
+    net.run_for(Duration::from_secs(60));
     for i in [2, 3] {
         assert_eq!(net.path(i, p.addr()), [i, 1, 0]);
     }
@@ -1314,7 +1324,7 @@ async fn unreachable_sources_are_not_counted_to_infinity() {
     let changes = net.fib_changes.len();
     net.links.remove(&(0, 1));
     net.links.remove(&(1, 0));
-    net.run_for(Duration::from_secs(120)).await;
+    net.run_for(Duration::from_secs(120));
     for i in [1, 2, 3] {
         let entries: Vec<_> = (net.fib_changes[changes..].iter())
             .filter(|change| (change.node, change.prefix) == (i, p))
@@ -1324,8 +1334,8 @@ async fn unreachable_sources_are_not_counted_to_infinity() {
     }
 }
 
-#[tokio::test(start_paused = true)]
-async fn feasible_routes_are_used_at_once_despite_larger_metrics() {
+#[test]
+fn feasible_routes_are_used_at_once_despite_larger_metrics() {
     let p = prefix("fd00::/64");
 
     // As in RFC 8966 §2.4: node 0 originates P, and is linked to nodes 2 and 3, which are
@@ -1337,20 +1347,20 @@ async fn feasible_routes_are_used_at_once_despite_larger_metrics() {
         net.connect(a, b, Duration::ZERO);
     }
     net.originate(0, p);
-    net.run_for(Duration::from_secs(60)).await;
+    net.run_for(Duration::from_secs(60));
     net.connect(3, 1, Duration::from_millis(60));
-    net.run_for(Duration::from_secs(60)).await;
+    net.run_for(Duration::from_secs(60));
     assert_eq!(net.path(1, p.addr()), [1, 2, 0]);
 
     // The link between nodes 1 and 2 fails. Node 3 advertises metric 96, below node 1's
     // feasibility distance of 192, so its route is feasible, although its metric is
     // larger than that of the lost route. Node 1 switches to it once it notices the
     // failure, without holding P or requesting a new seqno.
-    let start = Instant::now();
+    let start = net.now;
     let changes = net.fib_changes.len();
     net.links.remove(&(1, 2));
     net.links.remove(&(2, 1));
-    net.run_for(Duration::from_secs(30)).await;
+    net.run_for(Duration::from_secs(30));
     let entries: Vec<_> = (net.fib_changes[changes..].iter())
         .filter(|change| (change.node, change.prefix) == (1, p))
         .map(|change| change.entry)
@@ -1361,8 +1371,8 @@ async fn feasible_routes_are_used_at_once_despite_larger_metrics() {
     }
 }
 
-#[tokio::test(start_paused = true)]
-async fn retractions_and_expiry_unselect_routes() {
+#[test]
+fn retractions_and_expiry_unselect_routes() {
     let p = prefix("fd00:9::/64");
     // An interval of 4 s makes the route expire 14 s after the last update.
     let announcement = update(p, 42, 1, 0, 400);
@@ -1382,41 +1392,41 @@ async fn retractions_and_expiry_unselect_routes() {
     // Announcements are selected once the neighbour is up.
     for _ in 0..3 {
         neighbour.send(&mut net, 0, from_ref(&announcement));
-        net.run_for(Duration::from_secs(4)).await;
+        net.run_for(Duration::from_secs(4));
     }
     assert_eq!(net.fib(0, p), Some(Fib::Via(9)));
 
     // A retraction unselects the route at once.
     neighbour.send(&mut net, 0, from_ref(&retraction));
     assert_eq!(net.fib(0, p), Some(Fib::Unreachable));
-    net.run_for(Duration::from_secs(4)).await;
+    net.run_for(Duration::from_secs(4));
 
     // A new route is unaffected by the expiry of the one retracted.
     for _ in 0..6 {
         neighbour.send(&mut net, 0, from_ref(&announcement));
         assert_eq!(net.fib(0, p), Some(Fib::Via(9)));
-        net.run_for(Duration::from_secs(4)).await;
+        net.run_for(Duration::from_secs(4));
     }
 
     // So is a wildcard retraction.
     neighbour.send(&mut net, 0, from_ref(&wildcard_retraction));
     assert_eq!(net.fib(0, p), Some(Fib::Unreachable));
-    net.run_for(Duration::from_secs(4)).await;
+    net.run_for(Duration::from_secs(4));
 
     // A route that is not refreshed expires.
     neighbour.send(&mut net, 0, from_ref(&announcement));
     assert_eq!(net.fib(0, p), Some(Fib::Via(9)));
     for _ in 0..3 {
-        net.run_for(Duration::from_secs(4)).await;
+        net.run_for(Duration::from_secs(4));
         neighbour.send(&mut net, 0, &[]);
     }
     assert_eq!(net.fib(0, p), Some(Fib::Via(9)));
-    net.run_for(Duration::from_secs(4)).await;
+    net.run_for(Duration::from_secs(4));
     assert_eq!(net.fib(0, p), Some(Fib::Unreachable));
 }
 
-#[tokio::test(start_paused = true)]
-async fn unfeasible_routes_are_never_selected() {
+#[test]
+fn unfeasible_routes_are_never_selected() {
     let p = prefix("fd00:9::/64");
     // Neighbour 9 announces P once, with an interval long enough for it not to expire.
     let far = update(p, 42, 1, 500, 0x8000);
@@ -1434,7 +1444,7 @@ async fn unfeasible_routes_are_never_selected() {
         }
         let updates: &[Update] = if round >= 2 { from_ref(&near) } else { &[] };
         n8.send(&mut net, 0, updates);
-        net.run_for(Duration::from_secs(4)).await;
+        net.run_for(Duration::from_secs(4));
     }
 
     // Node 0 switched to the nearer route, and has advertised it.
@@ -1449,14 +1459,14 @@ async fn unfeasible_routes_are_never_selected() {
     // strictly better than what node 0 has advertised (RFC 8966 §3.5.1, §3.6).
     for _ in 0..5 {
         n9.send(&mut net, 0, &[]);
-        net.run_for(Duration::from_secs(4)).await;
+        net.run_for(Duration::from_secs(4));
     }
     assert_eq!(net.fib(0, p), Some(Fib::Unreachable));
 }
 
 /// Runs node 0 for `secs` seconds, with neighbours 8 and 9 sending a Hello and an IHU
 /// every 4 s, preceded by the given updates in their first packets only.
-async fn exchange(
+fn exchange(
     net: &mut Net,
     n8: &mut Scripted,
     n9: &mut Scripted,
@@ -1468,14 +1478,14 @@ async fn exchange(
         let first = round == 0;
         n9.send(net, 0, if first { updates9 } else { &[] });
         n8.send(net, 0, if first { updates8 } else { &[] });
-        net.run_for(Duration::from_secs(4)).await;
+        net.run_for(Duration::from_secs(4));
     }
 }
 
 /// Sets up node 0 with neighbours 8 and 9, which announce P once each, with an interval
 /// long enough for the routes not to expire. The route through neighbour 9 comes up
 /// first, and is selected. Both smoothed metrics have converged after 160 s.
-async fn two_routes(far: &Update, near: &Update) -> (Net, Scripted, Scripted) {
+fn two_routes(far: &Update, near: &Update) -> (Net, Scripted, Scripted) {
     let mut net = Net::new(1);
     net.add_neighbour(0, 8);
     net.add_neighbour(0, 9);
@@ -1487,13 +1497,12 @@ async fn two_routes(far: &Update, near: &Update) -> (Net, Scripted, Scripted) {
         160,
         from_ref(far),
         from_ref(near),
-    )
-    .await;
+    );
     (net, n8, n9)
 }
 
-#[tokio::test(start_paused = true)]
-async fn unfeasible_update_with_an_unchanged_router_id_is_ignored() {
+#[test]
+fn unfeasible_update_with_an_unchanged_router_id_is_ignored() {
     let p = prefix("fd00:9::/64");
     let far = update(p, 43, 1, 2000, 0x8000);
     let near = update(p, 42, 1, 100, 0x8000);
@@ -1505,14 +1514,14 @@ async fn unfeasible_update_with_an_unchanged_router_id_is_ignored() {
         net.add_neighbour(0, 9);
         let (mut n8, mut n9) = (Scripted::new(8), Scripted::new(9));
         let updates8: &[Update] = if alternative { from_ref(&far) } else { &[] };
-        exchange(&mut net, &mut n8, &mut n9, 160, updates8, from_ref(&near)).await;
+        exchange(&mut net, &mut n8, &mut n9, 160, updates8, from_ref(&near));
         assert_eq!(net.fib(0, p), Some(Fib::Via(9)));
 
         // Node 0 advertises P with metric 196, so an update from neighbour 9 with metric 300
         // and the same router-id is unfeasible. Rather than apply it and unselect the route,
         // node 0 ignores it (RFC 8966 §3.5.3, see `handle_update`), so P stays reachable, and
         // is still advertised with metric 196.
-        let start = Instant::now();
+        let start = net.now;
         let changes = net.fib_changes.len();
         n9.send(&mut net, 0, &[update(p, 42, 1, 300, 0x8000)]);
         assert_eq!(net.fib_changes.len(), changes);
@@ -1521,14 +1530,14 @@ async fn unfeasible_update_with_an_unchanged_router_id_is_ignored() {
 
         // It still sends neighbour 9 a seqno request, with the update's router-id and the
         // seqno in the source table plus 1 (§3.8.2.2), as an urgent TLV within 0.2 s.
-        net.run_for(Duration::from_millis(200)).await;
+        net.run_for(Duration::from_millis(200));
         assert_eq!(requests_sent(&net, 0, 9, start), [(42, 2, 64)]);
         assert_eq!(requests_sent(&net, 0, 8, start), []);
     }
 }
 
-#[tokio::test(start_paused = true)]
-async fn unfeasible_update_with_another_router_id_unselects_the_route() {
+#[test]
+fn unfeasible_update_with_another_router_id_unselects_the_route() {
     let p = prefix("fd00:9::/64");
     let far = update(p, 44, 1, 2000, 0x8000);
 
@@ -1541,15 +1550,15 @@ async fn unfeasible_update_with_another_router_id_unselects_the_route() {
         let (mut n8, mut n9) = (Scripted::new(8), Scripted::new(9));
         let updates8: &[Update] = if alternative { from_ref(&far) } else { &[] };
         let updates9 = [update(p, 43, 1, 100, 0x8000)];
-        exchange(&mut net, &mut n8, &mut n9, 20, updates8, &updates9).await;
+        exchange(&mut net, &mut n8, &mut n9, 20, updates8, &updates9);
         let updates9 = [update(p, 42, 1, 100, 0x8000)];
-        exchange(&mut net, &mut n8, &mut n9, 20, &[], &updates9).await;
+        exchange(&mut net, &mut n8, &mut n9, 20, &[], &updates9);
         assert_eq!(net.fib(0, p), Some(Fib::Via(9)));
 
         // Neighbour 9 switches back to router-id 43, with metric 300, which is unfeasible. With
         // another router-id, this is another source, so node 0 MUST unselect the route (RFC
         // 8966 §3.5.3). It selects the route through neighbour 8 instead, if there is one.
-        let start = Instant::now();
+        let start = net.now;
         n9.send(&mut net, 0, &[update(p, 43, 1, 300, 0x8000)]);
         let fib = if alternative {
             Fib::Via(8)
@@ -1560,7 +1569,7 @@ async fn unfeasible_update_with_another_router_id_unselects_the_route() {
 
         // Node 0 sends neighbour 9 a seqno request for router-id 43 (§3.8.2.2). If it has lost
         // P, it also sends every neighbour one for router-id 42 (§3.8.2.1).
-        net.run_for(Duration::from_millis(200)).await;
+        net.run_for(Duration::from_millis(200));
         let (to8, to9) = if alternative {
             (vec![], vec![(43, 2, 64)])
         } else {
@@ -1571,8 +1580,8 @@ async fn unfeasible_update_with_another_router_id_unselects_the_route() {
     }
 }
 
-#[tokio::test(start_paused = true)]
-async fn metric_increases_keep_routes_selected() {
+#[test]
+fn metric_increases_keep_routes_selected() {
     let p = prefix("fd00::/64");
 
     // Node 0 originates P, which nodes 1, 2 and 3 reach along a chain of links of 10 ms,
@@ -1583,18 +1592,18 @@ async fn metric_increases_keep_routes_selected() {
         net.connect(a, b, Duration::from_millis(10));
     }
     net.originate(0, p);
-    net.run_for(Duration::from_secs(120)).await;
+    net.run_for(Duration::from_secs(120));
     assert_eq!(net.path(3, p.addr()), [3, 2, 1, 0]);
 
     // The latency of the link between nodes 0 and 1 rises to 100 ms, so its cost, and node
     // 1's metric for P, rise to 246. Its updates become unfeasible at node 2, which ignores
     // them and keeps its route, as does node 3 (see `handle_update`), so P stays reachable.
     let changes = net.fib_changes.len();
-    let start = Instant::now();
+    let start = net.now;
     let seqno = net.nodes[0].seqno;
     net.links.insert((0, 1), Duration::from_millis(100));
     net.links.insert((1, 0), Duration::from_millis(100));
-    net.run_for(Duration::from_secs(300)).await;
+    net.run_for(Duration::from_secs(300));
     assert_eq!(net.fib_changes.len(), changes);
 
     // Node 2 requests a new seqno (RFC 8966 §3.8.2.2), which node 0 raises by 1. The routes
@@ -1607,8 +1616,8 @@ async fn metric_increases_keep_routes_selected() {
     }
 }
 
-#[tokio::test(start_paused = true)]
-async fn selected_routes_expire_unless_refreshed_by_feasible_updates() {
+#[test]
+fn selected_routes_expire_unless_refreshed_by_feasible_updates() {
     let p = prefix("fd00:9::/64");
     // An interval of 4 s makes the route expire 14 s after the last update that refreshes it.
     let feasible = update(p, 42, 1, 100, 400);
@@ -1621,7 +1630,7 @@ async fn selected_routes_expire_unless_refreshed_by_feasible_updates() {
         let mut n9 = Scripted::new(9);
         for _ in 0..3 {
             n9.send(&mut net, 0, from_ref(&feasible));
-            net.run_for(Duration::from_secs(4)).await;
+            net.run_for(Duration::from_secs(4));
         }
         assert_eq!(net.fib(0, p), Some(Fib::Via(9)));
 
@@ -1642,17 +1651,17 @@ async fn selected_routes_expire_unless_refreshed_by_feasible_updates() {
             let held = !answered && round == 3;
             let fib = if held { Fib::Unreachable } else { Fib::Via(9) };
             assert_eq!(net.fib(0, p), Some(fib));
-            net.run_for(Duration::from_secs(4)).await;
+            net.run_for(Duration::from_secs(4));
         }
     }
 }
 
-#[tokio::test(start_paused = true)]
-async fn worse_selected_route_is_replaced_at_the_next_update_of_a_better_one() {
+#[test]
+fn worse_selected_route_is_replaced_at_the_next_update_of_a_better_one() {
     let p = prefix("fd00:9::/64");
     let far = update(p, 43, 1, 500, 0x8000);
     let near = update(p, 42, 1, 100, 0x8000);
-    let (mut net, mut n8, mut n9) = two_routes(&far, &near).await;
+    let (mut net, mut n8, mut n9) = two_routes(&far, &near);
     assert_eq!(net.fib(0, p), Some(Fib::Via(9)));
 
     // At 162 s, the link to neighbour 9 gets worse, raising the route's metric from 196
@@ -1661,12 +1670,12 @@ async fn worse_selected_route_is_replaced_at_the_next_update_of_a_better_one() {
     // selected route each time. At 162 and 166 s, the selected route's smoothed metric,
     // 1100 - 904 exp(-t / 12 s), is still below 596. At 170 s, it is about 636, so node 0
     // switches then (RFC 8966 Appendix A.3).
-    net.run_for(Duration::from_secs(2)).await;
+    net.run_for(Duration::from_secs(2));
     n9.rxcost = Some(1000);
-    let start = Instant::now();
+    let start = net.now;
     let changes = net.fib_changes.len();
     for _ in 0..5 {
-        exchange(&mut net, &mut n8, &mut n9, 4, from_ref(&far), &[]).await;
+        exchange(&mut net, &mut n8, &mut n9, 4, from_ref(&far), &[]);
     }
 
     let [switch] = &net.fib_changes[changes..] else {
@@ -1676,8 +1685,8 @@ async fn worse_selected_route_is_replaced_at_the_next_update_of_a_better_one() {
     assert_eq!(switch.time - start, Duration::from_secs(8));
 }
 
-#[tokio::test(start_paused = true)]
-async fn router_id_change_by_hysteresis_is_advertised_urgently() {
+#[test]
+fn router_id_change_by_hysteresis_is_advertised_urgently() {
     let p = prefix("fd00:9::/64");
     let far = update(p, 43, 1, 500, 0x8000);
     let near = update(p, 42, 1, 100, 0x8000);
@@ -1695,17 +1704,16 @@ async fn router_id_change_by_hysteresis_is_advertised_urgently() {
         160,
         from_ref(&far),
         from_ref(&near),
-    )
-    .await;
+    );
     assert_eq!(net.path(1, p.addr()), [1, 0, 9]);
 
     // The link to neighbour 9 gets worse, and node 0 switches to the route through
     // neighbour 8, with another router-id, when that route is next updated.
-    net.run_for(Duration::from_secs(2)).await;
+    net.run_for(Duration::from_secs(2));
     n9.rxcost = Some(1000);
     let changes = net.fib_changes.len();
     for _ in 0..5 {
-        exchange(&mut net, &mut n8, &mut n9, 4, from_ref(&far), &[]).await;
+        exchange(&mut net, &mut n8, &mut n9, 4, from_ref(&far), &[]);
     }
     let switch = net.fib_changes[changes..]
         .iter()
@@ -1725,8 +1733,8 @@ async fn router_id_change_by_hysteresis_is_advertised_urgently() {
     assert!(sent.time - switch.time <= Duration::from_millis(200));
 }
 
-#[tokio::test(start_paused = true)]
-async fn hysteresis_needs_a_lower_metric_as_well() {
+#[test]
+fn hysteresis_needs_a_lower_metric_as_well() {
     let p = prefix("fd00:9::/64");
 
     let mut net = Net::new(1);
@@ -1746,8 +1754,7 @@ async fn hysteresis_needs_a_lower_metric_as_well() {
         72,
         from_ref(&near),
         from_ref(&far),
-    )
-    .await;
+    );
     assert_eq!(net.fib(0, p), Some(Fib::Via(9)));
 
     // By 72 s, its smoothed metric, 196 + 65339 exp(-68 s / 12 s) ≈ 422, is below 596.
@@ -1757,14 +1764,14 @@ async fn hysteresis_needs_a_lower_metric_as_well() {
     assert_eq!(net.fib(0, p), Some(Fib::Via(9)));
 }
 
-#[tokio::test(start_paused = true)]
-async fn hysteresis_never_switches_to_unfeasible_routes() {
+#[test]
+fn hysteresis_never_switches_to_unfeasible_routes() {
     let p = prefix("fd00:9::/64");
     // Both routes have the same source, and node 0 advertises P with metric 196 through
     // neighbour 9, so the route through neighbour 8 is unfeasible.
     let far = update(p, 42, 1, 500, 0x8000);
     let near = update(p, 42, 1, 100, 0x8000);
-    let (mut net, mut n8, mut n9) = two_routes(&far, &near).await;
+    let (mut net, mut n8, mut n9) = two_routes(&far, &near);
     assert_eq!(net.fib(0, p), Some(Fib::Via(9)));
 
     // The link to neighbour 9 gets worse, raising the route's metric to 1100, above 596
@@ -1773,7 +1780,7 @@ async fn hysteresis_never_switches_to_unfeasible_routes() {
     // one that is not.
     n9.rxcost = Some(1000);
     let changes = net.fib_changes.len();
-    let start = Instant::now();
+    let start = net.now;
     for _ in 0..15 {
         exchange(
             &mut net,
@@ -1782,8 +1789,7 @@ async fn hysteresis_never_switches_to_unfeasible_routes() {
             4,
             from_ref(&far),
             from_ref(&near),
-        )
-        .await;
+        );
     }
     assert_eq!(net.fib_changes.len(), changes);
     assert_eq!(net.fib(0, p), Some(Fib::Via(9)));
@@ -1798,8 +1804,8 @@ async fn hysteresis_never_switches_to_unfeasible_routes() {
     assert_eq!(requests_sent(&net, 0, 9, start), []);
 }
 
-#[tokio::test(start_paused = true)]
-async fn metric_changed_by_a_timeout_is_smoothed_from_then() {
+#[test]
+fn metric_changed_by_a_timeout_is_smoothed_from_then() {
     let p = prefix("fd00:8::/64");
 
     let mut net = Net::new(1);
@@ -1813,8 +1819,7 @@ async fn metric_changed_by_a_timeout_is_smoothed_from_then() {
         32,
         &[update(p, 8, 1, 100, 0x8000)],
         &[],
-    )
-    .await;
+    );
     assert_eq!(net.fib(0, p), Some(Fib::Via(8)));
 
     // Neighbour 8 falls silent, while neighbour 9 keeps sending packets, 3 s apart.
@@ -1823,7 +1828,7 @@ async fn metric_changed_by_a_timeout_is_smoothed_from_then() {
     // timeout, not of the last packet received (RFC 8966 Appendix A.3).
     let changes = net.fib_changes.len();
     for _ in 0..4 {
-        net.run_for(Duration::from_secs(3)).await;
+        net.run_for(Duration::from_secs(3));
         n9.send(&mut net, 0, &[]);
     }
     let [lost] = &net.fib_changes[changes..] else {
@@ -1831,15 +1836,12 @@ async fn metric_changed_by_a_timeout_is_smoothed_from_then() {
     };
     let route = &net.nodes[0].route_table.prefix_entries[&p].routes[net.key(0, 8)];
     assert_eq!(route.metric.get(), METRIC_INFINITY);
-    let age = timestamp_now().wrapping_sub(route.metric_smoothed_at.get());
-    assert_eq!(
-        Duration::from_micros(age.into()),
-        Instant::now() - lost.time
-    );
+    let age = timestamp(net.now).wrapping_sub(route.metric_smoothed_at.get());
+    assert_eq!(Duration::from_micros(age.into()), net.now - lost.time);
 }
 
-#[tokio::test(start_paused = true)]
-async fn source_expiry_keeps_hysteresis() {
+#[test]
+fn source_expiry_keeps_hysteresis() {
     let p = prefix("fd00:9::/64");
 
     let mut net = Net::new(1);
@@ -1856,8 +1858,7 @@ async fn source_expiry_keeps_hysteresis() {
         40,
         &[update(p, 43, 1, 2000, 0x8000)],
         &[update(p, 42, 1, 100, 0x8000)],
-    )
-    .await;
+    );
     exchange(
         &mut net,
         &mut n8,
@@ -1865,8 +1866,7 @@ async fn source_expiry_keeps_hysteresis() {
         4,
         &[],
         &[update(p, 44, 1, 100, 0x8000)],
-    )
-    .await;
+    );
     assert_eq!(net.fib(0, p), Some(Fib::Via(9)));
     let node = &net.nodes[0];
     let source = SourceKey {
@@ -1875,22 +1875,22 @@ async fn source_expiry_keeps_hysteresis() {
     };
     let expiry = node
         .timers
-        .deadline(&node.source_table[&source].gc_timer_key);
+        .deadline(node.source_table[&source].gc_timer_key);
 
     // Shortly before, the route through neighbour 8 gets a metric of 146, below 196, but
     // its smoothed metric is still far above. Node 0 keeps its route, also when the entry
     // expires (RFC 8966 Appendix A.3).
-    while Instant::now() + Duration::from_secs(8) < expiry {
-        exchange(&mut net, &mut n8, &mut n9, 4, &[], &[]).await;
+    while net.now + Duration::from_secs(8) < expiry {
+        exchange(&mut net, &mut n8, &mut n9, 4, &[], &[]);
     }
     n8.send(&mut net, 0, &[update(p, 43, 1, 50, 0x8000)]);
-    exchange(&mut net, &mut n8, &mut n9, 12, &[], &[]).await;
+    exchange(&mut net, &mut n8, &mut n9, 12, &[], &[]);
     assert!(!net.nodes[0].source_table.contains_key(&source));
     assert_eq!(net.fib(0, p), Some(Fib::Via(9)));
 }
 
-#[tokio::test(start_paused = true)]
-async fn smoothed_metrics_survive_timestamp_wraparound() {
+#[test]
+fn smoothed_metrics_survive_timestamp_wraparound() {
     let p = prefix("fd00:9::/64");
     let near = update(p, 42, 1, 100, 0x8000);
     let far = update(p, 43, 1, 500, 0x8000);
@@ -1899,20 +1899,20 @@ async fn smoothed_metrics_survive_timestamp_wraparound() {
     net.add_neighbour(0, 8);
     net.add_neighbour(0, 9);
     let (mut n8, mut n9) = (Scripted::new(8), Scripted::new(9));
-    exchange(&mut net, &mut n8, &mut n9, 16, &[], from_ref(&near)).await;
+    exchange(&mut net, &mut n8, &mut n9, 16, &[], from_ref(&near));
     assert_eq!(net.fib(0, p), Some(Fib::Via(9)));
 
     // Timestamps wrap around every 2^32 µs, about 72 minutes. The route through
     // neighbour 9 keeps its metric of 196 for longer than that, refreshed every 16 s.
     // The route through neighbour 8 appears a few minutes before, with metric 596.
     let route = &net.nodes[0].route_table.prefix_entries[&p].routes[net.key(0, 9)];
-    let age = timestamp_now().wrapping_sub(route.metric_smoothed_at.get());
-    let anchored = Instant::now() - Duration::from_micros(age.into());
+    let age = timestamp(net.now).wrapping_sub(route.metric_smoothed_at.get());
+    let anchored = net.now - Duration::from_micros(age.into());
     let wrapped = anchored + Duration::from_micros(1 << 32) + Duration::from_secs(1);
-    while Instant::now() < wrapped {
-        let soon = wrapped - Instant::now() < Duration::from_secs(300);
+    while net.now < wrapped {
+        let soon = wrapped - net.now < Duration::from_secs(300);
         let updates8: &[Update] = if soon { from_ref(&far) } else { &[] };
-        exchange(&mut net, &mut n8, &mut n9, 16, updates8, from_ref(&near)).await;
+        exchange(&mut net, &mut n8, &mut n9, 16, updates8, from_ref(&near));
     }
 
     // Just after the wraparound, the route through neighbour 8 gets a metric of 146.
@@ -1922,8 +1922,8 @@ async fn smoothed_metrics_survive_timestamp_wraparound() {
     assert_eq!(net.fib(0, p), Some(Fib::Via(9)));
 }
 
-#[tokio::test(start_paused = true)]
-async fn router_id_change_is_advertised_urgently() {
+#[test]
+fn router_id_change_is_advertised_urgently() {
     let p = prefix("fd00:9::/64");
 
     let mut net = Net::new(2);
@@ -1933,15 +1933,15 @@ async fn router_id_change_is_advertised_urgently() {
 
     for _ in 0..10 {
         neighbour.send(&mut net, 0, &[update(p, 42, 1, 0, 400)]);
-        net.run_for(Duration::from_secs(4)).await;
+        net.run_for(Duration::from_secs(4));
     }
     assert_eq!(net.path(1, p.addr()), [1, 0, 9]);
 
     // A new router-id for the selected route is advertised as an urgent TLV
     // (RFC 8966 §3.7.2), within the urgent timeout of 0.2 s.
     neighbour.send(&mut net, 0, &[update(p, 43, 1, 0, 400)]);
-    let change = Instant::now();
-    net.run_for(Duration::from_secs(4)).await;
+    let change = net.now;
+    net.run_for(Duration::from_secs(4));
 
     let first = net.sent.iter().find(|sent| {
         let updates = updates(&sent.buf);
@@ -1958,8 +1958,8 @@ async fn router_id_change_is_advertised_urgently() {
     }
 }
 
-#[tokio::test(start_paused = true)]
-async fn better_routes_are_adopted_after_hysteresis() {
+#[test]
+fn better_routes_are_adopted_after_hysteresis() {
     let p = prefix("fd00:9::/64");
 
     let mut net = Net::new(1);
@@ -1972,7 +1972,7 @@ async fn better_routes_are_adopted_after_hysteresis() {
     for _ in 0..50 {
         n8.send(&mut net, 0, &[update(p, 42, 1, 1000, 400)]);
         n9.send(&mut net, 0, &[update(p, 42, 1, 500, 400)]);
-        net.run_for(Duration::from_secs(4)).await;
+        net.run_for(Duration::from_secs(4));
     }
     assert_eq!(net.fib(0, p), Some(Fib::Via(9)));
 
@@ -1990,44 +1990,45 @@ async fn better_routes_are_adopted_after_hysteresis() {
             "after {} s",
             round * 4
         );
-        net.run_for(Duration::from_secs(4)).await;
+        net.run_for(Duration::from_secs(4));
     }
 }
 
 /// Sets up nodes 0, 1 and 2 in a line, with node 2 originating P, and once node 0 reaches
 /// P, reboots node 2 with the same router-id, but a seqno smaller than before by `gap`.
 /// Returns P and the time of the reboot.
-async fn rebooted_originator(gap: u16) -> (Net, Ipv6Net, Instant) {
+fn rebooted_originator(gap: u16) -> (Net, Ipv6Net, Instant) {
     let p = prefix("fd00:2::/64");
 
     let mut net = Net::new(3);
     net.connect(0, 1, Duration::ZERO);
     net.connect(1, 2, Duration::ZERO);
     net.originate(2, p);
-    net.run_for(Duration::from_secs(60)).await;
+    net.run_for(Duration::from_secs(60));
     assert_eq!(net.path(0, p.addr()), [0, 1, 2]);
 
     let seqno = Seqno::new(net.nodes[2].seqno.get().wrapping_sub(gap));
-    let mut node = State::new(Params::new(), net.nodes[2].router_id, Some(seqno));
+    let mut node = State::new(net.now, Params::new(), net.nodes[2].router_id, Some(seqno));
     node.hello_seqno = net.nodes[2].hello_seqno + 1000;
-    net.restart(2, node).await;
+    net.restart(2, node);
     net.add_neighbour(2, 1);
     assert!(net.nodes[2].inject_route(p));
 
-    (net, p, Instant::now())
+    let reboot = net.now;
+    (net, p, reboot)
 }
 
-#[tokio::test(start_paused = true)]
-async fn originator_rebooted_with_seqno_smaller_by_100_or_more_is_reacquired_once_sources_expire() {
+#[test]
+fn originator_rebooted_with_seqno_smaller_by_100_or_more_is_reacquired_once_sources_expire() {
     for gap in [100, 1000] {
-        let (mut net, p, reboot) = rebooted_originator(gap).await;
+        let (mut net, p, reboot) = rebooted_originator(gap);
 
         // Node 2's updates are unfeasible at nodes 1 and 0, which have advertised P with the
         // larger seqno (RFC 8966 §3.5.1), so P becomes unreachable. Node 1 would ask for a
         // seqno exceeding node 2's by more than 100, more than requests make up, as node 2
         // raises its seqno by only 1 per request (§3.8.1.2). So node 1 sends no requests
         // beyond the one for the lost route and its 3 resends, and node 2 ignores those.
-        net.run_for(Duration::from_secs(60)).await;
+        net.run_for(Duration::from_secs(60));
         assert_eq!(requests_sent(&net, 1, 2, reboot).len(), 4);
         assert_eq!(net.delivered_to(0, p.addr()), None);
 
@@ -2035,7 +2036,7 @@ async fn originator_rebooted_with_seqno_smaller_by_100_or_more_is_reacquired_onc
         // advertised P with a finite metric, which it did before holding P. Its route
         // through the next node then becomes feasible, and is selected at once. Node 1 holds
         // P before node 0, and announces it as an urgent TLV.
-        net.run_for(Duration::from_secs(240)).await;
+        net.run_for(Duration::from_secs(240));
         assert_eq!(net.path(0, p.addr()), [0, 1, 2]);
         let mut changes = net
             .fib_changes
@@ -2049,8 +2050,8 @@ async fn originator_rebooted_with_seqno_smaller_by_100_or_more_is_reacquired_onc
     }
 }
 
-#[tokio::test(start_paused = true)]
-async fn originator_rebooted_with_seqno_smaller_by_up_to_99_is_reacquired_through_requests() {
+#[test]
+fn originator_rebooted_with_seqno_smaller_by_up_to_99_is_reacquired_through_requests() {
     // As above, but with node 2's seqno at most 99 short, so that node 1 asks for a seqno
     // exceeding it by at most 100. Each reply from node 2 raises its seqno by only 1, and is
     // unfeasible too, but once the link between nodes 1 and 2 is back up, prompts node 1 to
@@ -2061,9 +2062,9 @@ async fn originator_rebooted_with_seqno_smaller_by_up_to_99_is_reacquired_throug
     // node 1. It sends one with every third Hello, 8 s after the reboot, and if it has not
     // heard two of node 1's Hellos by then, 12 s later.
     for (gap, within) in [(10, 23), (99, 45)] {
-        let (mut net, p, reboot) = rebooted_originator(gap).await;
+        let (mut net, p, reboot) = rebooted_originator(gap);
 
-        net.run_for(Duration::from_secs(60)).await;
+        net.run_for(Duration::from_secs(60));
         assert_eq!(net.path(0, p.addr()), [0, 1, 2]);
         let changes: Vec<_> = (net.fib_changes.iter())
             .filter(|change| (change.node, change.prefix) == (0, p) && change.time >= reboot)
@@ -2079,24 +2080,24 @@ async fn originator_rebooted_with_seqno_smaller_by_up_to_99_is_reacquired_throug
     }
 }
 
-#[tokio::test(start_paused = true)]
-async fn random_link_failures_cause_no_loops() {
-    random_link_failures(Duration::ZERO).await;
+#[test]
+fn random_link_failures_cause_no_loops() {
+    random_link_failures(Duration::ZERO);
 }
 
-#[tokio::test(start_paused = true)]
-async fn reordered_packets_cause_no_loops() {
+#[test]
+fn reordered_packets_cause_no_loops() {
     // Loop-freedom does not rely on packets arriving in order: whether an update is feasible
     // depends only on its own seqno and metric (RFC 8966 §3.5.1), and a late one is still
     // backed by its sender's feasibility distance, which only gets better. Here, packets take
     // up to 1 s longer than their link's latency, so that those sent close together on a link
     // often arrive out of order.
-    random_link_failures(Duration::from_secs(1)).await;
+    random_link_failures(Duration::from_secs(1));
 }
 
 /// Fails and recovers links at random in a mesh of 6 nodes, with packets delayed by up to
 /// `jitter` beyond their link's latency, then checks that every node reaches every prefix.
-async fn random_link_failures(jitter: Duration) {
+fn random_link_failures(jitter: Duration) {
     const N: usize = 6;
     let edges = [
         (0, 1),
@@ -2134,15 +2135,14 @@ async fn random_link_failures(jitter: Duration) {
             net.links.insert((a, b), links[&(a, b)]);
             net.links.insert((b, a), links[&(b, a)]);
         }
-        net.run_for(Duration::from_secs(rng.random_range(5..30)))
-            .await;
+        net.run_for(Duration::from_secs(rng.random_range(5..30)));
     }
 
     // Once all links are back, every node reaches every prefix. One that lost a prefix
     // regains it once a seqno request is answered, or at worst once its feasibility
     // distance is garbage-collected, 3 minutes after it last advertised the prefix.
     net.links = links;
-    net.run_for(Duration::from_secs(400)).await;
+    net.run_for(Duration::from_secs(400));
     for i in 0..N {
         for (j, p) in prefixes.iter().enumerate() {
             assert_eq!(net.delivered_to(i, p.addr()), Some(j), "from {i} to {p}");
@@ -2153,7 +2153,7 @@ async fn random_link_failures(jitter: Duration) {
 /// Sets up node 0 with a route learnt from node 1, a local route, and neighbour 9,
 /// outside the simulation. Returns the learnt and local prefixes, between periodic
 /// dumps, which are sent every 16 s and flushed within 2 s.
-async fn requested_net() -> (Net, Ipv6Net, Ipv6Net) {
+fn requested_net() -> (Net, Ipv6Net, Ipv6Net) {
     let learnt = prefix("fd00:1::/64");
     let local = prefix("fd00::/64");
 
@@ -2162,7 +2162,7 @@ async fn requested_net() -> (Net, Ipv6Net, Ipv6Net) {
     net.add_neighbour(0, 9);
     net.originate(0, local);
     net.originate(1, learnt);
-    net.run_for(Duration::from_secs(20)).await;
+    net.run_for(Duration::from_secs(20));
     assert_eq!(net.fib(0, learnt), Some(Fib::Via(1)));
 
     (net, learnt, local)
@@ -2175,13 +2175,13 @@ fn updates_sent(net: &Net, from: usize, to: usize, start: Instant) -> Vec<Update
     sent.flat_map(|sent| updates(&sent.buf)).collect()
 }
 
-#[tokio::test(start_paused = true)]
-async fn route_requests_are_answered() {
-    let (mut net, learnt, local) = requested_net().await;
+#[test]
+fn route_requests_are_answered() {
+    let (mut net, learnt, local) = requested_net();
     let unknown = prefix("fd00:9::/64");
     let interval = 1600;
 
-    let start = Instant::now();
+    let start = net.now;
     for p in [learnt, local, unknown] {
         let request = route_request(Ae::Ipv6, 64, &p.addr().octets()[..8]);
         net.inject(9, 0, &request);
@@ -2195,7 +2195,7 @@ async fn route_requests_are_answered() {
         0,
         &route_request(Ae::Ipv6, 64, &learnt.addr().octets()[..8]),
     );
-    net.run_for(Duration::from_secs(3)).await;
+    net.run_for(Duration::from_secs(3));
 
     // Each request is answered with the route that node 0 advertises, or else with
     // a retraction carrying its own router-id and seqno, and the same AE
@@ -2227,14 +2227,14 @@ async fn route_requests_are_answered() {
     );
 }
 
-#[tokio::test(start_paused = true)]
-async fn wildcard_route_requests_are_answered_with_full_dumps() {
-    let (mut net, learnt, local) = requested_net().await;
+#[test]
+fn wildcard_route_requests_are_answered_with_full_dumps() {
+    let (mut net, learnt, local) = requested_net();
 
     // A wildcard request is answered with a full dump, sent to the requester only.
-    let start = Instant::now();
+    let start = net.now;
     net.inject(9, 0, &route_request(Ae::Wildcard, 0, &[]));
-    net.run_for(Duration::from_secs(3)).await;
+    net.run_for(Duration::from_secs(3));
 
     // A dump of both prefixes, in whichever order.
     let dumped = |net: &Net, to, start| {
@@ -2250,14 +2250,14 @@ async fn wildcard_route_requests_are_answered_with_full_dumps() {
 
     // So is one from the neighbour that a route was learnt from, but without that route,
     // as in periodic dumps (RFC 8966 §3.7.4).
-    let start = Instant::now();
+    let start = net.now;
     net.inject(1, 0, &route_request(Ae::Wildcard, 0, &[]));
-    net.run_for(Duration::from_secs(3)).await;
+    net.run_for(Duration::from_secs(3));
     assert_eq!(dumped(&net, 1, start), [local]);
 }
 
-#[tokio::test(start_paused = true)]
-async fn requests_are_handled_after_route_selection() {
+#[test]
+fn requests_are_handled_after_route_selection() {
     let p = prefix("fd00:9::/64");
     let near = update(p, 42, 1, 100, 0x8000);
     // A packet from neighbour 9 retracting P, then asking for it.
@@ -2265,14 +2265,14 @@ async fn requests_are_handled_after_route_selection() {
         let mut encoder = PacketEncoder::new(1400);
         assert!(encoder.put_update(&update(p, 42, 1, METRIC_INFINITY, 0x8000)));
         assert!(encoder.put_tlv(&request));
-        encoder.finalize().to_vec()
+        encoder.finalize().as_bytes().to_vec()
     };
 
     // With a feasible route through neighbour 8, node 0 answers a route request with that
     // route, which it selects once the packet is handled, rather than the retracted one.
-    let (mut net, _, _) = two_routes(&update(p, 42, 1, 150, 0x8000), &near).await;
-    net.run_for(Duration::from_secs(2)).await;
-    let start = Instant::now();
+    let (mut net, _, _) = two_routes(&update(p, 42, 1, 150, 0x8000), &near);
+    net.run_for(Duration::from_secs(2));
+    let start = net.now;
     let request = Tlv::RouteRequest {
         ae: Ae::Ipv6,
         plen: 64,
@@ -2280,7 +2280,7 @@ async fn requests_are_handled_after_route_selection() {
     };
     net.inject(9, 0, &retract_and_ask(request));
     assert_eq!(net.fib(0, p), Some(Fib::Via(8)));
-    net.run_for(Duration::from_secs(2)).await;
+    net.run_for(Duration::from_secs(2));
     assert_eq!(
         updates_sent(&net, 0, 9, start),
         [update(p, 42, 1, 246, 1600)]
@@ -2289,9 +2289,9 @@ async fn requests_are_handled_after_route_selection() {
     // With only an unfeasible route through neighbour 8, node 0 holds P once the packet is
     // handled, so it does not forward a seqno request from neighbour 9. It sends its own for
     // the same seqno to every neighbour instead (RFC 8966 §3.8.2.1).
-    let (mut net, _, _) = two_routes(&update(p, 42, 1, 500, 0x8000), &near).await;
-    net.run_for(Duration::from_secs(2)).await;
-    let start = Instant::now();
+    let (mut net, _, _) = two_routes(&update(p, 42, 1, 500, 0x8000), &near);
+    net.run_for(Duration::from_secs(2));
+    let start = net.now;
     let request = Tlv::SeqnoRequest {
         ae: Ae::Ipv6,
         plen: 64,
@@ -2302,7 +2302,7 @@ async fn requests_are_handled_after_route_selection() {
     };
     net.inject(9, 0, &retract_and_ask(request));
     assert_eq!(net.fib(0, p), Some(Fib::Unreachable));
-    net.run_for(Duration::from_secs(1)).await;
+    net.run_for(Duration::from_secs(1));
     for to in [8, 9] {
         assert_eq!(requests_sent(&net, 0, to, start), [(42, 2, 64)]);
     }
@@ -2319,7 +2319,7 @@ fn seqno_request(prefix: Ipv6Net, router_id: u64, seqno: u16, hop_count: u8) -> 
         router_id: RouterId::new(router_id).unwrap(),
         prefix: prefix.addr().octets(),
     }));
-    encoder.finalize().to_vec()
+    encoder.finalize().as_bytes().to_vec()
 }
 
 /// Returns the seqno requests that node `from` sent to node `to` since `start`, each with
@@ -2364,7 +2364,7 @@ fn requests_sent(net: &Net, from: usize, to: usize, start: Instant) -> Vec<(u64,
 /// Sets up node 0 with a local prefix, a route to P through neighbour 9 (router-id 42,
 /// seqno 10, metric 196), and neighbours 7 and 8, all outside the simulation. Returns the
 /// local prefix, P and neighbour 9, which has just sent a Hello, between periodic dumps.
-async fn seqno_net() -> (Net, Ipv6Net, Ipv6Net, Scripted) {
+fn seqno_net() -> (Net, Ipv6Net, Ipv6Net, Scripted) {
     let local = prefix("fd00::/64");
     let p = prefix("fd00:9::/64");
 
@@ -2376,7 +2376,7 @@ async fn seqno_net() -> (Net, Ipv6Net, Ipv6Net, Scripted) {
     let mut n9 = Scripted::new(9);
     n9.send(&mut net, 0, &[update(p, 42, 10, 100, 0x8000)]);
     for _ in 0..5 {
-        net.run_for(Duration::from_secs(4)).await;
+        net.run_for(Duration::from_secs(4));
         n9.send(&mut net, 0, &[]);
     }
     assert_eq!(net.fib(0, p), Some(Fib::Via(9)));
@@ -2389,10 +2389,10 @@ type Answers = (Vec<(usize, Update)>, Vec<(usize, (u64, u16, u8))>);
 
 /// Sends node 0 a packet from node `from`, returning what node 0 sends neighbours 7, 8 and
 /// 9 within the urgent timeout of 0.2 s.
-async fn ask(net: &mut Net, from: usize, buf: &[u8]) -> Answers {
-    let start = Instant::now();
+fn ask(net: &mut Net, from: usize, buf: &[u8]) -> Answers {
+    let start = net.now;
     net.inject(from, 0, buf);
-    net.run_for(Duration::from_millis(200)).await;
+    net.run_for(Duration::from_millis(200));
 
     let mut answers = Answers::default();
     for to in [7, 8, 9] {
@@ -2404,9 +2404,9 @@ async fn ask(net: &mut Net, from: usize, buf: &[u8]) -> Answers {
     answers
 }
 
-#[tokio::test(start_paused = true)]
-async fn seqno_requests_are_answered_or_forwarded() {
-    let (mut net, local, p, _) = seqno_net().await;
+#[test]
+fn seqno_requests_are_answered_or_forwarded() {
+    let (mut net, local, p, _) = seqno_net();
     let other = prefix("fd00:77::/64");
     let seqno = net.nodes[0].seqno.get();
     let interval = 1600;
@@ -2415,46 +2415,37 @@ async fn seqno_requests_are_answered_or_forwarded() {
     // seqno by only 1 (RFC 8966 §3.8.1.2), and send the requester an update as an urgent TLV.
     let answer = (7, update(local, 1, seqno.wrapping_add(1), 0, interval));
     let request = seqno_request(local, 1, seqno.wrapping_add(5), 64);
-    assert_eq!(
-        ask(&mut net, 7, &request).await,
-        (vec![answer.clone()], vec![])
-    );
+    assert_eq!(ask(&mut net, 7, &request), (vec![answer.clone()], vec![]));
     assert_eq!(net.nodes[0].seqno.get(), seqno.wrapping_add(1));
 
     // So does a request that its seqno already satisfies, without the increase.
     let request = seqno_request(local, 1, seqno.wrapping_add(1), 64);
-    assert_eq!(ask(&mut net, 7, &request).await, (vec![answer], vec![]));
+    assert_eq!(ask(&mut net, 7, &request), (vec![answer], vec![]));
 
     // A request for a route that node 0 advertises is answered with that route, if the
     // seqno satisfies it, or if the router-ids differ.
     let answer = (7, update(p, 42, 10, 196, interval));
     for request in [seqno_request(p, 42, 10, 64), seqno_request(p, 99, 1, 64)] {
-        assert_eq!(
-            ask(&mut net, 7, &request).await,
-            (vec![answer.clone()], vec![])
-        );
+        assert_eq!(ask(&mut net, 7, &request), (vec![answer.clone()], vec![]));
     }
 
     // Otherwise, it is forwarded as an urgent TLV to the next hop, with its hop count
     // decremented, unless the hop count is 1, or the only next hop is the requester.
     let request = seqno_request(p, 42, 11, 3);
-    assert_eq!(
-        ask(&mut net, 7, &request).await,
-        (vec![], vec![(9, (42, 11, 2))])
-    );
+    assert_eq!(ask(&mut net, 7, &request), (vec![], vec![(9, (42, 11, 2))]));
     let request = seqno_request(p, 42, 12, 1);
-    assert_eq!(ask(&mut net, 7, &request).await, Answers::default());
+    assert_eq!(ask(&mut net, 7, &request), Answers::default());
     let request = seqno_request(p, 42, 12, 3);
-    assert_eq!(ask(&mut net, 9, &request).await, Answers::default());
+    assert_eq!(ask(&mut net, 9, &request), Answers::default());
 
     // A request for an unknown prefix is ignored.
     let request = seqno_request(other, 42, 1, 3);
-    assert_eq!(ask(&mut net, 7, &request).await, Answers::default());
+    assert_eq!(ask(&mut net, 7, &request), Answers::default());
 }
 
-#[tokio::test(start_paused = true)]
-async fn seqno_requests_for_much_larger_seqnos_are_ignored() {
-    let (mut net, local, _, _) = seqno_net().await;
+#[test]
+fn seqno_requests_for_much_larger_seqnos_are_ignored() {
+    let (mut net, local, _, _) = seqno_net();
     let seqno = net.nodes[0].seqno.get();
     let interval = 1600;
 
@@ -2462,17 +2453,17 @@ async fn seqno_requests_for_much_larger_seqnos_are_ignored() {
     // likely comes from a seqno it has lost, and cannot be satisfied by raising its seqno
     // by 1, so it is ignored, as in babeld.
     let request = seqno_request(local, 1, seqno.wrapping_add(101), 64);
-    assert_eq!(ask(&mut net, 7, &request).await, Answers::default());
+    assert_eq!(ask(&mut net, 7, &request), Answers::default());
     assert_eq!(net.nodes[0].seqno.get(), seqno);
 
     // One exceeding it by at most 100 is answered as usual.
     let answer = (7, update(local, 1, seqno.wrapping_add(1), 0, interval));
     let request = seqno_request(local, 1, seqno.wrapping_add(100), 64);
-    assert_eq!(ask(&mut net, 7, &request).await, (vec![answer], vec![]));
+    assert_eq!(ask(&mut net, 7, &request), (vec![answer], vec![]));
 }
 
-#[tokio::test(start_paused = true)]
-async fn seqno_requests_are_forwarded_along_the_selected_route() {
+#[test]
+fn seqno_requests_are_forwarded_along_the_selected_route() {
     let p = prefix("fd00:9::/64");
 
     let mut net = Net::new(1);
@@ -2493,29 +2484,22 @@ async fn seqno_requests_are_forwarded_along_the_selected_route() {
         8,
         from_ref(&near),
         from_ref(&far),
-    )
-    .await;
+    );
     assert_eq!(net.fib(0, p), Some(Fib::Via(9)));
 
     // A request from neighbour 7 is forwarded to neighbour 9, the next hop of the selected
     // route, rather than to neighbour 8, whose route has the smallest metric. A reply then
     // updates the selected route, and is forwarded on as an urgent TLV (RFC 8966 §3.8.1.2).
     let request = seqno_request(p, 42, 2, 3);
-    assert_eq!(
-        ask(&mut net, 7, &request).await,
-        (vec![], vec![(9, (42, 2, 2))])
-    );
+    assert_eq!(ask(&mut net, 7, &request), (vec![], vec![(9, (42, 2, 2))]));
 
     // A request from neighbour 9 itself is forwarded to neighbour 8 instead.
     let request = seqno_request(p, 42, 3, 3);
-    assert_eq!(
-        ask(&mut net, 9, &request).await,
-        (vec![], vec![(8, (42, 3, 2))])
-    );
+    assert_eq!(ask(&mut net, 9, &request), (vec![], vec![(8, (42, 3, 2))]));
 }
 
-#[tokio::test(start_paused = true)]
-async fn seqno_requests_are_not_forwarded_over_failed_links() {
+#[test]
+fn seqno_requests_are_not_forwarded_over_failed_links() {
     let p = prefix("fd00:9::/64");
 
     let mut net = Net::new(1);
@@ -2534,7 +2518,7 @@ async fn seqno_requests_are_not_forwarded_over_failed_links() {
         for (n, update) in neighbours.iter_mut().zip(&updates).rev() {
             n.send(&mut net, 0, if round == 0 { from_ref(update) } else { &[] });
         }
-        net.run_for(Duration::from_secs(4)).await;
+        net.run_for(Duration::from_secs(4));
     }
     assert_eq!(net.fib(0, p), Some(Fib::Via(9)));
     let route = net.nodes[0].route_table.prefix_entries[&p]
@@ -2546,14 +2530,11 @@ async fn seqno_requests_are_not_forwarded_over_failed_links() {
     // neighbour 8, whose route is unfeasible, rather than to neighbour 7, whose route is
     // feasible, but whose link has failed (RFC 8966 §3.8.1.2).
     let request = seqno_request(p, 42, 2, 3);
-    assert_eq!(
-        ask(&mut net, 9, &request).await,
-        (vec![], vec![(8, (42, 2, 2))])
-    );
+    assert_eq!(ask(&mut net, 9, &request), (vec![], vec![(8, (42, 2, 2))]));
 }
 
-#[tokio::test(start_paused = true)]
-async fn replies_are_forwarded_urgently_when_a_requesters_retraction_is_late() {
+#[test]
+fn replies_are_forwarded_urgently_when_a_requesters_retraction_is_late() {
     let p = prefix("fd00:9::/64");
     let far = update(p, 42, 1, 150, 0x8000);
     let near = update(p, 42, 1, 100, 0x8000);
@@ -2566,11 +2547,11 @@ async fn replies_are_forwarded_urgently_when_a_requesters_retraction_is_late() {
         // comes first. Node 0 still routes through neighbour 9, so it forwards the request
         // along the route through neighbour 8, which it selects once the retraction comes
         // (RFC 8966 §3.8.1.2).
-        let (mut net, mut n8, mut n9) = two_routes(&far, &near).await;
-        net.run_for(Duration::from_secs(2)).await;
-        let start = Instant::now();
+        let (mut net, mut n8, mut n9) = two_routes(&far, &near);
+        net.run_for(Duration::from_secs(2));
+        let start = net.now;
         net.inject(9, 0, &seqno_request(p, 42, 2, 64));
-        net.run_for(Duration::from_millis(200)).await;
+        net.run_for(Duration::from_millis(200));
         assert_eq!(requests_sent(&net, 0, 8, start), [(42, 2, 63)]);
 
         // Whichever of neighbour 8's reply and neighbour 9's retraction comes first, nothing
@@ -2582,17 +2563,17 @@ async fn replies_are_forwarded_urgently_when_a_requesters_retraction_is_late() {
         } else {
             n9.send(&mut net, 0, from_ref(&retraction));
         }
-        net.run_for(Duration::from_millis(500)).await;
+        net.run_for(Duration::from_millis(500));
         assert_eq!(updates_sent(&net, 0, 9, start), []);
 
-        let last = Instant::now();
+        let last = net.now;
         if reply_first {
             n9.send(&mut net, 0, from_ref(&retraction));
         } else {
             n8.send(&mut net, 0, from_ref(&reply));
         }
         assert_eq!(net.fib(0, p), Some(Fib::Via(8)));
-        net.run_for(Duration::from_millis(125)).await;
+        net.run_for(Duration::from_millis(125));
         assert_eq!(
             updates_sent(&net, 0, 9, last),
             [update(p, 42, 2, 246, 1600)]
@@ -2600,44 +2581,44 @@ async fn replies_are_forwarded_urgently_when_a_requesters_retraction_is_late() {
     }
 }
 
-#[tokio::test(start_paused = true)]
-async fn redundant_seqno_requests_are_not_forwarded() {
-    let (mut net, _, p, _) = seqno_net().await;
-    let start = Instant::now();
+#[test]
+fn redundant_seqno_requests_are_not_forwarded() {
+    let (mut net, _, p, _) = seqno_net();
+    let start = net.now;
 
     // A request from neighbour 7 is forwarded to neighbour 9.
     net.inject(7, 0, &seqno_request(p, 42, 11, 3));
-    net.run_for(Duration::from_millis(500)).await;
+    net.run_for(Duration::from_millis(500));
 
     // The same request from neighbour 8 within 1 s is redundant, and is not forwarded
     // (RFC 8966 §3.8.1.2). One with a newer seqno is.
     net.inject(8, 0, &seqno_request(p, 42, 11, 3));
     net.inject(8, 0, &seqno_request(p, 42, 12, 3));
-    net.run_for(Duration::from_millis(1100)).await;
+    net.run_for(Duration::from_millis(1100));
 
     // After 1 s, the same request is forwarded again, since its originator may resend it
     // after the initial request timeout of 2 s, in case it was lost.
     net.inject(7, 0, &seqno_request(p, 42, 12, 3));
-    net.run_for(Duration::from_millis(500)).await;
+    net.run_for(Duration::from_millis(500));
 
     let requests = [(42, 11, 2), (42, 12, 2), (42, 12, 2)];
     assert_eq!(requests_sent(&net, 0, 9, start), requests);
 }
 
-#[tokio::test(start_paused = true)]
-async fn satisfying_updates_are_forwarded_urgently() {
-    let (mut net, _, p, mut n9) = seqno_net().await;
+#[test]
+fn satisfying_updates_are_forwarded_urgently() {
+    let (mut net, _, p, mut n9) = seqno_net();
     let interval = 1600;
 
     // Node 0 forwards a request from neighbour 7 to neighbour 9.
     net.inject(7, 0, &seqno_request(p, 42, 11, 3));
-    net.run_for(Duration::from_millis(500)).await;
+    net.run_for(Duration::from_millis(500));
 
     // An update from neighbour 9 satisfies it, so node 0 forwards it as an urgent TLV
     // (RFC 8966 §3.8.1.2), to every neighbour but neighbour 9, by split horizon.
-    let start = Instant::now();
+    let start = net.now;
     n9.send(&mut net, 0, &[update(p, 42, 11, 100, 0x8000)]);
-    net.run_for(Duration::from_millis(200)).await;
+    net.run_for(Duration::from_millis(200));
     for to in [7, 8] {
         assert_eq!(
             updates_sent(&net, 0, to, start),
@@ -2647,20 +2628,20 @@ async fn satisfying_updates_are_forwarded_urgently() {
 
     // A newer seqno that satisfies no request waits for the next periodic update, since a
     // node SHOULD NOT send triggered updates to propagate a new seqno (RFC 8966 §3.7.2).
-    let start = Instant::now();
+    let start = net.now;
     n9.send(&mut net, 0, &[update(p, 42, 12, 100, 0x8000)]);
-    net.run_for(Duration::from_secs(2)).await;
+    net.run_for(Duration::from_secs(2));
     assert_eq!(updates_sent(&net, 0, 7, start), []);
 }
 
-#[tokio::test(start_paused = true)]
-async fn lost_routes_are_requested_from_every_neighbour() {
+#[test]
+fn lost_routes_are_requested_from_every_neighbour() {
     let p = prefix("fd00:9::/64");
     // Node 0 advertises P with metric 196 through neighbour 9, so the route through
     // neighbour 8 is unfeasible.
     let far = update(p, 42, 1, 500, 0x8000);
     let near = update(p, 42, 1, 100, 0x8000);
-    let (mut net, mut n8, mut n9) = two_routes(&far, &near).await;
+    let (mut net, mut n8, mut n9) = two_routes(&far, &near);
     assert_eq!(net.fib(0, p), Some(Fib::Via(9)));
 
     // Neighbour 9 retracts P. Node 0 has lost all feasible routes but an unfeasible one,
@@ -2668,18 +2649,18 @@ async fn lost_routes_are_requested_from_every_neighbour() {
     // in the source table plus 1, and SHOULD resend it if no route becomes feasible (RFC
     // 8966 §3.8.2.1): to every neighbour, 2, 6 and 14 s later (Appendix B), each as an
     // urgent TLV within 0.2 s after being due.
-    let start = Instant::now();
+    let start = net.now;
     let retraction = update(p, 42, 1, METRIC_INFINITY, 0x8000);
-    exchange(&mut net, &mut n8, &mut n9, 4, &[], from_ref(&retraction)).await;
+    exchange(&mut net, &mut n8, &mut n9, 4, &[], from_ref(&retraction));
     assert_eq!(net.fib(0, p), Some(Fib::Unreachable));
 
     // Neighbour 8 refreshes its unfeasible route 4, 8 and 12 s in. Each refresh also prompts
     // a request to it, as the route would be selected were it feasible (§3.8.2.2, Erratum
     // 7373). These requests are not recorded, so the resends go on.
     for _ in 0..3 {
-        exchange(&mut net, &mut n8, &mut n9, 4, from_ref(&far), &[]).await;
+        exchange(&mut net, &mut n8, &mut n9, 4, from_ref(&far), &[]);
     }
-    exchange(&mut net, &mut n8, &mut n9, 24, &[], &[]).await;
+    exchange(&mut net, &mut n8, &mut n9, 24, &[], &[]);
     for (to, due) in [(8, &[0, 2, 4, 6, 8, 12, 14][..]), (9, &[0, 2, 6, 14])] {
         assert_eq!(
             requests_sent(&net, 0, to, start),
@@ -2693,8 +2674,8 @@ async fn lost_routes_are_requested_from_every_neighbour() {
     }
 }
 
-#[tokio::test(start_paused = true)]
-async fn requested_routes_are_announced_urgently_and_end_resends() {
+#[test]
+fn requested_routes_are_announced_urgently_and_end_resends() {
     let p = prefix("fd00:9::/64");
     let far = update(p, 42, 1, 500, 0x8000);
     let near = update(p, 42, 1, 100, 0x8000);
@@ -2702,36 +2683,36 @@ async fn requested_routes_are_announced_urgently_and_end_resends() {
     // Neighbour 8 announces seqno 2, or router-id 43. Either makes its route feasible, and
     // satisfies the request (RFC 8966 §4.6.11).
     for regained in [update(p, 42, 2, 500, 0x8000), update(p, 43, 1, 500, 0x8000)] {
-        let (mut net, mut n8, mut n9) = two_routes(&far, &near).await;
+        let (mut net, mut n8, mut n9) = two_routes(&far, &near);
 
         // As above, node 0 loses P, and requests seqno 2 for router-id 42.
         let retraction = update(p, 42, 1, METRIC_INFINITY, 0x8000);
-        exchange(&mut net, &mut n8, &mut n9, 4, &[], from_ref(&retraction)).await;
+        exchange(&mut net, &mut n8, &mut n9, 4, &[], from_ref(&retraction));
         assert_eq!(net.fib(0, p), Some(Fib::Unreachable));
 
         // Node 0 selects the route, which satisfies the request, so the request is dropped
         // at once. Node 0 announces the route as an urgent TLV, to neighbour 9 only, by split
         // horizon, and no longer resends the request.
-        let start = Instant::now();
+        let start = net.now;
         n8.send(&mut net, 0, from_ref(&regained));
         assert_eq!(net.fib(0, p), Some(Fib::Via(8)));
         assert!(!net.nodes[0].seqno_request_table.contains_key(&p));
-        net.run_for(Duration::from_millis(200)).await;
+        net.run_for(Duration::from_millis(200));
         let announced = Update {
             metric: 596,
             interval: Interval::new(1600).unwrap(),
             ..regained
         };
         assert_eq!(updates_sent(&net, 0, 9, start), [announced]);
-        exchange(&mut net, &mut n8, &mut n9, 40, &[], &[]).await;
+        exchange(&mut net, &mut n8, &mut n9, 40, &[], &[]);
         for to in [8, 9] {
             assert_eq!(requests_sent(&net, 0, to, start), []);
         }
     }
 }
 
-#[tokio::test(start_paused = true)]
-async fn requests_are_satisfied_by_another_router_id_after_the_hold() {
+#[test]
+fn requests_are_satisfied_by_another_router_id_after_the_hold() {
     let p = prefix("fd00:9::/64");
     let near = update(p, 42, 1, 100, 0x8000);
     let far = update(p, 42, 1, 500, 0x8000);
@@ -2745,30 +2726,30 @@ async fn requests_are_satisfied_by_another_router_id_after_the_hold() {
         let mut params = Params::new();
         params.set_hello_interval(Interval::new(100).unwrap());
         let mut net = Net::new(1);
-        net.nodes[0] = State::new(params, RouterId::new(1).unwrap(), None);
+        net.nodes[0] = State::new(net.now, params, RouterId::new(1).unwrap(), None);
         net.add_neighbour(0, 8);
         net.add_neighbour(0, 9);
         let (mut n8, mut n9) = (Scripted::new(8), Scripted::new(9));
         let updates8: &[Update] = if unfeasible { from_ref(&far) } else { &[] };
-        exchange(&mut net, &mut n8, &mut n9, 20, updates8, from_ref(&near)).await;
+        exchange(&mut net, &mut n8, &mut n9, 20, updates8, from_ref(&near));
         assert_eq!(net.fib(0, p), Some(Fib::Via(9)));
 
         // Neighbour 9 retracts P, and node 0 requests seqno 2 for router-id 42. 20 s later,
         // the hold has expired, but the request is still pending.
         let retraction = update(p, 42, 1, METRIC_INFINITY, 0x8000);
-        exchange(&mut net, &mut n8, &mut n9, 4, &[], from_ref(&retraction)).await;
-        exchange(&mut net, &mut n8, &mut n9, 16, &[], &[]).await;
+        exchange(&mut net, &mut n8, &mut n9, 4, &[], from_ref(&retraction));
+        exchange(&mut net, &mut n8, &mut n9, 16, &[], &[]);
         assert_eq!(net.fib(0, p), None);
 
         // Neighbour 8 then announces P with router-id 43, which satisfies the request (RFC
         // 8966 §4.6.11), although the advertisement for router-id 42 is gone, so the request
         // is dropped. Node 0 announces the route as an urgent TLV, within 0.125 s, to neighbour
         // 9 only, by split horizon.
-        let regain = Instant::now();
+        let regain = net.now;
         n8.send(&mut net, 0, from_ref(&other));
         assert_eq!(net.fib(0, p), Some(Fib::Via(8)));
         assert!(!net.nodes[0].seqno_request_table.contains_key(&p));
-        net.run_for(Duration::from_millis(125)).await;
+        net.run_for(Duration::from_millis(125));
         let announced = Update {
             metric: 596,
             interval: Interval::new(400).unwrap(),
@@ -2778,59 +2759,59 @@ async fn requests_are_satisfied_by_another_router_id_after_the_hold() {
     }
 }
 
-#[tokio::test(start_paused = true)]
-async fn requests_are_not_resent_once_a_route_is_selected() {
+#[test]
+fn requests_are_not_resent_once_a_route_is_selected() {
     let p = prefix("fd00:9::/64");
     let far = update(p, 42, 1, 500, 0x8000);
     let near = update(p, 42, 1, 100, 0x8000);
-    let (mut net, mut n8, mut n9) = two_routes(&far, &near).await;
+    let (mut net, mut n8, mut n9) = two_routes(&far, &near);
 
     // As above, node 0 loses P, and requests seqno 2 for router-id 42.
     let retraction = update(p, 42, 1, METRIC_INFINITY, 0x8000);
-    exchange(&mut net, &mut n8, &mut n9, 4, &[], from_ref(&retraction)).await;
+    exchange(&mut net, &mut n8, &mut n9, 4, &[], from_ref(&retraction));
     assert_eq!(net.fib(0, p), Some(Fib::Unreachable));
 
     // Neighbour 8 then announces P with metric 50, below the 196 that node 0 advertised.
     // This makes its route feasible, though it does not satisfy the request, with the same
     // router-id and seqno. Node 0 selects it, and keeps the request until its timer expires,
     // but no longer resends it.
-    let start = Instant::now();
+    let start = net.now;
     n8.send(&mut net, 0, &[update(p, 42, 1, 50, 0x8000)]);
     assert_eq!(net.fib(0, p), Some(Fib::Via(8)));
     assert!(net.nodes[0].seqno_request_table.contains_key(&p));
-    exchange(&mut net, &mut n8, &mut n9, 40, &[], &[]).await;
+    exchange(&mut net, &mut n8, &mut n9, 40, &[], &[]);
     assert_eq!(net.fib(0, p), Some(Fib::Via(8)));
     for to in [8, 9] {
         assert_eq!(requests_sent(&net, 0, to, start), []);
     }
 }
 
-#[tokio::test(start_paused = true)]
-async fn own_requests_stop_suppressing_forwarding_once_a_route_is_selected() {
+#[test]
+fn own_requests_stop_suppressing_forwarding_once_a_route_is_selected() {
     let p = prefix("fd00:9::/64");
     let far = update(p, 42, 1, 500, 0x8000);
     let near = update(p, 42, 1, 100, 0x8000);
-    let (mut net, mut n8, mut n9) = two_routes(&far, &near).await;
+    let (mut net, mut n8, mut n9) = two_routes(&far, &near);
 
     // As above, node 0 loses P, requests seqno 2 for router-id 42, and resends the request
     // 2 s later. Neighbour 8 then makes its route feasible without satisfying the request,
     // and node 0 selects it, so the request will not be resent again.
     n9.send(&mut net, 0, &[update(p, 42, 1, METRIC_INFINITY, 0x8000)]);
-    net.run_for(Duration::from_millis(2500)).await;
+    net.run_for(Duration::from_millis(2500));
     n8.send(&mut net, 0, &[update(p, 42, 1, 50, 0x8000)]);
     assert_eq!(net.fib(0, p), Some(Fib::Via(8)));
-    net.run_for(Duration::from_millis(1500)).await;
+    net.run_for(Duration::from_millis(1500));
 
     // So a request from neighbour 9 for the same seqno, 2 s after the resend, is not
     // redundant, and node 0 forwards it to neighbour 8 (RFC 8966 §3.8.1.2).
-    let start = Instant::now();
+    let start = net.now;
     net.inject(9, 0, &seqno_request(p, 42, 2, 3));
-    net.run_for(Duration::from_millis(200)).await;
+    net.run_for(Duration::from_millis(200));
     assert_eq!(requests_sent(&net, 0, 8, start), [(42, 2, 2)]);
 }
 
-#[tokio::test(start_paused = true)]
-async fn lost_routes_are_regained_through_seqno_requests() {
+#[test]
+fn lost_routes_are_regained_through_seqno_requests() {
     let p = prefix("fd00:2::/64");
 
     // Node 0 reaches node 2 through node 1, and once connected to node 3, also through
@@ -2841,9 +2822,9 @@ async fn lost_routes_are_regained_through_seqno_requests() {
         net.connect(a, b, Duration::from_millis(10));
     }
     net.originate(2, p);
-    net.run_for(Duration::from_secs(60)).await;
+    net.run_for(Duration::from_secs(60));
     net.connect(0, 3, Duration::from_millis(10));
-    net.run_for(Duration::from_secs(60)).await;
+    net.run_for(Duration::from_secs(60));
     assert_eq!(net.path(0, p.addr()), [0, 1, 2]);
 
     // The link between nodes 0 and 1 fails. Once node 0 notices, it holds P, and sends a
@@ -2855,7 +2836,7 @@ async fn lost_routes_are_regained_through_seqno_requests() {
     let changes = net.fib_changes.len();
     net.links.remove(&(0, 1));
     net.links.remove(&(1, 0));
-    net.run_for(Duration::from_secs(30)).await;
+    net.run_for(Duration::from_secs(30));
     assert_eq!(net.path(0, p.addr()), [0, 3, 4, 2]);
 
     let changes: Vec<_> = (net.fib_changes[changes..].iter())
@@ -2869,8 +2850,8 @@ async fn lost_routes_are_regained_through_seqno_requests() {
     assert!(regained.time - held.time <= Duration::from_secs(1));
 }
 
-#[tokio::test(start_paused = true)]
-async fn ending_a_hold_is_announced_urgently() {
+#[test]
+fn ending_a_hold_is_announced_urgently() {
     let p = prefix("fd00::/64");
 
     for flap in [true, false] {
@@ -2881,7 +2862,7 @@ async fn ending_a_hold_is_announced_urgently() {
             net.connect(a, b, Duration::from_millis(10));
         }
         net.originate(0, p);
-        net.run_for(Duration::from_secs(60)).await;
+        net.run_for(Duration::from_secs(60));
         let changes = net.fib_changes.len();
         let latency = net.links.remove(&(0, 1)).unwrap();
         net.links.remove(&(1, 0));
@@ -2890,16 +2871,16 @@ async fn ending_a_hold_is_announced_urgently() {
         // connected 40 s after the failure, once its request for a new seqno has expired.
         // Neither need satisfy that request.
         if flap {
-            net.run_for(Duration::from_secs(15)).await;
+            net.run_for(Duration::from_secs(15));
             assert_eq!(net.fib(4, p), Some(Fib::Unreachable));
             net.links.insert((0, 1), latency);
             net.links.insert((1, 0), latency);
         } else {
-            net.run_for(Duration::from_secs(40)).await;
+            net.run_for(Duration::from_secs(40));
             assert_eq!(net.fib(4, p), Some(Fib::Unreachable));
             net.connect(1, 5, Duration::from_millis(10));
         }
-        net.run_for(Duration::from_secs(60)).await;
+        net.run_for(Duration::from_secs(60));
         let path: &[usize] = if flap {
             &[4, 3, 2, 1, 0]
         } else {
@@ -2922,24 +2903,24 @@ async fn ending_a_hold_is_announced_urgently() {
     }
 }
 
-#[tokio::test(start_paused = true)]
-async fn newly_reachable_prefixes_are_announced_urgently() {
+#[test]
+fn newly_reachable_prefixes_are_announced_urgently() {
     let q = prefix("fd00:99::/64");
 
     // Nodes 0 to 5 form a chain, along which node 0 starts originating Q. Node 1 first learns
-    // of it from node 0's next periodic update (see `State::add_local_route`).
+    // of it from node 0's next periodic update (see `State::inject_route`).
     let mut net = Net::new(6);
     for i in 0..5 {
         net.connect(i, i + 1, Duration::from_millis(10));
     }
-    net.run_for(Duration::from_secs(60)).await;
+    net.run_for(Duration::from_secs(60));
     net.originate(0, q);
     let mut reached = [None; 6];
     for _ in 0..800 {
-        net.run_for(Duration::from_millis(25)).await;
+        net.run_for(Duration::from_millis(25));
         for (i, reached) in reached.iter_mut().enumerate().skip(1) {
             if reached.is_none() && net.delivered_to(i, q.addr()) == Some(0) {
-                *reached = Some(Instant::now());
+                *reached = Some(net.now);
             }
         }
     }

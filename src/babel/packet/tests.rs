@@ -1,10 +1,11 @@
 use std::{
     net::{Ipv4Addr, Ipv6Addr},
     num::NonZeroU8,
+    time::Instant,
 };
 
 use super::*;
-use crate::babel::base::Ae::*;
+use crate::babel::base::{Ae::*, timestamp};
 
 const P: u8 = 0x80;
 const R: u8 = 0x40;
@@ -142,7 +143,7 @@ fn encode_updates(updates: &[Update]) -> Vec<u8> {
     for update in updates {
         assert!(encoder.put_update(update));
     }
-    encoder.finalize().to_vec()
+    encoder.finalize().as_bytes().to_vec()
 }
 
 /// Decodes the updates in a packet, skipping the Router-Id TLVs put along with them.
@@ -529,14 +530,17 @@ fn put_update_puts_nothing_if_not_all_fits() {
     assert!((13..25).contains(&encoder.remaining()));
     // The failed put leaves the parser state as is, so retrying fails likewise.
     assert!(!encoder.put_update(&rejected));
-    assert_eq!(decode_updates(encoder.finalize()), put);
+    assert_eq!(decode_updates(encoder.finalize().as_bytes()), put);
 
     // The parser state is reset for the next packet.
     encoder.clear();
     let last = put.last().unwrap().clone();
     assert!(encoder.put_update(&last));
     assert!(encoder.put_update(&rejected));
-    assert_eq!(decode_updates(encoder.finalize()), [last, rejected]);
+    assert_eq!(
+        decode_updates(encoder.finalize().as_bytes()),
+        [last, rejected]
+    );
 }
 
 fn hello(transmit_timestamp: Option<u32>) -> Tlv {
@@ -559,20 +563,6 @@ fn ihu(origin_receive_timestamps: Option<(u32, u32)>) -> Tlv {
 
 /// Decodes a packet carrying a timestamped Hello, returning the Hello's
 /// transmit timestamp and the items.
-fn decode_timestamped(packet: &[u8]) -> (u32, Vec<Item>) {
-    let items = decode(packet);
-    let t = items
-        .iter()
-        .find_map(|item| match item {
-            Ok(PacketItem::Tlv(Tlv::Hello {
-                transmit_timestamp, ..
-            })) => Some(transmit_timestamp.expect("Hello should be timestamped")),
-            _ => None,
-        })
-        .expect("packet should carry a Hello");
-    (t, items)
-}
-
 fn items(tlvs: impl IntoIterator<Item = Tlv>) -> Vec<Item> {
     tlvs.into_iter()
         .map(|tlv| Ok(PacketItem::Tlv(tlv)))
@@ -600,30 +590,24 @@ fn put_tlv_fills_packet_exactly() {
     }
 
     let packet = encoder.finalize();
-    assert_eq!(packet.len(), 512);
-    let (t, decoded) = decode_timestamped(packet);
-    put[0] = hello(Some(t));
-    assert_eq!(decoded, items(put));
+    assert_eq!(packet.as_bytes().len(), 512);
+    assert_eq!(decode(packet.as_bytes()), items(put));
 }
 
 #[test]
-fn finalize_timestamps_hello() {
+fn packets_are_timestamped_as_sent() {
     let ack = Tlv::Acknowledgement { opaque: 1 };
+    let at = Instant::now();
 
-    // The Transmit Timestamp put is a placeholder, and a timestamped IHU
-    // may follow the Hello it is put along with.
+    // The Transmit Timestamp put is a placeholder, filled in as the packet is sent, and a
+    // timestamped IHU may follow the Hello it is put along with.
     let mut encoder = PacketEncoder::new(512);
     assert!(encoder.put_tlv(&ack));
     assert!(encoder.put_tlvs(&[Tlv::Pad1, hello(Some(0)), ihu(Some((1, 2)))]));
-
-    let before = timestamp_now();
-    let (t, decoded) = decode_timestamped(encoder.finalize());
-    // Timestamps wrap, so compare them by their difference.
-    assert!(t.wrapping_sub(before).cast_signed() >= 0);
-    assert_eq!(
-        decoded,
-        items([ack, Tlv::Pad1, hello(Some(t)), ihu(Some((1, 2)))])
-    );
+    let mut packet = encoder.finalize();
+    let tlvs = |t| items([ack.clone(), Tlv::Pad1, hello(Some(t)), ihu(Some((1, 2)))]);
+    assert_eq!(decode(packet.as_bytes()), tlvs(0));
+    assert_eq!(decode(packet.timestamp(at)), tlvs(timestamp(at)));
 
     // Each packet may carry a Hello, and a timestamped IHU may be put after it,
     // but not another Hello.
@@ -631,20 +615,25 @@ fn finalize_timestamps_hello() {
     assert!(encoder.put_tlv(&hello(Some(0))));
     assert!(encoder.put_tlv(&ihu(Some((3, 4)))));
     assert!(!encoder.put_tlvs(&[Tlv::Pad1, hello(None)]));
-    let (t, decoded) = decode_timestamped(encoder.finalize());
-    assert_eq!(decoded, items([hello(Some(t)), ihu(Some((3, 4)))]));
+    assert_eq!(
+        decode(encoder.finalize().timestamp(at)),
+        items([hello(Some(timestamp(at))), ihu(Some((3, 4)))])
+    );
 
     // A Hello without a timestamp is left as is, and an untimestamped IHU needs no timestamped Hello.
     encoder.clear();
     assert!(encoder.put_tlvs(&[hello(None), ihu(None)]));
-    assert_eq!(decode(encoder.finalize()), items([hello(None), ihu(None)]));
+    assert_eq!(
+        decode(encoder.finalize().timestamp(at)),
+        items([hello(None), ihu(None)])
+    );
 
     // Nothing is timestamped if the Hello does not fit.
     encoder.clear();
     let padding = [Tlv::PadN { length: 250 }, Tlv::PadN { length: 250 }];
     assert!(encoder.put_tlvs(&padding));
     assert!(!encoder.put_tlv(&hello(Some(0))));
-    assert_eq!(decode(encoder.finalize()), items(padding));
+    assert_eq!(decode(encoder.finalize().timestamp(at)), items(padding));
 }
 
 macro_rules! put_tlvs_panics {

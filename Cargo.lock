@@ -240,7 +240,6 @@ dependencies = [
  "slotmap",
  "strum",
  "tokio",
- "tokio-util",
 ]
 
 [[package]]
@@ -968,7 +967,6 @@ dependencies = [
  "futures-core",
  "futures-sink",
  "pin-project-lite",
- "slab",
  "tokio",
 ]
 

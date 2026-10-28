@@ -1,6 +1,7 @@
 mod base;
 mod packet;
 mod params;
+mod timer;
 
 #[cfg(test)]
 mod tests;
@@ -13,22 +14,23 @@ use std::{
     mem,
     net::Ipv6Addr,
     num::NonZeroU8,
-    task::{Context, Poll},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use ipnet::Ipv6Net;
 use slotmap::{SecondaryMap, SlotMap, SparseSecondaryMap, sparse_secondary};
-use tokio::time::Instant;
-use tokio_util::time::{DelayQueue, delay_queue::Key as TimerKey};
 
 use crate::babel::{
-    base::{
-        Ae, COST_INFINITY, HelloEffect, HelloHistory, Interval, METRIC_INFINITY, RouterId, Seqno,
-        timestamp_now,
-    },
+    base::{Ae, COST_INFINITY, HelloEffect, HelloHistory, METRIC_INFINITY, timestamp},
     packet::{PacketDecoder, PacketEncoder, PacketItem, Update, tlv::Tlv},
-    params::{DurationKey, F64Key, IntervalKey, Params, U8Key},
+    params::{DurationKey, F64Key, IntervalKey, U8Key},
+    timer::{TimerKey, TimerQueue},
+};
+
+pub use crate::babel::{
+    base::{Interval, RouterId, Seqno},
+    packet::Packet,
+    params::Params,
 };
 
 /// How far the seqno of a seqno request may exceed its source's seqno for the source to
@@ -115,12 +117,12 @@ impl NeighEntry {
     /// Flushes the neighbour entry, except for the Hello history, which records
     /// the Hello, if any, that caused the flush, and the packet buffer, the TLVs
     /// in which, if any, are still to be sent.
-    fn flush(&mut self, timers: &mut DelayQueue<Timeout>) {
+    fn flush(&mut self, timers: &mut TimerQueue<Timer>) {
         if let Some(key) = self.hello_timer_key.take() {
-            timers.remove(&key);
+            timers.remove(key);
         }
         if let Some(key) = self.ihu_timer_key.take() {
-            timers.remove(&key);
+            timers.remove(key);
         }
         self.txcost = COST_INFINITY;
         self.last_hello_interval = None;
@@ -173,7 +175,7 @@ impl NeighEntry {
 
 /// Identifies a source of routing information (destination of data traffic).
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct SourceKey {
+struct SourceKey {
     prefix: Ipv6Net,
     router_id: RouterId,
 }
@@ -192,7 +194,7 @@ struct RouteEntry {
     metric: Cell<u16>,
     /// The smoothed metric at `metric_smoothed_at`, since when `metric` has not changed.
     metric_smoothed: Cell<f32>,
-    /// A timestamp, as returned by [`timestamp_now`].
+    /// A timestamp, as returned by [`timestamp`].
     metric_smoothed_at: Cell<u32>,
     seqno: Seqno,
     expiry_timer_key: TimerKey,
@@ -397,7 +399,7 @@ impl PacketBuf {
             "empty buffer should not be flushed"
         );
 
-        outputs.push_back(Output::Packet(key, self.encoder.finalize().into()));
+        outputs.push_back(Output::Packet(key, self.encoder.finalize()));
         self.encoder.clear();
     }
 
@@ -405,7 +407,7 @@ impl PacketBuf {
         &mut self,
         key: NeighKey,
         outputs: &mut VecDeque<Output>,
-        timers: &mut DelayQueue<Timeout>,
+        timers: &mut TimerQueue<Timer>,
         params: &Params,
         f: impl Fn(&mut PacketEncoder) -> bool,
     ) {
@@ -428,7 +430,7 @@ impl PacketBuf {
             // Encoding failed. The buffer is full. Flush it now.
             self.flush(key, outputs);
 
-            timers.reset(&self.flush_timer_key.unwrap(), timeout());
+            timers.reset(self.flush_timer_key.as_mut().unwrap(), timeout());
 
             assert!(
                 f(&mut self.encoder),
@@ -438,29 +440,29 @@ impl PacketBuf {
             // Encoding succeeded. The buffer was empty. Set a timer to flush it.
             assert!(self.flush_timer_key.is_none());
 
-            self.flush_timer_key = Some(timers.insert(Timeout::OutgoingPacket(key), timeout()));
+            self.flush_timer_key = Some(timers.insert(Timer::OutgoingPacket(key), timeout()));
         }
     }
 
-    fn schedule_flush(&mut self, timers: &mut DelayQueue<Timeout>, timeout: Duration) {
+    fn schedule_flush(&mut self, timers: &mut TimerQueue<Timer>, timeout: Duration) {
         if self.encoder.is_empty() {
             return;
         }
 
-        let key = self.flush_timer_key.unwrap();
+        let key = self.flush_timer_key.as_mut().unwrap();
 
         // Take half of the timeout and add some jitter as in `put`.
         let timeout = timeout.mul_f64(rand::random_range(0.375..=0.625));
-        let new_deadline = Instant::now() + timeout;
-        let deadline = timers.deadline(&key);
+        let new_deadline = timers.now() + timeout;
+        let deadline = timers.deadline(*key);
 
         if new_deadline < deadline {
-            timers.reset_at(&key, new_deadline);
+            timers.reset_at(key, new_deadline);
         }
     }
 }
 
-enum Timeout {
+enum Timer {
     OutgoingHello,
     OutgoingUpdate,
     IncomingHello(NeighKey),
@@ -475,7 +477,7 @@ enum Timeout {
 /// An output of a Babel router.
 pub enum Output {
     /// Sends a Babel packet to a neighbour.
-    Packet(NeighKey, Box<[u8]>),
+    Packet(NeighKey, Packet),
     /// Selects a neighbour as the next-hop router to a prefix.
     RouteSelect(Ipv6Net, NeighKey),
     /// Holds a prefix by installing an unreachable route.
@@ -485,6 +487,16 @@ pub enum Output {
 }
 
 /// The state of a Babel router.
+///
+/// # Time
+///
+/// `State` reads no clock. It is given the current time, `now`, as it is created, and by
+/// every method that may send a packet or set a timer, and [`State::poll_timeout`]
+/// returns when to call [`State::handle_timeout`] next. [`State::handle_packet`] also
+/// takes the time the packet arrived, as its receive timestamp (RFC 9616 §3.1), while a
+/// packet to send has its transmit timestamp left to be filled in just before it is sent
+/// (see [`Packet::timestamp`]). A `now` earlier than one given before is ignored, so that
+/// time never goes backward.
 ///
 /// # Reboots
 ///
@@ -531,10 +543,8 @@ pub struct State {
     route_table: RouteTable,
     seqno_request_table: HashMap<Ipv6Net, SeqnoRequestEntry>,
     outputs: VecDeque<Output>,
-    timers: DelayQueue<Timeout>,
-    /// The current timestamp, as returned by [`timestamp_now`],
-    /// taken as a packet or a timeout starts being handled.
-    /// For a packet, it is the receive timestamp (RFC 9616 §3.1).
+    timers: TimerQueue<Timer>,
+    /// The current time, as a timestamp (see [`timestamp`]).
     now: u32,
     // Temporary states for each received packet.
     /// The prefixes whose routes through the sender have been added, modified, or removed
@@ -542,18 +552,20 @@ pub struct State {
     updated_prefixes: Vec<Ipv6Net>,
     /// The route and seqno requests received, to be handled after route selection.
     requests: Vec<Tlv>,
+    /// The receive timestamp of the packet (RFC 9616 §3.1).
+    receive_timestamp: u32,
     hello_timestamp: Option<u32>,
     ihu_timestamps: Option<(u32, u32)>,
 }
 
 impl State {
-    /// Creates a new `State` with the given parameters, router-id, and seqno (if any).
-    /// Seqno defaults to a random one if not given.
-    pub fn new(params: Params, router_id: RouterId, seqno: Option<Seqno>) -> Self {
-        let mut timers = DelayQueue::new();
+    /// Creates a new `State` at `now`, with the given parameters, router-id, and seqno
+    /// (if any). Seqno defaults to a random one if not given.
+    pub fn new(now: Instant, params: Params, router_id: RouterId, seqno: Option<Seqno>) -> Self {
+        let mut timers = TimerQueue::new(now);
 
-        timers.insert(Timeout::OutgoingHello, Duration::ZERO);
-        timers.insert(Timeout::OutgoingUpdate, Duration::ZERO);
+        timers.insert(Timer::OutgoingHello, Duration::ZERO);
+        timers.insert(Timer::OutgoingUpdate, Duration::ZERO);
 
         let hellos_until_ihu = params.get_u8(U8Key::HellosPerIhu);
 
@@ -569,9 +581,10 @@ impl State {
             seqno_request_table: HashMap::new(),
             outputs: VecDeque::new(),
             timers,
-            now: 0,
+            now: timestamp(now),
             updated_prefixes: Vec::new(),
             requests: Vec::new(),
+            receive_timestamp: 0,
             hello_timestamp: None,
             ihu_timestamps: None,
         }
@@ -587,7 +600,9 @@ impl State {
     /// for example when node 1 adds node 2 after node 3 in the network of [Reboots].
     ///
     /// [Reboots]: State#reboots
-    pub fn add_neighbour(&mut self) -> NeighKey {
+    pub fn add_neighbour(&mut self, now: Instant) -> NeighKey {
+        self.set_now(now);
+
         let key = self.neigh_table.insert(NeighEntry::new(&self.params));
         self.route_table.neigh_prefixes.insert(key, HashSet::new());
 
@@ -619,7 +634,9 @@ impl State {
     /// this node's Hellos as missed every 0.1 s, so that the link fails after 0.25 s, and
     /// this node's entry is flushed after 1.65 s, once the 16-Hello history is empty
     /// (if RFC 8966 Appendix A.1 is exactly implemented).
-    pub fn shutdown(mut self) -> impl Iterator<Item = Output> {
+    pub fn shutdown(mut self, now: Instant) -> impl Iterator<Item = Output> {
+        self.set_now(now);
+
         let retraction = self.wildcard_retraction();
         let hello = Tlv::Hello {
             seqno: self.hello_seqno,
@@ -656,10 +673,11 @@ impl State {
         }
     }
 
-    pub fn poll_timeout(&mut self, cx: &mut Context<'_>) -> Poll<Option<Timeout>> {
-        self.timers
-            .poll_expired(cx)
-            .map(|o| o.map(|e| e.into_inner()))
+    /// Returns when [`handle_timeout`] is next to be called, if ever.
+    ///
+    /// [`handle_timeout`]: Self::handle_timeout
+    pub fn poll_timeout(&mut self) -> Option<Instant> {
+        self.timers.next_deadline()
     }
 
     /// Polls the next output, if any.
@@ -667,11 +685,28 @@ impl State {
         self.outputs.pop_front()
     }
 
-    pub fn handle_timeout(&mut self, timeout: Timeout) {
-        self.now = timestamp_now();
+    /// Handles every timer that has expired at `now`.
+    pub fn handle_timeout(&mut self, now: Instant) {
+        self.set_now(now);
+        while let Some(timer) = self.timers.pop_expired() {
+            self.handle_expired_timer(timer);
+        }
+    }
 
-        match timeout {
-            Timeout::OutgoingHello => {
+    /// Sets the current time, for the timers and as a timestamp. A time earlier than the
+    /// current one is ignored.
+    fn set_now(&mut self, now: Instant) {
+        if now < self.timers.now() {
+            return;
+        }
+        self.timers.set_now(now);
+        self.now = timestamp(now);
+    }
+
+    /// Handles a timer that has expired.
+    fn handle_expired_timer(&mut self, timer: Timer) {
+        match timer {
+            Timer::OutgoingHello => {
                 let hello_tlv = Tlv::Hello {
                     seqno: self.hello_seqno,
                     interval: Some(self.params.get_interval(IntervalKey::Hello)),
@@ -715,19 +750,19 @@ impl State {
 
                 self.hello_seqno += 1;
                 self.timers.insert(
-                    Timeout::OutgoingHello,
+                    Timer::OutgoingHello,
                     self.params.get_duration(DurationKey::HelloInterval),
                 );
             }
-            Timeout::OutgoingUpdate => {
+            Timer::OutgoingUpdate => {
                 self.dump_routes(None);
 
                 self.timers.insert(
-                    Timeout::OutgoingUpdate,
+                    Timer::OutgoingUpdate,
                     self.params.get_duration(DurationKey::UpdateInterval),
                 );
             }
-            Timeout::IncomingHello(key) => {
+            Timer::IncomingHello(key) => {
                 let neigh = &mut self.neigh_table[key];
 
                 if neigh.hello_history.missed() == HelloEffect::Flush {
@@ -740,14 +775,14 @@ impl State {
                 } else {
                     let timeout = neigh.last_hello_interval.unwrap().to_duration();
                     neigh.hello_timer_key =
-                        Some(self.timers.insert(Timeout::IncomingHello(key), timeout));
+                        Some(self.timers.insert(Timer::IncomingHello(key), timeout));
 
                     if neigh.update_cost() {
                         self.neigh_cost_changed(key);
                     }
                 }
             }
-            Timeout::IncomingIhu(key) => {
+            Timer::IncomingIhu(key) => {
                 let neigh = &mut self.neigh_table[key];
 
                 neigh.ihu_timer_key = None;
@@ -757,15 +792,15 @@ impl State {
                     self.neigh_cost_changed(key);
                 }
             }
-            Timeout::SourceGc(key) => {
+            Timer::SourceGc(key) => {
                 assert!(self.source_table.remove(&key).is_some());
                 self.select_route(key.prefix, None);
             }
-            Timeout::RouteExpiry(prefix, key) => {
+            Timer::RouteExpiry(prefix, key) => {
                 assert!(self.route_table.remove(&prefix, key).is_some());
                 self.select_route(prefix, Some(key));
             }
-            Timeout::RouteHold(prefix) => {
+            Timer::RouteHold(prefix) => {
                 let entry = self.route_table.prefix_entries.get_mut(&prefix).unwrap();
                 assert_matches!(entry.state, RouteState::Held(_));
 
@@ -779,7 +814,7 @@ impl State {
                     entry.advert = None;
                 }
             }
-            Timeout::SeqnoRequest(prefix) => {
+            Timer::SeqnoRequest(prefix) => {
                 let request = self.seqno_request_table.remove(&prefix).unwrap();
                 // Only a request that this node originated has resends left, and only
                 // until a route is selected (RFC 8966 §3.8.2.1).
@@ -793,7 +828,7 @@ impl State {
                     self.send_seqno_request(None, key, request.seqno, None);
                 }
             }
-            Timeout::OutgoingPacket(key) => {
+            Timer::OutgoingPacket(key) => {
                 let buf = &mut self.neigh_table[key].packet_buf;
                 buf.flush_timer_key = None;
                 buf.flush(key, &mut self.outputs);
@@ -801,15 +836,22 @@ impl State {
         }
     }
 
-    /// Handles a Babel packet.
-    pub fn handle_packet(&mut self, from: NeighKey, buf: &[u8]) {
+    /// Handles a Babel packet that arrived at `received_at`.
+    pub fn handle_packet(
+        &mut self,
+        now: Instant,
+        received_at: Instant,
+        from: NeighKey,
+        buf: &[u8],
+    ) {
         // Malformed packets, and TLVs that fail to decode or are otherwise
         // ignored, are silently ignored (RFC 8966 §4.2, §4.3, §4.4, §4.6).
         let Some(decoder) = PacketDecoder::new(buf) else {
             return;
         };
 
-        self.now = timestamp_now();
+        self.set_now(now);
+        self.receive_timestamp = timestamp(received_at);
 
         for res in decoder {
             let Ok(item) = res else {
@@ -823,7 +865,7 @@ impl State {
 
         // Delay-based metric extension (RFC 9616).
         if let (Some(t2p), Some((t1, t1p))) = (self.hello_timestamp, self.ihu_timestamps) {
-            let t2 = self.now;
+            let t2 = self.receive_timestamp;
 
             let d = t2.wrapping_sub(t1);
             let dp = t2p.wrapping_sub(t1p);
@@ -909,16 +951,16 @@ impl State {
                     // (RFC 8966 Appendix A.1). See also `PacketBuf::put`.
                     let timeout = interval.to_duration().mul_f64(1.5);
 
-                    if let Some(timer_key) = neigh.hello_timer_key {
-                        self.timers.reset(&timer_key, timeout);
+                    if let Some(timer_key) = &mut neigh.hello_timer_key {
+                        self.timers.reset(timer_key, timeout);
                     } else {
                         neigh.hello_timer_key =
-                            Some(self.timers.insert(Timeout::IncomingHello(from), timeout));
+                            Some(self.timers.insert(Timer::IncomingHello(from), timeout));
                     }
                 }
 
                 if let Some(t) = transmit_timestamp {
-                    neigh.origin_receive_timestamps = Some((t, self.now));
+                    neigh.origin_receive_timestamps = Some((t, self.receive_timestamp));
                     self.hello_timestamp = Some(t);
                 }
 
@@ -936,7 +978,7 @@ impl State {
                         .collect();
                     for prefix in stale {
                         let route = self.route_table.remove(&prefix, from).unwrap();
-                        self.timers.remove(&route.expiry_timer_key);
+                        self.timers.remove(route.expiry_timer_key);
                         self.updated_prefixes.push(prefix);
                     }
                 }
@@ -954,11 +996,11 @@ impl State {
                     .to_duration()
                     .mul_f64(self.params.get_f64(F64Key::IhuHoldTimeMultiplier));
 
-                if let Some(timer_key) = neigh.ihu_timer_key {
-                    self.timers.reset(&timer_key, timeout);
+                if let Some(timer_key) = &mut neigh.ihu_timer_key {
+                    self.timers.reset(timer_key, timeout);
                 } else {
                     neigh.ihu_timer_key =
-                        Some(self.timers.insert(Timeout::IncomingIhu(from), timeout));
+                        Some(self.timers.insert(Timer::IncomingIhu(from), timeout));
                 }
 
                 if let Some(ts) = origin_receive_timestamps {
@@ -1148,7 +1190,7 @@ impl State {
             resends_left,
             sent_at: self.now,
             timer_key: self.timers.insert(
-                Timeout::SeqnoRequest(key.prefix),
+                Timer::SeqnoRequest(key.prefix),
                 self.params.seqno_request_timeout(resends_left),
             ),
         };
@@ -1165,7 +1207,7 @@ impl State {
         if let Some(old) = self.seqno_request_table.insert(key.prefix, request) {
             debug_assert_eq!(old.router_id, key.router_id);
             debug_assert_eq!(old.resends_left, 0);
-            self.timers.remove(&old.timer_key);
+            self.timers.remove(old.timer_key);
         }
     }
 
@@ -1269,7 +1311,7 @@ impl State {
 
         if metric == METRIC_INFINITY {
             if let Some(route) = self.route_table.remove(&prefix, from) {
-                self.timers.remove(&route.expiry_timer_key);
+                self.timers.remove(route.expiry_timer_key);
                 self.updated_prefixes.push(prefix);
             }
             return;
@@ -1297,7 +1339,7 @@ impl State {
                 seqno,
                 expiry_timer_key: self
                     .timers
-                    .insert(Timeout::RouteExpiry(prefix, from), expiry_time),
+                    .insert(Timer::RouteExpiry(prefix, from), expiry_time),
             });
 
         if let Some(route) = route {
@@ -1325,7 +1367,7 @@ impl State {
             route.advertised_metric = metric;
             route.seqno = seqno;
 
-            self.timers.reset(&route.expiry_timer_key, expiry_time);
+            self.timers.reset(&mut route.expiry_timer_key, expiry_time);
         }
 
         self.updated_prefixes.push(prefix);
@@ -1338,7 +1380,7 @@ impl State {
         for prefix in &prefixes {
             let entry = self.route_table.prefix_entries.get_mut(prefix).unwrap();
             let route = entry.routes.remove(key).unwrap();
-            self.timers.remove(&route.expiry_timer_key);
+            self.timers.remove(route.expiry_timer_key);
         }
         prefixes
     }
@@ -1465,7 +1507,7 @@ impl State {
                 }
                 // The prefix is newly reachable after a retraction.
                 RouteState::Held(timer_key) => {
-                    self.timers.remove(&timer_key);
+                    self.timers.remove(timer_key);
                     trigger_update = true;
                 }
                 // The prefix is newly reachable.
@@ -1480,11 +1522,11 @@ impl State {
             if !matches!(entry.state, RouteState::Selected(_))
                 && let Some(request) = self.seqno_request_table.get_mut(&prefix)
             {
-                let new_deadline = self.timers.deadline(&request.timer_key)
+                let new_deadline = self.timers.deadline(request.timer_key)
                     + self.params.seqno_request_timeout(0)
                     - self.params.seqno_request_timeout(request.resends_left);
                 request.resends_left = 0;
-                self.timers.reset_at(&request.timer_key, new_deadline);
+                self.timers.reset_at(&mut request.timer_key, new_deadline);
             }
 
             if entry.state != RouteState::Selected(key) {
@@ -1512,7 +1554,7 @@ impl State {
                 && (request.router_id != advert.router_id || !advert.seqno.lt(request.seqno))
             {
                 let request = self.seqno_request_table.remove(&prefix).unwrap();
-                self.timers.remove(&request.timer_key);
+                self.timers.remove(request.timer_key);
                 trigger_update = true;
             }
 
@@ -1524,7 +1566,7 @@ impl State {
             self.outputs.push_back(Output::RouteHold(prefix));
 
             entry.state = RouteState::Held(self.timers.insert(
-                Timeout::RouteHold(prefix),
+                Timer::RouteHold(prefix),
                 self.params.get_duration(DurationKey::RouteHoldTime),
             ));
 
@@ -1700,7 +1742,7 @@ impl State {
         let mut send = |key, neigh: &mut NeighEntry| {
             let buf = &mut neigh.packet_buf;
             buf.put(key, &mut self.outputs, &mut self.timers, &self.params, &f);
-            self.timers.remove(&buf.flush_timer_key.take().unwrap());
+            self.timers.remove(buf.flush_timer_key.take().unwrap());
             buf.flush(key, &mut self.outputs);
         };
 
@@ -1754,13 +1796,13 @@ impl State {
                 } else if source.seqno == seqno && source.metric > metric {
                     source.metric = metric;
                 }
-                self.timers.reset(&source.gc_timer_key, gc_time);
+                self.timers.reset(&mut source.gc_timer_key, gc_time);
             }
             hash_map::Entry::Vacant(e) => {
                 e.insert(SourceEntry {
                     seqno,
                     metric,
-                    gc_timer_key: self.timers.insert(Timeout::SourceGc(key), gc_time),
+                    gc_timer_key: self.timers.insert(Timer::SourceGc(key), gc_time),
                 });
             }
         }

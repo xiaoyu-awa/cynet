@@ -2,6 +2,8 @@ use std::time::Duration;
 
 use crate::babel::base::Interval;
 
+/// The parameters of a Babel router. Only the MTU and the Hello interval can be set; the
+/// others are fixed or derived from the Hello interval.
 pub struct Params {
     mtu: u16,
     hello_interval: Interval,
@@ -11,6 +13,8 @@ pub struct Params {
 }
 
 impl Params {
+    /// Returns the default parameters.
+    #[expect(clippy::new_without_default)]
     pub fn new() -> Self {
         Self {
             mtu: 1400,
@@ -21,16 +25,28 @@ impl Params {
         }
     }
 
+    /// Returns the MTU of the links, in octets. Defaults to 1400.
     pub fn get_mtu(&self) -> u16 {
         self.mtu
     }
 
+    /// Sets the MTU of the links, in octets.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `mtu` is less than 1280, the minimum MTU of IPv6 (RFC 8200 §5).
     pub fn set_mtu(&mut self, mtu: u16) -> &mut Self {
         assert!(mtu >= 1280);
         self.mtu = mtu;
         self
     }
 
+    /// Sets the Hello interval.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `i` exceeds 163.83 s, as the Update interval would not fit in an
+    /// [`Interval`].
     pub fn set_hello_interval(&mut self, i: Interval) -> &mut Self {
         const MAX_I: u16 = u16::MAX / 4;
 
@@ -44,7 +60,7 @@ impl Params {
         self
     }
 
-    pub fn get_duration(&self, key: DurationKey) -> Duration {
+    pub(crate) fn get_duration(&self, key: DurationKey) -> Duration {
         match key {
             DurationKey::HelloInterval => self.hello_interval.to_duration(),
             DurationKey::UpdateInterval => self.update_interval.to_duration(),
@@ -55,7 +71,7 @@ impl Params {
         }
     }
 
-    pub fn get_interval(&self, key: IntervalKey) -> Interval {
+    pub(crate) fn get_interval(&self, key: IntervalKey) -> Interval {
         match key {
             IntervalKey::Hello => self.hello_interval,
             IntervalKey::Ihu => self.ihu_interval,
@@ -63,7 +79,7 @@ impl Params {
         }
     }
 
-    pub fn get_f64(&self, key: F64Key) -> f64 {
+    pub(crate) fn get_f64(&self, key: F64Key) -> f64 {
         match key {
             F64Key::IhuHoldTimeMultiplier => 3.5,
             F64Key::RouteExpiryTimeMultiplier => 3.5,
@@ -71,7 +87,7 @@ impl Params {
         }
     }
 
-    pub fn get_u8(&self, key: U8Key) -> u8 {
+    pub(crate) fn get_u8(&self, key: U8Key) -> u8 {
         match key {
             U8Key::HellosPerIhu => 3,
             U8Key::RequestMaxResends => 3,
@@ -80,7 +96,7 @@ impl Params {
 
     /// Returns the time constant for route hysteresis, in microseconds.
     /// Defaults to 3 times the Hello interval.
-    pub fn get_tau(&self) -> u32 {
+    pub(crate) fn get_tau(&self) -> u32 {
         self.tau
     }
 
@@ -88,7 +104,7 @@ impl Params {
     /// it waits before the next resend, or after the last one, how long it is kept. This
     /// is the initial request timeout, doubled every time the request has been resent
     /// (RFC 8966 Appendix B).
-    pub fn seqno_request_timeout(&self, resends_left: u8) -> Duration {
+    pub(crate) fn seqno_request_timeout(&self, resends_left: u8) -> Duration {
         let resends = self.get_u8(U8Key::RequestMaxResends) - resends_left;
         let factor = self.get_f64(F64Key::RequestBackoffFactor);
         self.get_duration(DurationKey::InitialRequestTimeout)

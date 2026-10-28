@@ -5,10 +5,8 @@ use std::{
     num::{NonZeroU16, NonZeroU64},
     ops::{Add, AddAssign, Sub},
     sync::LazyLock,
-    time::Duration,
+    time::{Duration, Instant},
 };
-
-use tokio::time::Instant;
 
 pub const COST_INFINITY: u16 = 0xffff;
 pub const METRIC_INFINITY: u16 = 0xffff;
@@ -242,17 +240,16 @@ impl HelloHistory {
 static TIMESTAMP_ORIGIN_OFFSET: LazyLock<(Instant, u32)> =
     LazyLock::new(|| (Instant::now(), rand::random()));
 
-/// Returns the current time in microseconds, modulo 2^32, from an arbitrary origin.
-pub fn timestamp_now() -> u32 {
+/// Returns the time `at` in microseconds, modulo 2^32, from an arbitrary origin.
+pub fn timestamp(at: Instant) -> u32 {
     let (origin, offset) = *TIMESTAMP_ORIGIN_OFFSET;
-    let now = Instant::now();
 
-    // Only the paused clock of a test can read earlier than the origin, which the first
-    // call sets. Count back from the origin then, rounding down as `as_micros` does when
-    // counting forward, so that differences between timestamps stay exact.
-    let micros = match now.checked_duration_since(origin) {
+    // The first call sets the origin, so `at` can be earlier, for example when it was taken
+    // before that call. Count back from the origin then, rounding down as `as_micros` does
+    // when counting forward, so that differences between timestamps stay exact.
+    let micros = match at.checked_duration_since(origin) {
         Some(elapsed) => elapsed.as_micros() as u32,
-        None => ((origin - now).as_nanos().div_ceil(1000) as u32).wrapping_neg(),
+        None => ((origin - at).as_nanos().div_ceil(1000) as u32).wrapping_neg(),
     };
     offset.wrapping_add(micros)
 }
