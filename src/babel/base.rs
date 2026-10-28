@@ -105,10 +105,10 @@ impl AddAssign<u16> for Seqno {
     }
 }
 
-impl Sub<Seqno> for Seqno {
+impl Sub<Self> for Seqno {
     type Output = i16;
 
-    fn sub(self, rhs: Seqno) -> i16 {
+    fn sub(self, rhs: Self) -> i16 {
         self.0.wrapping_sub(rhs.0).cast_signed()
     }
 }

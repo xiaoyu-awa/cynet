@@ -85,7 +85,7 @@ impl<K: Clone + Eq + Hash> NeighKeyMap<K> {
 struct NeighEntry {
     hello_history: HelloHistory,
     txcost: u16,
-    /// The link cost, as last computed by [`Self::update_cost`].
+    /// The link cost, as last computed by `update_cost`.
     cost: u16,
     last_hello_interval: Option<Interval>,
     hello_timer_key: Option<TimerKey>,
@@ -440,7 +440,7 @@ impl PacketBuf {
             // Encoding succeeded. The buffer was empty. Set a timer to flush it.
             assert!(self.flush_timer_key.is_none());
 
-            self.flush_timer_key = Some(timers.insert(Timer::OutgoingPacket(key), timeout()));
+            self.flush_timer_key = Some(timers.insert(Timer::BufferFlush(key), timeout()));
         }
     }
 
@@ -471,7 +471,7 @@ enum Timer {
     RouteExpiry(Ipv6Net, NeighKey),
     RouteHold(Ipv6Net),
     SeqnoRequest(Ipv6Net),
-    OutgoingPacket(NeighKey),
+    BufferFlush(NeighKey),
 }
 
 /// An output of a Babel router.
@@ -745,7 +745,7 @@ impl State {
                                 e.put_tlv(&hello_tlv)
                             }
                         },
-                    )
+                    );
                 }
 
                 self.hello_seqno += 1;
@@ -828,7 +828,7 @@ impl State {
                     self.send_seqno_request(None, key, request.seqno, None);
                 }
             }
-            Timer::OutgoingPacket(key) => {
+            Timer::BufferFlush(key) => {
                 let buf = &mut self.neigh_table[key].packet_buf;
                 buf.flush_timer_key = None;
                 buf.flush(key, &mut self.outputs);
@@ -1275,7 +1275,7 @@ impl State {
         self.seqno_request_table
             .get(&key.prefix)
             .is_some_and(|request| {
-                debug_assert!(request.router_id == key.router_id);
+                debug_assert_eq!(request.router_id, key.router_id);
                 !request.seqno.lt(seqno)
                     && self.now.wrapping_sub(request.sent_at) < window.as_micros() as u32
             })

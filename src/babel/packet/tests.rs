@@ -45,13 +45,12 @@ fn router_id(n: u64) -> Tlv {
 
 /// Parses an IPv6 or IPv4 address into the octets of a prefix.
 fn addr(s: &str) -> [u8; 16] {
-    match s.parse::<Ipv6Addr>() {
-        Ok(addr) => addr.octets(),
-        Err(_) => {
-            let mut prefix = [0; 16];
-            prefix[..4].copy_from_slice(&s.parse::<Ipv4Addr>().unwrap().octets());
-            prefix
-        }
+    if let Ok(addr) = s.parse::<Ipv6Addr>() {
+        addr.octets()
+    } else {
+        let mut prefix = [0; 16];
+        prefix[..4].copy_from_slice(&s.parse::<Ipv4Addr>().unwrap().octets());
+        prefix
     }
 }
 

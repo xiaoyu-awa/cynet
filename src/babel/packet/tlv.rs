@@ -204,7 +204,7 @@ impl Tlv {
         len + 2
     }
 
-    pub fn decode(buf: &mut &[u8]) -> Result<Tlv, TlvDecodeError> {
+    pub fn decode(buf: &mut &[u8]) -> Result<Self, TlvDecodeError> {
         decode(buf)
     }
 }
