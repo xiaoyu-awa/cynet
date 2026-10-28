@@ -90,6 +90,8 @@ struct NeighEntry {
     last_hello_interval: Option<Interval>,
     hello_timer_key: Option<TimerKey>,
     ihu_timer_key: Option<TimerKey>,
+    hello_seqno: Seqno,
+    hellos_until_ihu: u8,
     packet_buf: PacketBuf,
     origin_receive_timestamps: Option<(u32, u32)>,
     rtt: Option<f64>,
@@ -104,6 +106,8 @@ impl NeighEntry {
             last_hello_interval: None,
             hello_timer_key: None,
             ihu_timer_key: None,
+            hello_seqno: Seqno::new(rand::random()),
+            hellos_until_ihu: params.get_u8(U8Key::HellosPerIhu),
             packet_buf: PacketBuf {
                 // Leave room for IPv6 and UDP headers (RFC 8966 §4).
                 encoder: PacketEncoder::new(params.get_mtu() as usize - 48),
@@ -463,8 +467,8 @@ impl PacketBuf {
 }
 
 enum Timer {
-    OutgoingHello,
-    OutgoingUpdate,
+    OutgoingHello(NeighKey),
+    OutgoingUpdate(NeighKey),
     IncomingHello(NeighKey),
     IncomingIhu(NeighKey),
     SourceGc(SourceKey),
@@ -536,8 +540,6 @@ pub struct State {
     params: Params,
     router_id: RouterId,
     seqno: Seqno,
-    hello_seqno: Seqno,
-    hellos_until_ihu: u8,
     neigh_table: SlotMap<NeighKey, NeighEntry>,
     source_table: HashMap<SourceKey, SourceEntry>,
     route_table: RouteTable,
@@ -562,25 +564,16 @@ impl State {
     /// Creates a new `State` at `now`, with the given parameters, router-id, and seqno
     /// (if any). Seqno defaults to a random one if not given.
     pub fn new(now: Instant, params: Params, router_id: RouterId, seqno: Option<Seqno>) -> Self {
-        let mut timers = TimerQueue::new(now);
-
-        timers.insert(Timer::OutgoingHello, Duration::ZERO);
-        timers.insert(Timer::OutgoingUpdate, Duration::ZERO);
-
-        let hellos_until_ihu = params.get_u8(U8Key::HellosPerIhu);
-
         Self {
             params,
             router_id,
             seqno: seqno.unwrap_or_else(|| Seqno::new(rand::random())),
-            hello_seqno: Seqno::new(rand::random()),
-            hellos_until_ihu,
             neigh_table: SlotMap::with_key(),
             source_table: HashMap::new(),
             route_table: RouteTable::default(),
             seqno_request_table: HashMap::new(),
             outputs: VecDeque::new(),
-            timers,
+            timers: TimerQueue::new(now),
             now: timestamp(now),
             updated_prefixes: Vec::new(),
             requests: Vec::new(),
@@ -599,6 +592,10 @@ impl State {
     /// through them already, and the packets could loop until the retraction arrives,
     /// for example when node 1 adds node 2 after node 3 in the network of [Reboots].
     ///
+    /// The neighbour is then sent its first Hello and a full dump as soon as timeouts are
+    /// next handled, as babeld does when an interface comes up, and then a Hello every
+    /// Hello interval and a full dump every Update interval.
+    ///
     /// [Reboots]: State#reboots
     pub fn add_neighbour(&mut self, now: Instant) -> NeighKey {
         self.set_now(now);
@@ -610,6 +607,11 @@ impl State {
         self.send(Some(key), Some(Duration::ZERO), |e| {
             e.put_update(&retraction)
         });
+
+        self.timers
+            .insert(Timer::OutgoingHello(key), Duration::ZERO);
+        self.timers
+            .insert(Timer::OutgoingUpdate(key), Duration::ZERO);
 
         key
     }
@@ -640,17 +642,20 @@ impl State {
         self.set_now(now);
 
         let retraction = self.wildcard_retraction();
-        let hello = Tlv::Hello {
-            seqno: self.hello_seqno,
-            interval: Interval::new(10),
-            transmit_timestamp: None,
-        };
+        let keys: Vec<_> = self.neigh_table.keys().collect();
 
-        self.send(None, Some(Duration::ZERO), |e| {
-            e.clear();
-            assert!(e.put_update(&retraction) && e.put_tlv(&hello));
-            true
-        });
+        for key in keys {
+            let hello = Tlv::Hello {
+                seqno: self.neigh_table[key].hello_seqno,
+                interval: Interval::new(10),
+                transmit_timestamp: None,
+            };
+            self.send(Some(key), Some(Duration::ZERO), |e| {
+                e.clear();
+                assert!(e.put_update(&retraction) && e.put_tlv(&hello));
+                true
+            });
+        }
 
         for (&prefix, entry) in &self.route_table.prefix_entries {
             if let RouteState::Selected(_) | RouteState::Held(_) = entry.state {
@@ -705,62 +710,58 @@ impl State {
         self.now = timestamp(now);
     }
 
+    /// Sends a neighbour a scheduled Hello, with an IHU every few Hellos, and sets the
+    /// timer for the next one.
+    fn send_hello(&mut self, key: NeighKey) {
+        let neigh = &mut self.neigh_table[key];
+
+        let hello_tlv = Tlv::Hello {
+            seqno: neigh.hello_seqno,
+            interval: Some(self.params.get_interval(IntervalKey::Hello)),
+            transmit_timestamp: Some(0),
+        };
+
+        let mut tlvs = [hello_tlv, Tlv::Pad1];
+
+        neigh.hellos_until_ihu -= 1;
+        let tlvs = if neigh.hellos_until_ihu == 0 {
+            neigh.hellos_until_ihu = self.params.get_u8(U8Key::HellosPerIhu);
+            tlvs[1] = Tlv::Ihu {
+                ae: Ae::Wildcard,
+                rxcost: neigh.rxcost(),
+                interval: self.params.get_interval(IntervalKey::Ihu),
+                address: [0; 8],
+                origin_receive_timestamps: neigh.origin_receive_timestamps,
+            };
+            &tlvs
+        } else {
+            &tlvs[..1]
+        };
+
+        neigh.packet_buf.put(
+            key,
+            &mut self.outputs,
+            &mut self.timers,
+            &self.params,
+            |e| e.put_tlvs(tlvs),
+        );
+
+        neigh.hello_seqno += 1;
+        self.timers.insert(
+            Timer::OutgoingHello(key),
+            self.params.get_duration(DurationKey::HelloInterval),
+        );
+    }
+
     /// Handles a timer that has expired.
     fn handle_expired_timer(&mut self, timer: Timer) {
         match timer {
-            Timer::OutgoingHello => {
-                let hello_tlv = Tlv::Hello {
-                    seqno: self.hello_seqno,
-                    interval: Some(self.params.get_interval(IntervalKey::Hello)),
-                    transmit_timestamp: Some(0),
-                };
-
-                self.hellos_until_ihu -= 1;
-                let ihu_interval = if self.hellos_until_ihu == 0 {
-                    self.hellos_until_ihu = self.params.get_u8(U8Key::HellosPerIhu);
-                    Some(self.params.get_interval(IntervalKey::Ihu))
-                } else {
-                    None
-                };
-
-                for (key, neigh) in &mut self.neigh_table {
-                    let rxcost = neigh.rxcost();
-                    let origin_receive_timestamps = neigh.origin_receive_timestamps;
-
-                    neigh.packet_buf.put(
-                        key,
-                        &mut self.outputs,
-                        &mut self.timers,
-                        &self.params,
-                        |e| {
-                            let hello_tlv = hello_tlv.clone();
-                            if let Some(interval) = ihu_interval {
-                                let ihu_tlv = Tlv::Ihu {
-                                    ae: Ae::Wildcard,
-                                    rxcost,
-                                    interval,
-                                    address: [0; 8],
-                                    origin_receive_timestamps,
-                                };
-                                e.put_tlvs(&[hello_tlv, ihu_tlv])
-                            } else {
-                                e.put_tlv(&hello_tlv)
-                            }
-                        },
-                    );
-                }
-
-                self.hello_seqno += 1;
-                self.timers.insert(
-                    Timer::OutgoingHello,
-                    self.params.get_duration(DurationKey::HelloInterval),
-                );
-            }
-            Timer::OutgoingUpdate => {
-                self.dump_routes(None);
+            Timer::OutgoingHello(key) => self.send_hello(key),
+            Timer::OutgoingUpdate(key) => {
+                self.dump_routes(key);
 
                 self.timers.insert(
-                    Timer::OutgoingUpdate,
+                    Timer::OutgoingUpdate(key),
                     self.params.get_duration(DurationKey::UpdateInterval),
                 );
             }
@@ -1045,7 +1046,7 @@ impl State {
     fn handle_route_request(&mut self, from: NeighKey, ae: Ae, plen: u8, prefix: [u8; 16]) {
         if ae == Ae::Wildcard {
             // TODO: Full route table dumps SHOULD be rate-limited.
-            self.dump_routes(Some(from));
+            self.dump_routes(from);
             return;
         }
 
@@ -1616,46 +1617,28 @@ impl State {
         }
     }
 
-    /// Sends a full dump of the routes that this node advertises,
-    /// to every neighbour or to the given one.
-    fn dump_routes(&mut self, to: Option<NeighKey>) {
-        struct Update {
-            prefix: Ipv6Net,
-            router_id: RouterId,
-            seqno: Seqno,
-            metric: u16,
-            not_to: Option<NeighKey>,
-        }
-
-        let mut updates: Vec<_> = self
-            .route_table
-            .prefix_entries
-            .iter()
+    /// Sends a neighbour a full dump of the routes that this node advertises, leaving out
+    /// those through it for split horizon (RFC 8966 §3.7.4).
+    fn dump_routes(&mut self, to: NeighKey) {
+        let mut updates: Vec<_> = (self.route_table.prefix_entries.iter())
             .filter_map(|(&prefix, entry)| {
-                self.advert_for_prefix(entry).map(|advert| Update {
-                    prefix,
-                    router_id: advert.router_id,
-                    seqno: advert.seqno,
-                    metric: advert.metric,
-                    not_to: entry.state.selected(),
-                })
+                let advert = self.advert_for_prefix(entry)?;
+                Some((prefix, advert, entry.state.selected()))
             })
             .collect();
 
         // By router-id, those with the router-id omitted first, then by prefix, whose
         // derived order is by address, then by length.
-        updates.sort_unstable_by_key(|u| {
-            let omitted = u.router_id.get() == u.prefix.addr().to_bits() as u64;
-            (u.router_id, !omitted, u.prefix)
+        updates.sort_unstable_by_key(|&(prefix, advert, _)| {
+            let omitted = advert.router_id.get() == prefix.addr().to_bits() as u64;
+            (advert.router_id, !omitted, prefix)
         });
 
-        for u in updates {
-            let advert = Advert {
-                router_id: u.router_id,
-                seqno: u.seqno,
-                metric: u.metric,
-            };
-            self.send_update(to, u.not_to, false, u.prefix, advert);
+        // An update for a route through `to` is not sent, but still updates the source
+        // table, since a seqno request for the route, once lost, takes its seqno from
+        // there (see `select_route`).
+        for (prefix, advert, not_to) in updates {
+            self.send_update(Some(to), not_to, false, prefix, advert);
         }
     }
 

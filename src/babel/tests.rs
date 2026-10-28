@@ -377,6 +377,12 @@ impl Net {
         &self.nodes[i].neigh_table[self.key(i, j)]
     }
 
+    /// Sets the seqno of the next Hello that node `i` sends node `j`.
+    fn set_hello_seqno(&mut self, i: usize, j: usize, seqno: Seqno) {
+        let key = self.key(i, j);
+        self.nodes[i].neigh_table[key].hello_seqno = seqno;
+    }
+
     /// Returns node `i`'s rxcost, txcost and link cost for node `j`.
     fn costs(&self, i: usize, j: usize) -> (u16, u16, u16) {
         let neigh = self.neigh(i, j);
@@ -663,6 +669,60 @@ fn hellos_and_ihus_follow_the_rfcs() {
 }
 
 #[test]
+fn neighbours_are_sent_hellos_and_dumps_on_schedules_of_their_own() {
+    let p = prefix("fd00::/64");
+    let mut net = Net::new(1);
+    net.originate(0, p);
+    net.add_neighbour(0, 8);
+    net.run_for(Duration::from_secs(6));
+    net.add_neighbour(0, 9);
+    let added = [(8, net.now - Duration::from_secs(6)), (9, net.now)];
+    net.run_for(Duration::from_secs(64));
+
+    // Each neighbour is on a point-to-point link of its own, so it is sent Hellos with
+    // consecutive seqnos of its own (RFC 8966 §3.4.1). It is sent one every Hello interval
+    // and a full dump every Update interval, both counted from when it was added, and each
+    // sent after the 0.75 to 1.25 s for which TLVs are buffered.
+    let buffered = Duration::from_millis(750)..=Duration::from_millis(1250);
+    for (j, added) in added {
+        let sent: Vec<_> = (net.sent.iter())
+            .filter(|sent| (sent.from, sent.to) == (0, j))
+            .collect();
+
+        let hellos: Vec<_> = (sent.iter())
+            .flat_map(|sent| {
+                let time = sent.time;
+                let hellos = tlvs(&sent.buf).into_iter().filter_map(|tlv| match tlv {
+                    Tlv::Hello {
+                        seqno,
+                        interval: Some(_),
+                        ..
+                    } => Some(seqno),
+                    _ => None,
+                });
+                hellos.map(move |seqno| (time, seqno))
+            })
+            .collect();
+        assert!(hellos.len() >= 15);
+        for (i, &(time, seqno)) in hellos.iter().enumerate() {
+            assert_eq!(seqno, hellos[0].1 + i as u16);
+            let due = added + Duration::from_secs(4) * i as u32;
+            assert!(buffered.contains(&(time - due)));
+        }
+
+        let dumps: Vec<_> = (sent.iter())
+            .filter(|sent| updates(&sent.buf).iter().any(|update| is_for(update, p)))
+            .map(|sent| sent.time)
+            .collect();
+        assert!(dumps.len() >= 4);
+        for (i, &time) in dumps.iter().enumerate() {
+            let due = added + Duration::from_secs(16) * i as u32;
+            assert!(buffered.contains(&(time - due)));
+        }
+    }
+}
+
+#[test]
 fn one_way_loss_makes_link_unusable() {
     let mut net = Net::new(2);
     net.connect(0, 1, Duration::ZERO);
@@ -711,10 +771,10 @@ fn rebooted_neighbour_is_reacquired() {
     net.run_for(Duration::from_secs(31));
 
     // Node 1 reboots, and its Hello seqno jumps.
-    let mut node = state(1, net.now);
-    node.hello_seqno = net.nodes[1].hello_seqno + 1000;
-    net.restart(1, node);
+    let hello_seqno = net.neigh(1, 0).hello_seqno + 1000;
+    net.restart(1, state(1, net.now));
     net.add_neighbour(1, 0);
+    net.set_hello_seqno(1, 0, hello_seqno);
 
     // Its first Hello flushes node 0's entry for it, restarting the history.
     net.run_for(Duration::from_secs(3));
@@ -750,10 +810,10 @@ fn rebooted_neighbour_routes_wait_for_the_link() {
     // retraction at once (see `State::add_neighbour`), then a packet with an update for P and a
     // Hello, which flushes node 0's entry for it, but keeps the route to P that the packet
     // refreshed.
-    let mut node = state(1, net.now);
-    node.hello_seqno = net.nodes[1].hello_seqno + 1000;
-    net.restart(1, node);
+    let hello_seqno = net.neigh(1, 0).hello_seqno + 1000;
+    net.restart(1, state(1, net.now));
     net.add_neighbour(1, 0);
+    net.set_hello_seqno(1, 0, hello_seqno);
     net.originate(1, p);
     let changes = net.fib_changes.len();
 
@@ -780,10 +840,10 @@ fn rebooted_neighbour_old_routes_are_held_at_its_first_packet() {
     assert_eq!(net.fib(0, p), Some(Fib::Via(1)));
 
     // Node 1 reboots without P, and its Hello seqno jumps.
-    let mut node = state(1, net.now);
-    node.hello_seqno = net.nodes[1].hello_seqno + 1000;
-    net.restart(1, node);
+    let hello_seqno = net.neigh(1, 0).hello_seqno + 1000;
+    net.restart(1, state(1, net.now));
     net.add_neighbour(1, 0);
+    net.set_hello_seqno(1, 0, hello_seqno);
     net.locals[1].clear();
 
     // It sends node 0 a wildcard retraction at once (see `State::add_neighbour`), which removes
@@ -857,9 +917,9 @@ fn shutdown_says_goodbye_and_removes_routes() {
     // a Hello with an interval of 0.1 s, dropping what was buffered for it, such as the urgent
     // retraction of Q. P and Q are removed.
     let sent_before = net.sent.len();
-    let hello_seqno = net.nodes[0].hello_seqno;
+    let hello_seqnos = [8, 9].map(|j| (j, net.neigh(0, j).hello_seqno));
     net.shutdown(0);
-    for j in [8, 9] {
+    for (j, hello_seqno) in hello_seqnos {
         let sent: Vec<_> = net.sent[sent_before..]
             .iter()
             .filter(|sent| sent.to == j)
@@ -943,18 +1003,18 @@ fn unnoticed_restarts_cause_no_loops() {
         net.run_for(Duration::from_secs(secs));
         assert_eq!(net.path(3, p.addr()), [3, 2, 1, 0]);
 
-        // Node 1 restarts, with its Hello seqno where it was, so that its neighbours do not
+        // Node 1 restarts, with its Hello seqnos where they were, so that its neighbours do not
         // notice (RFC 8966 Appendix A.1). Their routes through it are from before the
         // restart, and could form loops with the routes that it learns, as it has lost its
         // feasibility distances: it could learn P from node 3 before node 0, and node 3 then
         // switch to its old route through node 1. But node 1 sends each neighbour a wildcard
         // retraction (see `State::add_neighbour`), which removes them. The harness checks that
         // no forwarding loop forms meanwhile.
-        let mut node = state(1, net.now);
-        node.hello_seqno = net.nodes[1].hello_seqno;
-        net.restart(1, node);
-        for j in [0, 2, 3] {
+        let hello_seqnos = [0, 2, 3].map(|j| (j, net.neigh(1, j).hello_seqno));
+        net.restart(1, state(1, net.now));
+        for (j, hello_seqno) in hello_seqnos {
             net.add_neighbour(1, j);
+            net.set_hello_seqno(1, j, hello_seqno);
         }
         net.run_for(Duration::from_secs(60));
         assert_eq!(net.delivered_to(3, p.addr()), Some(0));
@@ -1192,6 +1252,25 @@ fn routes_propagate_without_flapping() {
         }];
         assert_eq!((source.seqno, source.metric), (seqno, metric));
     }
+}
+
+#[test]
+fn routes_through_the_only_neighbour_can_be_lost_after_the_source_gc_time() {
+    let p = prefix("fd00:1::/64");
+
+    // Node 0 selects P through node 1, its only neighbour, which split horizon keeps it from
+    // sending P to. Its source table entry for P still outlasts the source GC time, as node 0
+    // takes the seqno that it requests from there once the route is lost (RFC 8966 §3.8.2.1).
+    let mut net = Net::new(2);
+    net.connect(0, 1, Duration::ZERO);
+    net.originate(1, p);
+    net.run_for(Duration::from_mins(4));
+    assert_eq!(net.fib(0, p), Some(Fib::Via(1)));
+
+    net.links.remove(&(0, 1));
+    net.links.remove(&(1, 0));
+    net.run_for(Duration::from_secs(15));
+    assert_eq!(net.fib(0, p), Some(Fib::Unreachable));
 }
 
 #[test]
@@ -2008,10 +2087,11 @@ fn rebooted_originator(gap: u16) -> (Net, Ipv6Net, Instant) {
     assert_eq!(net.path(0, p.addr()), [0, 1, 2]);
 
     let seqno = Seqno::new(net.nodes[2].seqno.get().wrapping_sub(gap));
-    let mut node = State::new(net.now, Params::new(), net.nodes[2].router_id, Some(seqno));
-    node.hello_seqno = net.nodes[2].hello_seqno + 1000;
+    let hello_seqno = net.neigh(2, 1).hello_seqno + 1000;
+    let node = State::new(net.now, Params::new(), net.nodes[2].router_id, Some(seqno));
     net.restart(2, node);
     net.add_neighbour(2, 1);
+    net.set_hello_seqno(2, 1, hello_seqno);
     assert!(net.nodes[2].inject_route(p));
 
     let reboot = net.now;
