@@ -607,7 +607,9 @@ impl State {
         self.route_table.neigh_prefixes.insert(key, HashSet::new());
 
         let retraction = self.wildcard_retraction();
-        self.send_now(Some(key), |e| e.put_update(&retraction));
+        self.send(Some(key), Some(Duration::ZERO), |e| {
+            e.put_update(&retraction)
+        });
 
         key
     }
@@ -644,7 +646,7 @@ impl State {
             transmit_timestamp: None,
         };
 
-        self.send_now(None, |e| {
+        self.send(None, Some(Duration::ZERO), |e| {
             e.clear();
             assert!(e.put_update(&retraction) && e.put_tlv(&hello));
             true
@@ -1710,6 +1712,8 @@ impl State {
     /// Puts what `f` encodes in the packet buffer of the given neighbour or of every one,
     /// to be sent within `timeout` if any, or else as usual.
     ///
+    /// If `timeout` is zero, the buffer will be flushed immediately.
+    ///
     /// `f` returns whether what it encodes fits in the buffer. If not, it must have
     /// encoded nothing, and is called again once the buffer is flushed. So it must encode
     /// several TLVs all at once or not at all, as [`PacketEncoder::put_tlvs`] does.
@@ -1723,27 +1727,13 @@ impl State {
             let buf = &mut neigh.packet_buf;
             buf.put(key, &mut self.outputs, &mut self.timers, &self.params, &f);
             if let Some(timeout) = timeout {
-                buf.schedule_flush(&mut self.timers, timeout);
+                if timeout.is_zero() {
+                    self.timers.remove(buf.flush_timer_key.take().unwrap());
+                    buf.flush(key, &mut self.outputs);
+                } else {
+                    buf.schedule_flush(&mut self.timers, timeout);
+                }
             }
-        };
-
-        if let Some(key) = to {
-            send(key, &mut self.neigh_table[key]);
-        } else {
-            for (key, neigh) in &mut self.neigh_table {
-                send(key, neigh);
-            }
-        }
-    }
-
-    /// Puts what `f` encodes in the packet buffer of the given neighbour or of every one,
-    /// as [`State::send`] does, and sends the buffer at once.
-    fn send_now(&mut self, to: Option<NeighKey>, f: impl Fn(&mut PacketEncoder) -> bool) {
-        let mut send = |key, neigh: &mut NeighEntry| {
-            let buf = &mut neigh.packet_buf;
-            buf.put(key, &mut self.outputs, &mut self.timers, &self.params, &f);
-            self.timers.remove(buf.flush_timer_key.take().unwrap());
-            buf.flush(key, &mut self.outputs);
         };
 
         if let Some(key) = to {
