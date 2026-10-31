@@ -304,9 +304,9 @@ fn encode_prefix(prefix: IpNet, ipv4_ae: Ae) -> (Ae, u8, [u8; 16]) {
     (ae, prefix.prefix_len(), octets)
 }
 
-/// The routing state for a prefix.
+/// The state of a prefix.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-enum RouteState {
+enum PrefixState {
     /// A route for the prefix is injected into the Babel domain by the local node.
     Injected,
     /// The route through this neighbour is selected for the prefix.
@@ -325,7 +325,7 @@ enum RouteState {
     None,
 }
 
-impl RouteState {
+impl PrefixState {
     /// Returns the selected next-hop neighbour, if any.
     fn selected(self) -> Option<NeighKey> {
         match self {
@@ -343,9 +343,9 @@ struct Advert {
 }
 
 #[derive(Default)]
-struct PrefixRouteEntry {
+struct PrefixEntry {
     routes: SparseSecondaryMap<NeighKey, RouteEntry>,
-    state: RouteState,
+    state: PrefixState,
     /// Advertisement for a selected or held route: the selected route's router-id, seqno,
     /// and metric, kept with an infinite metric while held. `None` for an injected route
     /// or when no route to the prefix is selected. An injected route is advertised with
@@ -353,17 +353,17 @@ struct PrefixRouteEntry {
     advert: Option<Advert>,
 }
 
-impl PrefixRouteEntry {
+impl PrefixEntry {
     /// Checks whether no route to the prefix is selected and no fallback route exists,
     /// so that the entry can be safely removed.
     fn is_empty(&self) -> bool {
-        self.state == RouteState::None && self.routes.is_empty()
+        self.state == PrefixState::None && self.routes.is_empty()
     }
 }
 
 #[derive(Default)]
 struct RouteTable {
-    prefix_entries: HashMap<IpNet, PrefixRouteEntry>,
+    prefix_entries: HashMap<IpNet, PrefixEntry>,
     neigh_prefixes: SecondaryMap<NeighKey, HashSet<IpNet>>,
 }
 
@@ -372,8 +372,8 @@ impl RouteTable {
         match self.prefix_entries.entry(prefix) {
             hash_map::Entry::Occupied(_) => false,
             hash_map::Entry::Vacant(e) => {
-                e.insert(PrefixRouteEntry {
-                    state: RouteState::Injected,
+                e.insert(PrefixEntry {
+                    state: PrefixState::Injected,
                     ..Default::default()
                 });
                 true
@@ -381,7 +381,7 @@ impl RouteTable {
         }
     }
 
-    /// Returns the routing state for the prefix, and the route entry for the prefix
+    /// Returns the state of the prefix, and the route entry for the prefix
     /// through the neighbour, or `None` if it is not present, in which case
     /// a new route returned by `f` is inserted.
     fn get_or_insert_with(
@@ -389,7 +389,7 @@ impl RouteTable {
         prefix: IpNet,
         key: NeighKey,
         f: impl FnOnce() -> RouteEntry,
-    ) -> (RouteState, Option<&mut RouteEntry>) {
+    ) -> (PrefixState, Option<&mut RouteEntry>) {
         let entry = self.prefix_entries.entry(prefix).or_default();
         let route = match entry.routes.entry(key).unwrap() {
             sparse_secondary::Entry::Occupied(e) => Some(e.into_mut()),
@@ -709,7 +709,7 @@ impl State {
         }
 
         for (&prefix, entry) in &self.route_table.prefix_entries {
-            if let RouteState::Selected(_) | RouteState::Held(_) = entry.state {
+            if let PrefixState::Selected(_) | PrefixState::Held(_) = entry.state {
                 self.outputs.push_back(Output::RouteRemove(prefix));
             }
         }
@@ -869,7 +869,7 @@ impl State {
             }
             Timer::RouteHold(prefix) => {
                 let entry = self.route_table.prefix_entries.get_mut(&prefix).unwrap();
-                assert_matches!(entry.state, RouteState::Held(_));
+                assert_matches!(entry.state, PrefixState::Held(_));
 
                 self.outputs.push_back(Output::RouteRemove(prefix));
 
@@ -877,7 +877,7 @@ impl State {
                     // Nothing is left to keep the entry for.
                     self.route_table.prefix_entries.remove(&prefix);
                 } else {
-                    entry.state = RouteState::None;
+                    entry.state = PrefixState::None;
                     entry.advert = None;
                 }
             }
@@ -1397,7 +1397,7 @@ impl State {
             // last until the metric reaches infinity. An ignored update leaves such a
             // route to expire (see Reboots in the doc of `State`).
             let key = SourceKey { prefix, router_id };
-            if state == RouteState::Selected(from)
+            if state == PrefixState::Selected(from)
                 && route.router_id == router_id
                 && !update_feasible(&self.source_table, key, seqno, metric)
             {
@@ -1466,7 +1466,7 @@ impl State {
             route.set_metric(metric, self.now, self.params.get_tau());
         }
 
-        if entry.state == RouteState::Injected {
+        if entry.state == PrefixState::Injected {
             return;
         }
 
@@ -1490,12 +1490,12 @@ impl State {
         // if it were feasible. In the latter case, a node SHOULD send a seqno request to
         // the neighbour that advertised it (RFC 8966 §3.8.2.2, with Erratum 7373).
         let (selection, wanted) = match entry.state {
-            RouteState::Injected => unreachable!(),
+            PrefixState::Injected => unreachable!(),
             // The selected route has not changed, so it is still usable. Its metric is
             // still finite, and it is still feasible: only advertising tightens
             // feasibility, and advertising the selected route keeps it feasible.
             // This includes a source table entry expiring, with no changed route.
-            RouteState::Selected(key) if changed != Some(key) => {
+            PrefixState::Selected(key) if changed != Some(key) => {
                 let selected = &entry.routes[key];
                 debug_assert!(selected.is_usable(prefix, &self.source_table));
 
@@ -1516,14 +1516,14 @@ impl State {
             // if its router-id has changed, making it a route for another source, or if
             // an update added it anew after a retraction in the same packet. Either way,
             // it is unselected, as RFC 8966 requires (§3.5.3, §3.6).
-            RouteState::Selected(_) => {
+            PrefixState::Selected(_) => {
                 let kept = candidate.filter(|_| candidate_feasible);
                 (kept.or_else(best_usable), candidate)
             }
             // Nothing is selected, so no route is usable: one only becomes usable without
             // changing as its source table entry expires. So select the changed route if
             // it is usable, or after such an expiry, the best usable route.
-            RouteState::Held(_) | RouteState::None => match changed {
+            PrefixState::Held(_) | PrefixState::None => match changed {
                 Some(_) => (candidate.filter(|_| candidate_feasible), candidate),
                 None => (best_usable(), None),
             },
@@ -1546,18 +1546,18 @@ impl State {
 
         if let Some((key, route)) = selection {
             match entry.state {
-                RouteState::Injected => unreachable!(),
+                PrefixState::Injected => unreachable!(),
                 // The prefix is still reachable, possibly with another router-id.
-                RouteState::Selected(_) => {
+                PrefixState::Selected(_) => {
                     trigger_update = route.router_id != entry.advert.unwrap().router_id;
                 }
                 // The prefix is newly reachable after a retraction.
-                RouteState::Held(timer_key) => {
+                PrefixState::Held(timer_key) => {
                     self.timers.remove(timer_key);
                     trigger_update = true;
                 }
                 // The prefix is newly reachable.
-                RouteState::None => trigger_update = true,
+                PrefixState::None => trigger_update = true,
             }
 
             // A route is selected for a prefix that had none, so this node no longer
@@ -1565,7 +1565,7 @@ impl State {
             // the lost route (RFC 8966 §3.8.2.1). The request is kept as long as if its
             // last send had been its last resend, to tell redundant requests and to
             // forward a reply (§3.8.1.2). Its timer was set at that send.
-            if !matches!(entry.state, RouteState::Selected(_))
+            if !matches!(entry.state, PrefixState::Selected(_))
                 && let Some(request) = self.seqno_request_table.get_mut(&prefix)
             {
                 let new_deadline = self.timers.deadline(request.timer_key)
@@ -1575,11 +1575,11 @@ impl State {
                 self.timers.reset_at(&mut request.timer_key, new_deadline);
             }
 
-            if entry.state != RouteState::Selected(key) {
+            if entry.state != PrefixState::Selected(key) {
                 self.outputs.push_back(Output::RouteSelect(prefix, key));
             }
 
-            entry.state = RouteState::Selected(key);
+            entry.state = PrefixState::Selected(key);
 
             let advert = Advert {
                 router_id: route.router_id,
@@ -1605,13 +1605,13 @@ impl State {
             }
 
             entry.advert = Some(advert);
-        } else if let RouteState::Selected(_) = entry.state {
+        } else if let PrefixState::Selected(_) = entry.state {
             // The prefix is retracted and no longer reachable.
             trigger_update = true;
 
             self.outputs.push_back(Output::RouteHold(prefix));
 
-            entry.state = RouteState::Held(self.timers.insert(
+            entry.state = PrefixState::Held(self.timers.insert(
                 Timer::RouteHold(prefix),
                 self.params.get(DurationKey::RouteHoldTime),
             ));
@@ -1781,10 +1781,10 @@ impl State {
     /// or the local router-id, seqno, and a zero metric for an injected route,
     /// or the last advertised router-id, seqno, and an infinite metric for a held prefix,
     /// or `None` when no route to the prefix is selected.
-    fn advert_for_prefix(&self, entry: &PrefixRouteEntry) -> Option<Advert> {
+    fn advert_for_prefix(&self, entry: &PrefixEntry) -> Option<Advert> {
         match entry.state {
             // A route injected by this node (RFC 8966 §3.7).
-            RouteState::Injected => Some(Advert {
+            PrefixState::Injected => Some(Advert {
                 router_id: self.router_id,
                 seqno: self.seqno,
                 metric: 0,
