@@ -12,12 +12,12 @@ use std::{
     collections::{HashMap, HashSet, VecDeque, hash_map},
     hash::Hash,
     mem,
-    net::Ipv6Addr,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
     num::NonZeroU8,
     time::{Duration, Instant},
 };
 
-use ipnet::Ipv6Net;
+use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use slotmap::{SecondaryMap, SlotMap, SparseSecondaryMap, sparse_secondary};
 
 use crate::babel::{
@@ -180,7 +180,7 @@ impl NeighEntry {
 /// Identifies a source of routing information (destination of data traffic).
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct SourceKey {
-    prefix: Ipv6Net,
+    prefix: IpNet,
     router_id: RouterId,
 }
 
@@ -242,7 +242,7 @@ impl RouteEntry {
     }
 
     /// Checks whether the route is feasible (see [`update_feasible`]).
-    fn is_feasible(&self, prefix: Ipv6Net, source_table: &HashMap<SourceKey, SourceEntry>) -> bool {
+    fn is_feasible(&self, prefix: IpNet, source_table: &HashMap<SourceKey, SourceEntry>) -> bool {
         let key = SourceKey {
             prefix,
             router_id: self.router_id,
@@ -252,7 +252,7 @@ impl RouteEntry {
 
     /// Checks whether the route may be selected, that is, whether it is feasible and its
     /// metric is finite (RFC 8966 §3.6).
-    fn is_usable(&self, prefix: Ipv6Net, source_table: &HashMap<SourceKey, SourceEntry>) -> bool {
+    fn is_usable(&self, prefix: IpNet, source_table: &HashMap<SourceKey, SourceEntry>) -> bool {
         self.metric.get() != METRIC_INFINITY && self.is_feasible(prefix, source_table)
     }
 }
@@ -269,6 +269,39 @@ fn update_feasible(
     source_table.get(&key).is_none_or(|source| {
         source.seqno.lt(seqno) || (seqno == source.seqno && metric < source.metric)
     })
+}
+
+/// Returns the prefix that a TLV carries in its AE, Plen and Prefix fields, or `None` for
+/// AE 0 (wildcard). AEs 1 and 4 (v4-via-v6) carry an IPv4 prefix alike (RFC 9229 §4.1),
+/// and a request with either MUST be treated in the same manner (§2.3).
+fn decode_prefix(ae: Ae, plen: u8, prefix: [u8; 16]) -> Option<IpNet> {
+    Some(match ae {
+        Ae::Wildcard => return None,
+        Ae::Ipv4 | Ae::V4ViaV6 => {
+            let addr = Ipv4Addr::from_octets(*prefix.first_chunk().unwrap());
+            Ipv4Net::new_assert(addr, plen).into()
+        }
+        Ae::Ipv6 => Ipv6Net::new_assert(Ipv6Addr::from_octets(prefix), plen).into(),
+        Ae::LinkLocalIpv6 => panic!("AE 3 should not carry a prefix"),
+    })
+}
+
+/// Returns the AE, Plen and Prefix fields that carry a prefix in a TLV, with `ipv4_ae`
+/// for an IPv4 prefix: AE 4 (v4-via-v6) in an Update, as packets are sent over IPv6 (RFC
+/// 9229 §2.1), and AE 1 in a request (§2.3).
+fn encode_prefix(prefix: IpNet, ipv4_ae: Ae) -> (Ae, u8, [u8; 16]) {
+    let mut octets = [0; 16];
+    let ae = match prefix.addr() {
+        IpAddr::V4(addr) => {
+            octets[..4].copy_from_slice(&addr.octets());
+            ipv4_ae
+        }
+        IpAddr::V6(addr) => {
+            octets = addr.octets();
+            Ae::Ipv6
+        }
+    };
+    (ae, prefix.prefix_len(), octets)
 }
 
 /// The routing state for a prefix.
@@ -330,12 +363,12 @@ impl PrefixRouteEntry {
 
 #[derive(Default)]
 struct RouteTable {
-    prefix_entries: HashMap<Ipv6Net, PrefixRouteEntry>,
-    neigh_prefixes: SecondaryMap<NeighKey, HashSet<Ipv6Net>>,
+    prefix_entries: HashMap<IpNet, PrefixRouteEntry>,
+    neigh_prefixes: SecondaryMap<NeighKey, HashSet<IpNet>>,
 }
 
 impl RouteTable {
-    fn inject(&mut self, prefix: Ipv6Net) -> bool {
+    fn inject(&mut self, prefix: IpNet) -> bool {
         match self.prefix_entries.entry(prefix) {
             hash_map::Entry::Occupied(_) => false,
             hash_map::Entry::Vacant(e) => {
@@ -353,7 +386,7 @@ impl RouteTable {
     /// a new route returned by `f` is inserted.
     fn get_or_insert_with(
         &mut self,
-        prefix: Ipv6Net,
+        prefix: IpNet,
         key: NeighKey,
         f: impl FnOnce() -> RouteEntry,
     ) -> (RouteState, Option<&mut RouteEntry>) {
@@ -369,7 +402,7 @@ impl RouteTable {
         (entry.state, route)
     }
 
-    fn remove(&mut self, prefix: &Ipv6Net, key: NeighKey) -> Option<RouteEntry> {
+    fn remove(&mut self, prefix: &IpNet, key: NeighKey) -> Option<RouteEntry> {
         let route = self.prefix_entries.get_mut(prefix)?.routes.remove(key)?;
         assert!(self.neigh_prefixes[key].remove(prefix));
         Some(route)
@@ -481,10 +514,10 @@ enum Timer {
     IncomingHello(NeighKey),
     IncomingIhu(NeighKey),
     SourceGc(SourceKey),
-    RouteNearExpiry(Ipv6Net, NeighKey),
-    RouteExpiry(Ipv6Net, NeighKey),
-    RouteHold(Ipv6Net),
-    SeqnoRequest(Ipv6Net),
+    RouteNearExpiry(IpNet, NeighKey),
+    RouteExpiry(IpNet, NeighKey),
+    RouteHold(IpNet),
+    SeqnoRequest(IpNet),
     BufferFlush(NeighKey),
 }
 
@@ -493,11 +526,11 @@ pub enum Output {
     /// Sends a Babel packet to a neighbour.
     Packet(NeighKey, Packet),
     /// Selects a neighbour as the next-hop router to a prefix.
-    RouteSelect(Ipv6Net, NeighKey),
+    RouteSelect(IpNet, NeighKey),
     /// Holds a prefix by installing an unreachable route.
-    RouteHold(Ipv6Net),
+    RouteHold(IpNet),
     /// Removes the route to a prefix.
-    RouteRemove(Ipv6Net),
+    RouteRemove(IpNet),
 }
 
 /// The state of a Babel router.
@@ -553,7 +586,7 @@ pub struct State {
     neigh_table: SlotMap<NeighKey, NeighEntry>,
     source_table: HashMap<SourceKey, SourceEntry>,
     route_table: RouteTable,
-    seqno_request_table: HashMap<Ipv6Net, SeqnoRequestEntry>,
+    seqno_request_table: HashMap<IpNet, SeqnoRequestEntry>,
     outputs: VecDeque<Output>,
     timers: TimerQueue<Timer>,
     /// The current time, as a timestamp (see [`timestamp`]).
@@ -561,7 +594,7 @@ pub struct State {
     // Temporary states for each received packet.
     /// The prefixes whose routes through the sender have been added, modified, or removed
     /// by the packet. A single prefix may appear more than once.
-    updated_prefixes: Vec<Ipv6Net>,
+    updated_prefixes: Vec<IpNet>,
     /// The route and seqno requests received, to be handled after route selection.
     requests: Vec<Tlv>,
     /// The receive timestamp of the packet (RFC 9616 §3.1).
@@ -640,7 +673,7 @@ impl State {
     /// No update is sent for it at once: neighbours first learn of it from the next
     /// periodic update. Injected routes are meant to be added when the node starts,
     /// before any neighbour is added, which this does not delay.
-    pub fn inject_route(&mut self, prefix: Ipv6Net) -> bool {
+    pub fn inject_route(&mut self, prefix: IpNet) -> bool {
         self.route_table.inject(prefix.trunc())
     }
 
@@ -825,11 +858,8 @@ impl State {
                 // Shortly before a selected route expires, a route request SHOULD be sent
                 // to the neighbour that advertised it (RFC 8966 §3.8.2.3).
                 if entry.state.selected() == Some(key) {
-                    let tlv = Tlv::RouteRequest {
-                        ae: Ae::Ipv6,
-                        plen: prefix.prefix_len(),
-                        prefix: prefix.addr().octets(),
-                    };
+                    let (ae, plen, prefix) = encode_prefix(prefix, Ae::Ipv4);
+                    let tlv = Tlv::RouteRequest { ae, plen, prefix };
                     self.send(Some(key), None, |e| e.put_tlv(&tlv));
                 }
             }
@@ -1056,7 +1086,7 @@ impl State {
     fn handle_request(&mut self, from: NeighKey, tlv: &Tlv) {
         match *tlv {
             Tlv::RouteRequest { ae, plen, prefix } => {
-                self.handle_route_request(from, ae, plen, prefix);
+                self.handle_route_request(from, decode_prefix(ae, plen, prefix));
             }
             Tlv::SeqnoRequest {
                 ae,
@@ -1066,57 +1096,35 @@ impl State {
                 router_id,
                 prefix,
             } => {
-                if ae != Ae::Ipv6 {
-                    return;
-                }
-                let prefix = Ipv6Net::new_assert(Ipv6Addr::from_octets(prefix), plen);
+                // A seqno request with AE 0 already fails to decode as a TLV.
+                let prefix = decode_prefix(ae, plen, prefix).unwrap();
                 self.handle_seqno_request(from, seqno, hop_count, router_id, prefix);
             }
             _ => unreachable!(),
         }
     }
 
-    /// Answers a route request (RFC 8966 §3.8.1.1, RFC 9229 §2.3).
-    fn handle_route_request(&mut self, from: NeighKey, ae: Ae, plen: u8, prefix: [u8; 16]) {
-        if ae == Ae::Wildcard {
+    /// Answers a route request for a prefix, or a wildcard one with `None` (RFC 8966
+    /// §3.8.1.1, RFC 9229 §2.3).
+    fn handle_route_request(&mut self, from: NeighKey, prefix: Option<IpNet>) {
+        let Some(prefix) = prefix else {
             // TODO: Full route table dumps SHOULD be rate-limited.
             self.dump_routes(from);
             return;
-        }
-
-        let advert = match ae {
-            Ae::Ipv6 => {
-                let prefix = Ipv6Net::new_assert(Ipv6Addr::from_octets(prefix), plen);
-                let entry = self.route_table.prefix_entries.get(&prefix);
-                let advert = entry.and_then(|e| self.advert_for_prefix(e));
-
-                if let Some(advert) = advert {
-                    self.update_source_table(prefix, advert);
-                }
-                advert
-            }
-            Ae::Ipv4 | Ae::V4ViaV6 => None,
-            Ae::Wildcard | Ae::LinkLocalIpv6 => unreachable!(),
         };
+
+        let entry = self.route_table.prefix_entries.get(&prefix);
 
         // The local router-id and seqno are used for retracting an unknown route.
-        let advert = advert.unwrap_or(Advert {
-            router_id: self.router_id,
-            seqno: self.seqno,
-            metric: METRIC_INFINITY,
-        });
+        let advert = entry
+            .and_then(|e| self.advert_for_prefix(e))
+            .unwrap_or(Advert {
+                router_id: self.router_id,
+                seqno: self.seqno,
+                metric: METRIC_INFINITY,
+            });
 
-        let update = Update {
-            ae,
-            plen,
-            interval: self.params.get(IntervalKey::Update),
-            seqno: advert.seqno,
-            metric: advert.metric,
-            prefix,
-            router_id: Some(advert.router_id),
-        };
-
-        self.send(Some(from), None, |e| e.put_update(&update));
+        self.send_update(Some(from), None, false, prefix, advert);
     }
 
     /// Answers a seqno request (RFC 8966 §3.8.1.2).
@@ -1126,7 +1134,7 @@ impl State {
         seqno: Seqno,
         hop_count: NonZeroU8,
         router_id: RouterId,
-        prefix: Ipv6Net,
+        prefix: IpNet,
     ) {
         let Some(entry) = self.route_table.prefix_entries.get(&prefix) else {
             return;
@@ -1289,13 +1297,15 @@ impl State {
 
         let timeout = self.params.get(DurationKey::UrgentTimeout);
 
+        let (ae, plen, prefix) = encode_prefix(key.prefix, Ae::Ipv4);
+
         let tlv = Tlv::SeqnoRequest {
-            ae: Ae::Ipv6,
-            plen: key.prefix.prefix_len(),
+            ae,
+            plen,
             seqno,
             hop_count: hop_count.unwrap_or(DEFAULT_HOP_COUNT),
             router_id: key.router_id,
-            prefix: key.prefix.addr().octets(),
+            prefix,
         };
 
         self.send(to, Some(timeout), |e| e.put_tlv(&tlv));
@@ -1331,20 +1341,14 @@ impl State {
             router_id,
         } = *update;
 
-        if ae == Ae::Wildcard {
+        let Some(prefix) = decode_prefix(ae, plen, prefix) else {
             // Wildcard retraction.
             assert_eq!(metric, METRIC_INFINITY);
 
             let prefixes = self.remove_neigh_routes(from);
             self.updated_prefixes.extend(prefixes);
             return;
-        }
-
-        if ae != Ae::Ipv6 {
-            return;
-        }
-
-        let prefix = Ipv6Net::new_assert(Ipv6Addr::from_octets(prefix), plen);
+        };
 
         if metric == METRIC_INFINITY {
             if let Some(route) = self.route_table.remove(&prefix, from) {
@@ -1417,7 +1421,7 @@ impl State {
 
     /// Removes the routes through a neighbour along with their expiry timers,
     /// returning their prefixes.
-    fn remove_neigh_routes(&mut self, key: NeighKey) -> HashSet<Ipv6Net> {
+    fn remove_neigh_routes(&mut self, key: NeighKey) -> HashSet<IpNet> {
         let prefixes = mem::take(&mut self.route_table.neigh_prefixes[key]);
         for prefix in &prefixes {
             let entry = self.route_table.prefix_entries.get_mut(prefix).unwrap();
@@ -1446,7 +1450,7 @@ impl State {
     /// expires while nothing is selected. A better route that has not changed is only
     /// switched to when it is next updated, which its neighbour does about once per
     /// Update interval.
-    fn select_route(&mut self, prefix: Ipv6Net, changed: Option<NeighKey>) {
+    fn select_route(&mut self, prefix: IpNet, changed: Option<NeighKey>) {
         // A prefix may have no entry: a source table entry can outlive it, and selection
         // may have already removed it for a prefix recorded more than once in a packet.
         let Some(entry) = self.route_table.prefix_entries.get_mut(&prefix) else {
@@ -1667,9 +1671,13 @@ impl State {
             .collect();
 
         // By router-id, those with the router-id omitted first, then by prefix, whose
-        // derived order is by address, then by length.
+        // derived order is IPv4 first, then by address, then by length.
         updates.sort_unstable_by_key(|&(prefix, advert, _)| {
-            let omitted = advert.router_id.get() == prefix.addr().to_bits() as u64;
+            let bits = match prefix.addr() {
+                IpAddr::V4(addr) => u64::from(addr.to_bits()),
+                IpAddr::V6(addr) => addr.to_bits() as u64,
+            };
+            let omitted = advert.router_id.get() == bits;
             (advert.router_id, !omitted, prefix)
         });
 
@@ -1688,20 +1696,22 @@ impl State {
         to: Option<NeighKey>,
         not_to: Option<NeighKey>,
         urgent: bool,
-        prefix: Ipv6Net,
+        prefix: IpNet,
         advert: Advert,
     ) {
         self.update_source_table(prefix, advert);
 
         let timeout = urgent.then(|| self.params.get(DurationKey::UrgentTimeout));
 
+        let (ae, plen, prefix) = encode_prefix(prefix, Ae::V4ViaV6);
+
         let update = Update {
-            ae: Ae::Ipv6,
-            plen: prefix.prefix_len(),
+            ae,
+            plen,
             interval: self.params.get(IntervalKey::Update),
             seqno: advert.seqno,
             metric: advert.metric,
-            prefix: prefix.addr().octets(),
+            prefix,
             router_id: Some(advert.router_id),
         };
 
@@ -1783,7 +1793,7 @@ impl State {
         }
     }
 
-    fn update_source_table(&mut self, prefix: Ipv6Net, advert: Advert) {
+    fn update_source_table(&mut self, prefix: IpNet, advert: Advert) {
         let Advert {
             router_id,
             seqno,

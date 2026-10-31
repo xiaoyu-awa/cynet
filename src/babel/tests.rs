@@ -10,7 +10,7 @@ const INF: u16 = COST_INFINITY;
 /// The rxcost, txcost and link cost of a link that is up with a negligible RTT.
 const UP: (u16, u16, u16) = (NOMINAL_COST, NOMINAL_COST, NOMINAL_COST);
 
-fn prefix(s: &str) -> Ipv6Net {
+fn prefix(s: &str) -> IpNet {
     s.parse().unwrap()
 }
 
@@ -46,7 +46,7 @@ enum Fib {
 struct FibChange {
     time: Instant,
     node: usize,
-    prefix: Ipv6Net,
+    prefix: IpNet,
     entry: Option<Fib>,
 }
 
@@ -88,8 +88,8 @@ struct Net {
     last_arrivals: HashMap<(usize, usize), Instant>,
     sent: Vec<Sent>,
     /// The prefixes each node originates.
-    locals: Vec<Vec<Ipv6Net>>,
-    fibs: Vec<HashMap<Ipv6Net, Fib>>,
+    locals: Vec<Vec<IpNet>>,
+    fibs: Vec<HashMap<IpNet, Fib>>,
     fib_changes: Vec<FibChange>,
 }
 
@@ -174,7 +174,7 @@ impl Net {
         *self.key_maps[i].external(key).unwrap()
     }
 
-    fn originate(&mut self, i: usize, prefix: Ipv6Net) {
+    fn originate(&mut self, i: usize, prefix: IpNet) {
         assert!(self.nodes[i].inject_route(prefix));
         self.locals[i].push(prefix);
         self.process_outputs(i);
@@ -328,14 +328,14 @@ impl Net {
     /// starting with node `i`, and ending where it is delivered or dropped.
     /// Each node forwards it by the longest matching prefix, whether local or in
     /// its forwarding table, and drops it if that is unreachable.
-    fn path(&self, i: usize, dst: Ipv6Addr) -> Vec<usize> {
+    fn path(&self, i: usize, dst: IpAddr) -> Vec<usize> {
         let mut path = vec![i];
         loop {
             let j = *path.last().unwrap();
-            let longest = |prefixes: &mut dyn Iterator<Item = &Ipv6Net>| {
+            let longest = |prefixes: &mut dyn Iterator<Item = &IpNet>| {
                 prefixes
                     .filter(|prefix| prefix.contains(&dst))
-                    .map(Ipv6Net::prefix_len)
+                    .map(IpNet::prefix_len)
                     .max()
             };
             let local = self.locals.get(j).and_then(|l| longest(&mut l.iter()));
@@ -359,7 +359,7 @@ impl Net {
     }
 
     /// Returns the node that a packet to `dst` from node `i` is delivered to, if any.
-    fn delivered_to(&self, i: usize, dst: Ipv6Addr) -> Option<usize> {
+    fn delivered_to(&self, i: usize, dst: IpAddr) -> Option<usize> {
         let j = *self.path(i, dst).last().unwrap();
         let local = self
             .locals
@@ -379,7 +379,7 @@ impl Net {
         }
     }
 
-    fn fib(&self, i: usize, prefix: Ipv6Net) -> Option<Fib> {
+    fn fib(&self, i: usize, prefix: IpNet) -> Option<Fib> {
         self.fibs[i].get(&prefix).copied()
     }
 
@@ -430,24 +430,28 @@ fn route_request(ae: Ae, plen: u8, prefix: &[u8]) -> Vec<u8> {
     packet(&[&[9, 2 + prefix.len() as u8, ae as u8, plen], prefix].concat())
 }
 
-/// Builds an Update for an IPv6 prefix.
-fn update(prefix: Ipv6Net, router_id: u64, seqno: u16, metric: u16, interval: u16) -> Update {
+/// Returns the Prefix field that carries a prefix in a TLV.
+fn octets(prefix: IpNet) -> [u8; 16] {
+    encode_prefix(prefix, Ae::Ipv4).2
+}
+
+/// Builds an Update for a prefix, with AE 4 for an IPv4 one.
+fn update(prefix: IpNet, router_id: u64, seqno: u16, metric: u16, interval: u16) -> Update {
+    let (ae, plen, prefix) = encode_prefix(prefix, Ae::V4ViaV6);
     Update {
-        ae: Ae::Ipv6,
-        plen: prefix.prefix_len(),
+        ae,
+        plen,
         interval: Interval::new(interval).unwrap(),
         seqno: Seqno::new(seqno),
         metric,
-        prefix: prefix.addr().octets(),
+        prefix,
         router_id: RouterId::new(router_id),
     }
 }
 
-/// Returns whether an Update is for the given IPv6 prefix.
-fn is_for(update: &Update, prefix: Ipv6Net) -> bool {
-    update.ae == Ae::Ipv6
-        && update.plen == prefix.prefix_len()
-        && update.prefix == prefix.addr().octets()
+/// Returns whether an Update is for the given prefix.
+fn is_for(update: &Update, prefix: IpNet) -> bool {
+    decode_prefix(update.ae, update.plen, update.prefix) == Some(prefix)
 }
 
 /// Re-encodes a packet without its retractions.
@@ -1331,6 +1335,81 @@ fn routes_propagate_without_flapping() {
 }
 
 #[test]
+fn ipv4_prefixes_are_routed_like_ipv6_ones() {
+    let p4 = prefix("10.0.0.0/16");
+    let p6 = prefix("fd00::/64");
+
+    // Node 0 originates P4 and P6, which nodes 1 and 2 route through it.
+    let mut net = Net::new(3);
+    for i in 0..2 {
+        net.connect(i, i + 1, Duration::ZERO);
+    }
+    net.originate(0, p4);
+    net.originate(0, p6);
+    net.run_for(Duration::from_secs(40));
+    for i in 0..3 {
+        for p in [p4, p6] {
+            assert_eq!(net.delivered_to(i, p.addr()), Some(0), "from {i} to {p}");
+        }
+    }
+
+    // P4 is announced with AE 4 (RFC 9229 §2.1), and AE 4 is used for nothing else.
+    let updates: Vec<_> = (net.sent.iter())
+        .flat_map(|sent| updates(&sent.buf))
+        .collect();
+    assert!(updates.iter().any(|update| is_for(update, p4)));
+    for update in updates {
+        assert_eq!(is_for(&update, p4), update.ae == Ae::V4ViaV6);
+    }
+
+    // Node 0 shuts down, so that node 1 loses both prefixes, retracts them, which node 2 then
+    // holds, and sends a seqno request for each, with AE 1 for P4 (RFC 9229 §2.3).
+    let start = net.now;
+    net.shutdown(0);
+    net.run_for(Duration::from_secs(1));
+    for p in [p4, p6] {
+        assert_eq!(net.fib(2, p), Some(Fib::Unreachable));
+    }
+    let requests: Vec<_> = (net.sent.iter())
+        .filter(|sent| (sent.from, sent.to) == (1, 2) && sent.time >= start)
+        .flat_map(|sent| tlvs(&sent.buf))
+        .filter_map(|tlv| match tlv {
+            Tlv::SeqnoRequest {
+                ae, plen, prefix, ..
+            } => Some((ae, plen, prefix)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(requests.len(), 2);
+    assert!(requests.contains(&(Ae::Ipv4, 16, octets(p4))));
+    assert!(requests.contains(&(Ae::Ipv6, 64, octets(p6))));
+}
+
+#[test]
+fn ipv4_updates_with_ae_1_or_4_are_for_the_same_prefix() {
+    let p = prefix("10.8.0.0/16");
+    let mut net = neighbour_8_up();
+    let send = |net: &mut Net, ae, metric| {
+        let mut encoder = PacketEncoder::new(1400);
+        let update = Update {
+            ae,
+            ..update(p, 8, 1, metric, 400)
+        };
+        assert!(encoder.put_update(&update));
+        net.inject(8, 0, encoder.finalize().as_bytes());
+    };
+
+    // Neighbour 8 announces P with either AE, and retracts it with the other, which removes
+    // the route (RFC 9229 §2.2).
+    for (announce, retract) in [(Ae::Ipv4, Ae::V4ViaV6), (Ae::V4ViaV6, Ae::Ipv4)] {
+        send(&mut net, announce, 100);
+        assert_eq!(net.fib(0, p), Some(Fib::Via(8)));
+        send(&mut net, retract, METRIC_INFINITY);
+        assert_eq!(net.fib(0, p), Some(Fib::Unreachable));
+    }
+}
+
+#[test]
 fn routes_through_the_only_neighbour_can_be_lost_after_the_source_gc_time() {
     let p = prefix("fd00:1::/64");
 
@@ -2152,7 +2231,7 @@ fn better_routes_are_adopted_after_hysteresis() {
 /// Sets up nodes 0, 1 and 2 in a line, with node 2 originating P, and once node 0 reaches
 /// P, reboots node 2 with the same router-id, but a seqno smaller than before by `gap`.
 /// Returns P and the time of the reboot.
-fn rebooted_originator(gap: u16) -> (Net, Ipv6Net, Instant) {
+fn rebooted_originator(gap: u16) -> (Net, IpNet, Instant) {
     let p = prefix("fd00:2::/64");
 
     let mut net = Net::new(3);
@@ -2308,7 +2387,7 @@ fn random_link_failures(jitter: Duration) {
 /// Sets up node 0 with a route learnt from node 1, a local route, and neighbour 9,
 /// outside the simulation. Returns the learnt and local prefixes, between periodic
 /// dumps, which are sent every 16 s and flushed within 2 s.
-fn requested_net() -> (Net, Ipv6Net, Ipv6Net) {
+fn requested_net() -> (Net, IpNet, IpNet) {
     let learnt = prefix("fd00:1::/64");
     let local = prefix("fd00::/64");
 
@@ -2334,46 +2413,40 @@ fn updates_sent(net: &Net, from: usize, to: usize, start: Instant) -> Vec<Update
 fn route_requests_are_answered() {
     let (mut net, learnt, local) = requested_net();
     let unknown = prefix("fd00:9::/64");
+    let local_v4 = prefix("10.0.0.0/16");
+    let unknown_v4 = prefix("10.9.0.0/16");
     let interval = 1600;
+    net.originate(0, local_v4);
 
     let start = net.now;
     for p in [learnt, local, unknown] {
-        let request = route_request(Ae::Ipv6, 64, &p.addr().octets()[..8]);
-        net.inject(9, 0, &request);
+        net.inject(9, 0, &route_request(Ae::Ipv6, 64, &octets(p)[..8]));
     }
-    net.inject(9, 0, &route_request(Ae::Ipv4, 8, &[10]));
-    net.inject(9, 0, &route_request(Ae::V4ViaV6, 16, &[10, 1]));
+    // A request for an IPv4 prefix may have AE 1 or 4.
+    for p in [local_v4, unknown_v4] {
+        for ae in [Ae::Ipv4, Ae::V4ViaV6] {
+            net.inject(9, 0, &route_request(ae, 16, &octets(p)[..2]));
+        }
+    }
     // So is a request from the neighbour that the route was learnt from, although
     // updates are otherwise not sent back to it (RFC 8966 §3.7.4).
-    net.inject(
-        1,
-        0,
-        &route_request(Ae::Ipv6, 64, &learnt.addr().octets()[..8]),
-    );
+    net.inject(1, 0, &route_request(Ae::Ipv6, 64, &octets(learnt)[..8]));
     net.run_for(Duration::from_secs(3));
 
     // Each request is answered with the route that node 0 advertises, or else with
-    // a retraction carrying its own router-id and seqno, and the same AE
-    // (RFC 8966 §3.8.1.1, RFC 9229 §2.3).
+    // a retraction carrying its own router-id and seqno, with AE 4 for an IPv4 prefix
+    // whichever AE the request has (RFC 8966 §3.8.1.1, RFC 9229 §2.3).
     let (seqno_0, seqno_1) = (net.nodes[0].seqno.get(), net.nodes[1].seqno.get());
-    let ipv4_retraction = |ae, plen, octets: &[u8]| {
-        let mut prefix = [0; 16];
-        prefix[..octets.len()].copy_from_slice(octets);
-        Update {
-            ae,
-            plen,
-            prefix,
-            ..update(unknown, 1, seqno_0, METRIC_INFINITY, interval)
-        }
-    };
     assert_eq!(
         updates_sent(&net, 0, 9, start),
         [
             update(learnt, 2, seqno_1, 96, interval),
             update(local, 1, seqno_0, 0, interval),
             update(unknown, 1, seqno_0, METRIC_INFINITY, interval),
-            ipv4_retraction(Ae::Ipv4, 8, &[10]),
-            ipv4_retraction(Ae::V4ViaV6, 16, &[10, 1]),
+            update(local_v4, 1, seqno_0, 0, interval),
+            update(local_v4, 1, seqno_0, 0, interval),
+            update(unknown_v4, 1, seqno_0, METRIC_INFINITY, interval),
+            update(unknown_v4, 1, seqno_0, METRIC_INFINITY, interval),
         ]
     );
     assert_eq!(
@@ -2399,7 +2472,7 @@ fn wildcard_route_requests_are_answered_with_full_dumps() {
         prefixes.sort();
         prefixes
     };
-    let [local, learnt] = [local, learnt].map(|p| (p.prefix_len(), p.addr().octets()));
+    let [local, learnt] = [local, learnt].map(|p| (p.prefix_len(), octets(p)));
     assert_eq!(dumped(&net, 9, start), [local, learnt]);
     assert_eq!(updates_sent(&net, 0, 1, start), []);
 
@@ -2413,62 +2486,68 @@ fn wildcard_route_requests_are_answered_with_full_dumps() {
 
 #[test]
 fn selected_routes_are_requested_shortly_before_they_expire() {
-    let p = prefix("fd00:9::/64");
-    let near = update(p, 42, 1, 100, 1600);
-    let far = update(p, 42, 1, 500, 1600);
-    let request = Tlv::RouteRequest {
-        ae: Ae::Ipv6,
-        plen: 64,
-        prefix: p.addr().octets(),
-    };
-    // The times since `start` at which node 0 sent neighbour `to` a route request for P.
-    let requested = |net: &Net, to, start| -> Vec<_> {
-        (net.sent.iter())
-            .filter(|sent| (sent.from, sent.to) == (0, to) && sent.time >= start)
-            .filter(|sent| tlvs(&sent.buf).contains(&request))
-            .map(|sent| sent.time - start)
-            .collect()
-    };
-    let buffered = Duration::from_millis(40_750)..Duration::from_millis(41_250);
+    // An IPv4 prefix is requested with AE 1 (RFC 9229 §2.3).
+    for (p, ae) in [
+        (prefix("fd00:9::/64"), Ae::Ipv6),
+        (prefix("10.9.0.0/16"), Ae::Ipv4),
+    ] {
+        let near = update(p, 42, 1, 100, 1600);
+        let far = update(p, 42, 1, 500, 1600);
+        let request = Tlv::RouteRequest {
+            ae,
+            plen: p.prefix_len(),
+            prefix: octets(p),
+        };
+        // The times since `start` at which node 0 sent neighbour `to` a route request for P.
+        let requested = |net: &Net, to, start| -> Vec<_> {
+            (net.sent.iter())
+                .filter(|sent| (sent.from, sent.to) == (0, to) && sent.time >= start)
+                .filter(|sent| tlvs(&sent.buf).contains(&request))
+                .map(|sent| sent.time - start)
+                .collect()
+        };
+        let buffered = Duration::from_millis(40_750)..Duration::from_millis(41_250);
 
-    // Node 0 learns P from neighbours 8 and 9, which advertise an Update interval of 16 s, and
-    // selects the route through neighbour 9. Neither sends another update, but both stay up.
-    let mut net = Net::new(1);
-    net.add_neighbour(0, 8);
-    net.add_neighbour(0, 9);
-    let (mut n8, mut n9) = (Scripted::new(8), Scripted::new(9));
-    let start = net.now;
-    exchange(
-        &mut net,
-        &mut n8,
-        &mut n9,
-        44,
-        from_ref(&far),
-        from_ref(&near),
-    );
-    assert_eq!(net.fib(0, p), Some(Fib::Via(9)));
+        // Node 0 learns P from neighbours 8 and 9, which advertise an Update interval of
+        // 16 s, and selects the route through neighbour 9. Neither sends another update, but
+        // both stay up.
+        let mut net = Net::new(1);
+        net.add_neighbour(0, 8);
+        net.add_neighbour(0, 9);
+        let (mut n8, mut n9) = (Scripted::new(8), Scripted::new(9));
+        let start = net.now;
+        exchange(
+            &mut net,
+            &mut n8,
+            &mut n9,
+            44,
+            from_ref(&far),
+            from_ref(&near),
+        );
+        assert_eq!(net.fib(0, p), Some(Fib::Via(9)));
 
-    // 2.5 Update intervals after the update, 40 s, node 0 requests P from neighbour 9 (RFC 8966
-    // §3.8.2.3), in a TLV buffered for 0.75 to 1.25 s, but not from neighbour 8, as its route
-    // is not selected.
-    let [after] = requested(&net, 9, start)[..] else {
-        panic!("node 0 should request P once");
-    };
-    assert!(buffered.contains(&after));
-    assert_eq!(requested(&net, 8, start), []);
+        // 2.5 Update intervals after the update, 40 s, node 0 requests P from neighbour 9
+        // (RFC 8966 §3.8.2.3), in a TLV buffered for 0.75 to 1.25 s, but not from neighbour
+        // 8, as its route is not selected.
+        let [after] = requested(&net, 9, start)[..] else {
+            panic!("node 0 should request {p} once");
+        };
+        assert!(buffered.contains(&after));
+        assert_eq!(requested(&net, 8, start), []);
 
-    // Neighbour 9 answers with an update, which refreshes the route, so that it outlasts the
-    // 3.5 Update intervals, 56 s, after which the route through neighbour 8 expires. Node 0
-    // requests P again 40 s after the answer.
-    let answered = net.now;
-    exchange(&mut net, &mut n8, &mut n9, 44, &[], from_ref(&near));
-    assert_eq!(net.fib(0, p), Some(Fib::Via(9)));
-    let routes = &net.nodes[0].route_table.prefix_entries[&p].routes;
-    assert!(!routes.contains_key(net.key(0, 8)));
-    let [after] = requested(&net, 9, answered)[..] else {
-        panic!("node 0 should request P once more");
-    };
-    assert!(buffered.contains(&after));
+        // Neighbour 9 answers with an update, which refreshes the route, so that it outlasts
+        // the 3.5 Update intervals, 56 s, after which the route through neighbour 8 expires.
+        // Node 0 requests P again 40 s after the answer.
+        let answered = net.now;
+        exchange(&mut net, &mut n8, &mut n9, 44, &[], from_ref(&near));
+        assert_eq!(net.fib(0, p), Some(Fib::Via(9)));
+        let routes = &net.nodes[0].route_table.prefix_entries[&p].routes;
+        assert!(!routes.contains_key(net.key(0, 8)));
+        let [after] = requested(&net, 9, answered)[..] else {
+            panic!("node 0 should request {p} once more");
+        };
+        assert!(buffered.contains(&after));
+    }
 }
 
 #[test]
@@ -2530,7 +2609,7 @@ fn requests_are_handled_after_route_selection() {
     let request = Tlv::RouteRequest {
         ae: Ae::Ipv6,
         plen: 64,
-        prefix: p.addr().octets(),
+        prefix: octets(p),
     };
     net.inject(9, 0, &retract_and_ask(request));
     assert_eq!(net.fib(0, p), Some(Fib::Via(8)));
@@ -2552,7 +2631,7 @@ fn requests_are_handled_after_route_selection() {
         seqno: Seqno::new(2),
         hop_count: NonZeroU8::new(64).unwrap(),
         router_id: RouterId::new(42).unwrap(),
-        prefix: p.addr().octets(),
+        prefix: octets(p),
     };
     net.inject(9, 0, &retract_and_ask(request));
     assert_eq!(net.fib(0, p), Some(Fib::Unreachable));
@@ -2563,7 +2642,7 @@ fn requests_are_handled_after_route_selection() {
 }
 
 /// Builds a packet with a seqno request for an IPv6 prefix.
-fn seqno_request(prefix: Ipv6Net, router_id: u64, seqno: u16, hop_count: u8) -> Vec<u8> {
+fn seqno_request(prefix: IpNet, router_id: u64, seqno: u16, hop_count: u8) -> Vec<u8> {
     let mut encoder = PacketEncoder::new(1400);
     assert!(encoder.put_tlv(&Tlv::SeqnoRequest {
         ae: Ae::Ipv6,
@@ -2571,7 +2650,7 @@ fn seqno_request(prefix: Ipv6Net, router_id: u64, seqno: u16, hop_count: u8) -> 
         seqno: Seqno::new(seqno),
         hop_count: NonZeroU8::new(hop_count).unwrap(),
         router_id: RouterId::new(router_id).unwrap(),
-        prefix: prefix.addr().octets(),
+        prefix: octets(prefix),
     }));
     encoder.finalize().as_bytes().to_vec()
 }
@@ -2618,7 +2697,7 @@ fn requests_sent(net: &Net, from: usize, to: usize, start: Instant) -> Vec<(u64,
 /// Sets up node 0 with a local prefix, a route to P through neighbour 9 (router-id 42,
 /// seqno 10, metric 196), and neighbours 7 and 8, all outside the simulation. Returns the
 /// local prefix, P and neighbour 9, which has just sent a Hello, between periodic dumps.
-fn seqno_net() -> (Net, Ipv6Net, Ipv6Net, Scripted) {
+fn seqno_net() -> (Net, IpNet, IpNet, Scripted) {
     let local = prefix("fd00::/64");
     let p = prefix("fd00:9::/64");
 
