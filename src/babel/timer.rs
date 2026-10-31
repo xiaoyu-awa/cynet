@@ -78,6 +78,11 @@ impl<T> TimerQueue<T> {
         }
     }
 
+    /// Sets the value of a timer.
+    pub fn set(&mut self, key: TimerKey, value: T) {
+        self.timers[key].0 = value;
+    }
+
     /// Removes a timer, returning its value.
     pub fn remove(&mut self, key: TimerKey) -> T {
         self.timers.remove(key).expect("timer should exist").0

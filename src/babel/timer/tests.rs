@@ -4,8 +4,8 @@ use rand::{RngExt, SeedableRng, rngs::StdRng};
 
 use super::*;
 
-/// Random insertions, resets, removals and passing time give the same timers, in the same
-/// order of deadline, as a map of their deadlines.
+/// Random insertions, resets, changes of value, removals and passing time give the same
+/// timers, in the same order of deadline, as a map of their deadlines.
 #[test]
 fn timers_match_a_model() {
     let base = Instant::now();
@@ -46,6 +46,11 @@ fn timers_match_a_model() {
                 6 if !keys.is_empty() => {
                     let key = keys.swap_remove(rng.random_range(0..keys.len()));
                     assert_eq!(timers.remove(key), model.remove(&key).unwrap().0);
+                }
+                7 if !keys.is_empty() => {
+                    let key = keys[rng.random_range(0..keys.len())];
+                    timers.set(key, id);
+                    model.get_mut(&key).unwrap().0 = id;
                 }
                 _ => {
                     now += match rng.random_range(0..3) {

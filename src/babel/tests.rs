@@ -1,4 +1,4 @@
-use std::{array::from_ref, collections::BTreeMap};
+use std::{array::from_ref, collections::BTreeMap, iter};
 
 use rand::{RngExt, SeedableRng, rngs::StdRng};
 
@@ -14,14 +14,17 @@ fn prefix(s: &str) -> Ipv6Net {
     s.parse().unwrap()
 }
 
+/// Returns the default parameters, but with the Hello and Update timers not randomized, so
+/// that Hellos and full dumps follow their intervals exactly.
+fn params() -> Params {
+    let mut params = Params::new();
+    params.set_randomize_timers(false);
+    params
+}
+
 /// Creates a new state for node `i`, starting at `now`.
 fn state(i: usize, now: Instant) -> State {
-    State::new(
-        now,
-        Params::new(),
-        RouterId::new((i + 1) as u64).unwrap(),
-        None,
-    )
+    State::new(now, params(), RouterId::new((i + 1) as u64).unwrap(), None)
 }
 
 /// A packet sent by a node, whether or not it was delivered.
@@ -116,6 +119,14 @@ impl Net {
     /// sends the wildcard retraction that node `i` outputs for it.
     fn add_neighbour(&mut self, i: usize, j: usize) {
         let key = self.nodes[i].add_neighbour(self.now);
+        self.key_maps[i].insert(j, key);
+        self.process_outputs(i);
+    }
+
+    /// Adds node `j` as a neighbour of node `i` (see [`Self::add_neighbour`]), with the seqno
+    /// of the first Hello that node `i` sends node `j`.
+    fn add_neighbour_with_hello_seqno(&mut self, i: usize, j: usize, hello_seqno: Seqno) {
+        let key = self.nodes[i].add_neighbour_with_hello_seqno(self.now, hello_seqno);
         self.key_maps[i].insert(j, key);
         self.process_outputs(i);
     }
@@ -377,12 +388,6 @@ impl Net {
         &self.nodes[i].neigh_table[self.key(i, j)]
     }
 
-    /// Sets the seqno of the next Hello that node `i` sends node `j`.
-    fn set_hello_seqno(&mut self, i: usize, j: usize, seqno: Seqno) {
-        let key = self.key(i, j);
-        self.nodes[i].neigh_table[key].hello_seqno = seqno;
-    }
-
     /// Returns node `i`'s rxcost, txcost and link cost for node `j`.
     fn costs(&self, i: usize, j: usize) -> (u16, u16, u16) {
         let neigh = self.neigh(i, j);
@@ -536,7 +541,7 @@ fn link_cost() {
     ];
 
     for (bits, txcost, rtt_ms, rxcost, cost) in rows {
-        let mut neigh = NeighEntry::new(&Params::new());
+        let mut neigh = NeighEntry::new(&Params::new(), Seqno::new(0));
 
         // Receive or miss a Hello for each bit, the most recent last.
         for (i, seqno) in (0..16).rev().zip(0..) {
@@ -680,10 +685,10 @@ fn neighbours_are_sent_hellos_and_dumps_on_schedules_of_their_own() {
     net.run_for(Duration::from_secs(64));
 
     // Each neighbour is on a point-to-point link of its own, so it is sent Hellos with
-    // consecutive seqnos of its own (RFC 8966 §3.4.1). It is sent one every Hello interval
-    // and a full dump every Update interval, both counted from when it was added, and each
-    // sent after the 0.75 to 1.25 s for which TLVs are buffered.
-    let buffered = Duration::from_millis(750)..=Duration::from_millis(1250);
+    // consecutive seqnos of its own (RFC 8966 §3.4.1). With timers not randomized, it is sent
+    // one every Hello interval and a full dump every Update interval, both counted from when
+    // it was added, and each sent after the 0.75 to 1.25 s for which TLVs are buffered.
+    let buffered = Duration::from_millis(750)..Duration::from_millis(1250);
     for (j, added) in added {
         let sent: Vec<_> = (net.sent.iter())
             .filter(|sent| (sent.from, sent.to) == (0, j))
@@ -719,6 +724,81 @@ fn neighbours_are_sent_hellos_and_dumps_on_schedules_of_their_own() {
             let due = added + Duration::from_secs(16) * i as u32;
             assert!(buffered.contains(&(time - due)));
         }
+    }
+}
+
+#[test]
+fn hellos_and_full_dumps_are_spread_out_by_default() {
+    const NEIGHS: usize = 50;
+    let p = prefix("fd00::/64");
+    let mut net = Net::new(1);
+    net.nodes[0] = State::new(net.now, Params::new(), RouterId::new(1).unwrap(), None);
+    net.originate(0, p);
+    let added = net.now;
+    for j in 1..=NEIGHS {
+        net.add_neighbour(0, j);
+    }
+    net.run_for(Duration::from_hours(1));
+
+    let secs = Duration::from_secs_f64;
+    let mut phases = [vec![], vec![]];
+    let mut drifts = [vec![], vec![]];
+    for j in 1..=NEIGHS {
+        // When node 0 sent neighbour `j` each of its Hellos, and each of its updates for P,
+        // which a packet carries more than one of if two full dumps share it.
+        let (mut hellos, mut dumps) = (vec![], vec![]);
+        for sent in net
+            .sent
+            .iter()
+            .filter(|sent| (sent.from, sent.to) == (0, j))
+        {
+            let tlvs = tlvs(&sent.buf);
+            let count = tlvs
+                .iter()
+                .filter(|tlv| matches!(tlv, Tlv::Hello { .. }))
+                .count();
+            assert!(count <= 1, "packet should carry at most one Hello");
+            hellos.extend(iter::repeat_n(sent.time, count));
+            let count = updates(&sent.buf)
+                .iter()
+                .filter(|update| is_for(update, p))
+                .count();
+            dumps.extend(iter::repeat_n(sent.time, count));
+        }
+
+        // With the default timers, the first Hello and full dump are put at once, the second
+        // a random part of the interval later, and each one after that 0.96875 to 1.03125
+        // intervals after the one before. Each is sent within 1.25 s, as TLVs are buffered.
+        for (i, (times, interval)) in [(hellos, secs(4.0)), (dumps, secs(16.0))]
+            .iter()
+            .enumerate()
+        {
+            assert!(times[0] - added <= secs(1.25));
+            let phase = times[1] - times[0];
+            assert!(phase <= *interval + secs(1.25));
+            phases[i].push(phase);
+            let bounds =
+                interval.mul_f64(0.96875) - secs(1.25)..interval.mul_f64(1.03125) + secs(1.25);
+            assert!(
+                times[1..]
+                    .windows(2)
+                    .all(|pair| bounds.contains(&(pair[1] - pair[0])))
+            );
+
+            // How far the last has drifted from where fixed intervals would have put it.
+            let last = times.len() - 1;
+            let fixed = times[1] + *interval * (last - 1) as u32;
+            drifts[i].push(times[last].max(fixed) - times[last].min(fixed));
+        }
+    }
+
+    // The second Hellos and full dumps to the neighbours, added together, are spread over
+    // their intervals, and the ones after them drift apart, by more than the 1.25 s that
+    // buffering alone can account for.
+    for (i, interval) in [secs(4.0), secs(16.0)].into_iter().enumerate() {
+        assert!(phases[i].iter().any(|&phase| phase < interval / 2));
+        assert!(phases[i].iter().any(|&phase| phase > interval / 2));
+        assert!(drifts[i].iter().any(|&drift| drift > secs(1.5)));
     }
 }
 
@@ -773,8 +853,7 @@ fn rebooted_neighbour_is_reacquired() {
     // Node 1 reboots, and its Hello seqno jumps.
     let hello_seqno = net.neigh(1, 0).hello_seqno + 1000;
     net.restart(1, state(1, net.now));
-    net.add_neighbour(1, 0);
-    net.set_hello_seqno(1, 0, hello_seqno);
+    net.add_neighbour_with_hello_seqno(1, 0, hello_seqno);
 
     // Its first Hello flushes node 0's entry for it, restarting the history.
     net.run_for(Duration::from_secs(3));
@@ -812,8 +891,7 @@ fn rebooted_neighbour_routes_wait_for_the_link() {
     // refreshed.
     let hello_seqno = net.neigh(1, 0).hello_seqno + 1000;
     net.restart(1, state(1, net.now));
-    net.add_neighbour(1, 0);
-    net.set_hello_seqno(1, 0, hello_seqno);
+    net.add_neighbour_with_hello_seqno(1, 0, hello_seqno);
     net.originate(1, p);
     let changes = net.fib_changes.len();
 
@@ -842,8 +920,7 @@ fn rebooted_neighbour_old_routes_are_held_at_its_first_packet() {
     // Node 1 reboots without P, and its Hello seqno jumps.
     let hello_seqno = net.neigh(1, 0).hello_seqno + 1000;
     net.restart(1, state(1, net.now));
-    net.add_neighbour(1, 0);
-    net.set_hello_seqno(1, 0, hello_seqno);
+    net.add_neighbour_with_hello_seqno(1, 0, hello_seqno);
     net.locals[1].clear();
 
     // It sends node 0 a wildcard retraction at once (see `State::add_neighbour`), which removes
@@ -1013,8 +1090,7 @@ fn unnoticed_restarts_cause_no_loops() {
         let hello_seqnos = [0, 2, 3].map(|j| (j, net.neigh(1, j).hello_seqno));
         net.restart(1, state(1, net.now));
         for (j, hello_seqno) in hello_seqnos {
-            net.add_neighbour(1, j);
-            net.set_hello_seqno(1, j, hello_seqno);
+            net.add_neighbour_with_hello_seqno(1, j, hello_seqno);
         }
         net.run_for(Duration::from_secs(60));
         assert_eq!(net.delivered_to(3, p.addr()), Some(0));
@@ -2088,10 +2164,9 @@ fn rebooted_originator(gap: u16) -> (Net, Ipv6Net, Instant) {
 
     let seqno = Seqno::new(net.nodes[2].seqno.get().wrapping_sub(gap));
     let hello_seqno = net.neigh(2, 1).hello_seqno + 1000;
-    let node = State::new(net.now, Params::new(), net.nodes[2].router_id, Some(seqno));
+    let node = State::new(net.now, params(), net.nodes[2].router_id, Some(seqno));
     net.restart(2, node);
-    net.add_neighbour(2, 1);
-    net.set_hello_seqno(2, 1, hello_seqno);
+    net.add_neighbour_with_hello_seqno(2, 1, hello_seqno);
     assert!(net.nodes[2].inject_route(p));
 
     let reboot = net.now;
@@ -2334,6 +2409,105 @@ fn wildcard_route_requests_are_answered_with_full_dumps() {
     net.inject(1, 0, &route_request(Ae::Wildcard, 0, &[]));
     net.run_for(Duration::from_secs(3));
     assert_eq!(dumped(&net, 1, start), [local]);
+}
+
+#[test]
+fn selected_routes_are_requested_shortly_before_they_expire() {
+    let p = prefix("fd00:9::/64");
+    let near = update(p, 42, 1, 100, 1600);
+    let far = update(p, 42, 1, 500, 1600);
+    let request = Tlv::RouteRequest {
+        ae: Ae::Ipv6,
+        plen: 64,
+        prefix: p.addr().octets(),
+    };
+    // The times since `start` at which node 0 sent neighbour `to` a route request for P.
+    let requested = |net: &Net, to, start| -> Vec<_> {
+        (net.sent.iter())
+            .filter(|sent| (sent.from, sent.to) == (0, to) && sent.time >= start)
+            .filter(|sent| tlvs(&sent.buf).contains(&request))
+            .map(|sent| sent.time - start)
+            .collect()
+    };
+    let buffered = Duration::from_millis(40_750)..Duration::from_millis(41_250);
+
+    // Node 0 learns P from neighbours 8 and 9, which advertise an Update interval of 16 s, and
+    // selects the route through neighbour 9. Neither sends another update, but both stay up.
+    let mut net = Net::new(1);
+    net.add_neighbour(0, 8);
+    net.add_neighbour(0, 9);
+    let (mut n8, mut n9) = (Scripted::new(8), Scripted::new(9));
+    let start = net.now;
+    exchange(
+        &mut net,
+        &mut n8,
+        &mut n9,
+        44,
+        from_ref(&far),
+        from_ref(&near),
+    );
+    assert_eq!(net.fib(0, p), Some(Fib::Via(9)));
+
+    // 2.5 Update intervals after the update, 40 s, node 0 requests P from neighbour 9 (RFC 8966
+    // §3.8.2.3), in a TLV buffered for 0.75 to 1.25 s, but not from neighbour 8, as its route
+    // is not selected.
+    let [after] = requested(&net, 9, start)[..] else {
+        panic!("node 0 should request P once");
+    };
+    assert!(buffered.contains(&after));
+    assert_eq!(requested(&net, 8, start), []);
+
+    // Neighbour 9 answers with an update, which refreshes the route, so that it outlasts the
+    // 3.5 Update intervals, 56 s, after which the route through neighbour 8 expires. Node 0
+    // requests P again 40 s after the answer.
+    let answered = net.now;
+    exchange(&mut net, &mut n8, &mut n9, 44, &[], from_ref(&near));
+    assert_eq!(net.fib(0, p), Some(Fib::Via(9)));
+    let routes = &net.nodes[0].route_table.prefix_entries[&p].routes;
+    assert!(!routes.contains_key(net.key(0, 8)));
+    let [after] = requested(&net, 9, answered)[..] else {
+        panic!("node 0 should request P once more");
+    };
+    assert!(buffered.contains(&after));
+}
+
+#[test]
+fn routes_missing_one_full_dump_in_two_are_not_requested() {
+    thread_local! {
+        static DUMPS: Cell<u32> = const { Cell::new(0) };
+    }
+    let p = prefix("fd00:1::/64");
+
+    // Node 0 learns P from node 1, both with the default timers, but misses every other full
+    // dump. It then receives one at most 33 s after the one before, plus up to 1.25 s for
+    // buffering, within the 40 s after which it would request P (RFC 8966 §3.8.2.3).
+    let mut net = Net::new(2);
+    for i in 0..2 {
+        let router_id = RouterId::new(i as u64 + 1).unwrap();
+        net.nodes[i] = State::new(net.now, Params::new(), router_id, None);
+    }
+    // Node 1's dumps are its only packets with finite updates.
+    net.filter = |from, _, packet| {
+        let updates = updates(packet.as_bytes());
+        let dump = from == 1
+            && updates
+                .iter()
+                .any(|update| update.metric != METRIC_INFINITY);
+        let missed = dump && DUMPS.with(|dumps| dumps.replace(dumps.get() + 1) % 2 == 1);
+        (!missed).then_some(packet)
+    };
+    net.connect(0, 1, Duration::ZERO);
+    net.originate(1, p);
+    net.run_for(Duration::from_hours(1));
+
+    assert_eq!(net.fib(0, p), Some(Fib::Via(1)));
+    assert!(DUMPS.get() > 180);
+    let requests = (net.sent.iter()).flat_map(|sent| tlvs(&sent.buf));
+    assert!(
+        !requests
+            .into_iter()
+            .any(|tlv| matches!(tlv, Tlv::RouteRequest { .. }))
+    );
 }
 
 #[test]
@@ -2803,7 +2977,7 @@ fn requests_are_satisfied_by_another_router_id_after_the_hold() {
     // During the hold, neighbour 8 has an unfeasible route, which keeps the prefix's entry
     // once the hold expires, or none, so that the entry goes.
     for unfeasible in [true, false] {
-        let mut params = Params::new();
+        let mut params = params();
         params.set_hello_interval(Interval::new(100).unwrap());
         let mut net = Net::new(1);
         net.nodes[0] = State::new(net.now, params, RouterId::new(1).unwrap(), None);

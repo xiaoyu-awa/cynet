@@ -9,6 +9,8 @@ pub struct Params {
     hello_interval: Interval,
     ihu_interval: Interval,
     update_interval: Interval,
+    /// Whether the Hello and Update timers are randomized.
+    randomize_timers: bool,
     tau: u32,
 }
 
@@ -21,6 +23,7 @@ impl Params {
             hello_interval: Interval::new(400).unwrap(),
             ihu_interval: Interval::new(400 * 3).unwrap(),
             update_interval: Interval::new(400 * 4).unwrap(),
+            randomize_timers: true,
             tau: 4_000_000 * 3,
         }
     }
@@ -60,38 +63,16 @@ impl Params {
         self
     }
 
-    pub(crate) fn get_duration(&self, key: DurationKey) -> Duration {
-        match key {
-            DurationKey::HelloInterval => self.hello_interval.to_duration(),
-            DurationKey::UpdateInterval => self.update_interval.to_duration(),
-            DurationKey::InitialRequestTimeout => Duration::from_secs(2),
-            DurationKey::UrgentTimeout => Duration::from_millis(200),
-            DurationKey::SourceGcTime => Duration::from_mins(3),
-            DurationKey::RouteHoldTime => self.update_interval.to_duration() * 4,
-        }
+    /// Sets whether the Hello and Update timers are randomized. Tests turn this off, so
+    /// that Hellos and full dumps of routes follow their intervals exactly.
+    #[cfg(test)]
+    pub(crate) fn set_randomize_timers(&mut self, randomize: bool) -> &mut Self {
+        self.randomize_timers = randomize;
+        self
     }
 
-    pub(crate) fn get_interval(&self, key: IntervalKey) -> Interval {
-        match key {
-            IntervalKey::Hello => self.hello_interval,
-            IntervalKey::Ihu => self.ihu_interval,
-            IntervalKey::Update => self.update_interval,
-        }
-    }
-
-    pub(crate) fn get_f64(&self, key: F64Key) -> f64 {
-        match key {
-            F64Key::IhuHoldTimeMultiplier => 3.5,
-            F64Key::RouteExpiryTimeMultiplier => 3.5,
-            F64Key::RequestBackoffFactor => 2.0,
-        }
-    }
-
-    pub(crate) fn get_u8(&self, key: U8Key) -> u8 {
-        match key {
-            U8Key::HellosPerIhu => 3,
-            U8Key::RequestMaxResends => 3,
-        }
+    pub(crate) fn get<K: Key>(&self, key: K) -> K::Value {
+        key.get(self)
     }
 
     /// Returns the time constant for route hysteresis, in microseconds.
@@ -105,11 +86,39 @@ impl Params {
     /// is the initial request timeout, doubled every time the request has been resent
     /// (RFC 8966 Appendix B).
     pub(crate) fn seqno_request_timeout(&self, resends_left: u8) -> Duration {
-        let resends = self.get_u8(U8Key::RequestMaxResends) - resends_left;
-        let factor = self.get_f64(F64Key::RequestBackoffFactor);
-        self.get_duration(DurationKey::InitialRequestTimeout)
+        let resends = self.get(U8Key::RequestMaxResends) - resends_left;
+        let factor = self.get(F64Key::RequestBackoffFactor);
+        self.get(DurationKey::InitialRequestTimeout)
             .mul_f64(factor.powi(resends.into()))
     }
+
+    /// Returns the duration multiplied by a random number in the range from 0 to 1, or
+    /// the whole duration if timers are not randomized.
+    pub(crate) fn random_part(&self, key: DurationKey) -> Duration {
+        let d = self.get(key);
+        if !self.randomize_timers {
+            return d;
+        }
+        d.mul_f64(rand::random())
+    }
+
+    /// Returns the duration multiplied by a random number in the range of 1 ± 0.03125, or
+    /// the exact duration if timers are not randomized.
+    pub(crate) fn jittered(&self, key: DurationKey) -> Duration {
+        const J: f64 = 0.03125;
+
+        let d = self.get(key);
+        if !self.randomize_timers {
+            return d;
+        }
+        d.mul_f64(rand::random_range(1.0 - J..1.0 + J))
+    }
+}
+
+pub trait Key {
+    type Value;
+
+    fn get(self, params: &Params) -> Self::Value;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -128,6 +137,21 @@ pub enum DurationKey {
     RouteHoldTime,
 }
 
+impl Key for DurationKey {
+    type Value = Duration;
+
+    fn get(self, params: &Params) -> Duration {
+        match self {
+            DurationKey::HelloInterval => params.hello_interval.to_duration(),
+            DurationKey::UpdateInterval => params.update_interval.to_duration(),
+            DurationKey::InitialRequestTimeout => Duration::from_secs(2),
+            DurationKey::UrgentTimeout => Duration::from_millis(200),
+            DurationKey::SourceGcTime => Duration::from_mins(3),
+            DurationKey::RouteHoldTime => params.update_interval.to_duration() * 4,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IntervalKey {
     /// Hello interval. Defaults to 4 seconds.
@@ -138,15 +162,43 @@ pub enum IntervalKey {
     Update,
 }
 
+impl Key for IntervalKey {
+    type Value = Interval;
+
+    fn get(self, params: &Params) -> Interval {
+        match self {
+            IntervalKey::Hello => params.hello_interval,
+            IntervalKey::Ihu => params.ihu_interval,
+            IntervalKey::Update => params.update_interval,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum F64Key {
     /// IHU Hold time, relative to the advertised IHU interval. Defaults to 3.5.
     IhuHoldTimeMultiplier,
     /// Route Expiry time, relative to the advertised Update interval. Defaults to 3.5.
     RouteExpiryTimeMultiplier,
+    /// The time after which a selected route that has not been updated is requested
+    /// from its neighbour, relative to the advertised Update interval. Defaults to 2.5.
+    RouteNearExpiryTimeMultiplier,
     /// Request timeout, relative to the previous Request timeout
     /// when a request is resent. Defaults to 2.0.
     RequestBackoffFactor,
+}
+
+impl Key for F64Key {
+    type Value = f64;
+
+    fn get(self, _: &Params) -> f64 {
+        match self {
+            F64Key::IhuHoldTimeMultiplier => 3.5,
+            F64Key::RouteExpiryTimeMultiplier => 3.5,
+            F64Key::RouteNearExpiryTimeMultiplier => 2.5,
+            F64Key::RequestBackoffFactor => 2.0,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -155,4 +207,15 @@ pub enum U8Key {
     HellosPerIhu,
     /// The maximum number of times a request can be resent. Defaults to 3.
     RequestMaxResends,
+}
+
+impl Key for U8Key {
+    type Value = u8;
+
+    fn get(self, _: &Params) -> u8 {
+        match self {
+            U8Key::HellosPerIhu => 3,
+            U8Key::RequestMaxResends => 3,
+        }
+    }
 }

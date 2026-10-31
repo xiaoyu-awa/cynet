@@ -98,7 +98,7 @@ struct NeighEntry {
 }
 
 impl NeighEntry {
-    fn new(params: &Params) -> Self {
+    fn new(params: &Params, hello_seqno: Seqno) -> Self {
         Self {
             hello_history: HelloHistory::new(),
             txcost: COST_INFINITY,
@@ -106,8 +106,8 @@ impl NeighEntry {
             last_hello_interval: None,
             hello_timer_key: None,
             ihu_timer_key: None,
-            hello_seqno: Seqno::new(rand::random()),
-            hellos_until_ihu: params.get_u8(U8Key::HellosPerIhu),
+            hello_seqno,
+            hellos_until_ihu: params.get(U8Key::HellosPerIhu),
             packet_buf: PacketBuf {
                 // Leave room for IPv6 and UDP headers (RFC 8966 §4).
                 encoder: PacketEncoder::new(params.get_mtu() as usize - 48),
@@ -201,7 +201,10 @@ struct RouteEntry {
     /// A timestamp, as returned by [`timestamp`].
     metric_smoothed_at: Cell<u32>,
     seqno: Seqno,
-    expiry_timer_key: TimerKey,
+    /// The Interval of the last update applied, from which the route's expiry is timed.
+    last_update_interval: Interval,
+    /// The route's timer key: first for near-expiry, then for expiry.
+    timer_key: TimerKey,
 }
 
 impl RouteEntry {
@@ -421,13 +424,19 @@ impl PacketBuf {
         // 8966 §3.1). Take half of that and multiply it by 0.75 ~ 1.25, as outgoing TLVs
         // SHOULD be sent with a random delay (§3.1).
         //
-        // A Hello then waits at most 0.3125 Hello intervals, so consecutive Hellos
-        // are at most 1.3125 intervals apart, within the 1.5 intervals after which a
-        // neighbour counts a Hello as missed.
+        // A Hello then waits at most 0.3125 Hello intervals, and is put at most 1.03125
+        // intervals after the one before, so consecutive Hellos are at most 1.34375
+        // intervals apart, within the 1.5 intervals after which a neighbour counts a
+        // Hello as missed. After a lost Hello, the next is at most 2.375 intervals after
+        // the last one received, within the 2.5 intervals after which the neighbour
+        // counts a second Hello as missed, which makes its link cost infinite. With the
+        // default Hello interval of 4 s, the delay may then grow by up to 0.5 s between
+        // the two Hellos. That is the worst case, where the first was sent early, in a
+        // buffer led by another TLV.
         let timeout = || {
             params
-                .get_duration(DurationKey::HelloInterval)
-                .mul_f64(rand::random_range(0.1875..=0.3125))
+                .get(DurationKey::HelloInterval)
+                .mul_f64(rand::random_range(0.1875..0.3125))
         };
 
         if !f(&mut self.encoder) {
@@ -456,7 +465,7 @@ impl PacketBuf {
         let key = self.flush_timer_key.as_mut().unwrap();
 
         // Take half of the timeout and add some jitter as in `put`.
-        let timeout = timeout.mul_f64(rand::random_range(0.375..=0.625));
+        let timeout = timeout.mul_f64(rand::random_range(0.375..0.625));
         let new_deadline = timers.now() + timeout;
         let deadline = timers.deadline(*key);
 
@@ -472,6 +481,7 @@ enum Timer {
     IncomingHello(NeighKey),
     IncomingIhu(NeighKey),
     SourceGc(SourceKey),
+    RouteNearExpiry(Ipv6Net, NeighKey),
     RouteExpiry(Ipv6Net, NeighKey),
     RouteHold(Ipv6Net),
     SeqnoRequest(Ipv6Net),
@@ -583,24 +593,28 @@ impl State {
         }
     }
 
-    /// Adds a neighbour, and sends it a wildcard retraction at once, in a packet of
-    /// its own, so that it removes any route through this node from before a reboot
-    /// (see [Reboots]).
+    /// Adds a neighbour and returns its key.
     ///
-    /// The retraction goes at once, as the neighbour's packets may reach this node from
-    /// now on. If the neighbour is added after others, this node may have learnt routes
-    /// through them already, and the packets could loop until the retraction arrives,
-    /// for example when node 1 adds node 2 after node 3 in the network of [Reboots].
+    /// The neighbour is sent a wildcard retraction at once, unbuffered, to remove any
+    /// route through this node from before a reboot (see [Reboots]). If this node has
+    /// already learnt routes, packets coming from the neighbour could loop until the
+    /// retraction arrives, for example when node 1 adds node 2 after node 3 in the
+    /// network of [Reboots].
     ///
-    /// The neighbour is then sent its first Hello and a full dump as soon as timeouts are
-    /// next handled, as babeld does when an interface comes up, and then a Hello every
-    /// Hello interval and a full dump every Update interval.
+    /// The neighbour is then sent the first Hello and the first full route table dump,
+    /// buffered as usual. The second of each goes a random part of its interval later,
+    /// and each one after that 0.96875 to 1.03125 intervals after the one before.
     ///
     /// [Reboots]: State#reboots
     pub fn add_neighbour(&mut self, now: Instant) -> NeighKey {
+        self.add_neighbour_with_hello_seqno(now, Seqno::new(rand::random()))
+    }
+
+    /// Adds a neighbour, with the seqno of the first Hello sent to it.
+    fn add_neighbour_with_hello_seqno(&mut self, now: Instant, hello_seqno: Seqno) -> NeighKey {
         self.set_now(now);
 
-        let key = self.neigh_table.insert(NeighEntry::new(&self.params));
+        let key = (self.neigh_table).insert(NeighEntry::new(&self.params, hello_seqno));
         self.route_table.neigh_prefixes.insert(key, HashSet::new());
 
         let retraction = self.wildcard_retraction();
@@ -608,10 +622,14 @@ impl State {
             e.put_update(&retraction)
         });
 
-        self.timers
-            .insert(Timer::OutgoingHello(key), Duration::ZERO);
-        self.timers
-            .insert(Timer::OutgoingUpdate(key), Duration::ZERO);
+        self.send_hello(key);
+        self.dump_routes(key);
+
+        let timeout = self.params.random_part(DurationKey::HelloInterval);
+        self.timers.insert(Timer::OutgoingHello(key), timeout);
+
+        let timeout = self.params.random_part(DurationKey::UpdateInterval);
+        self.timers.insert(Timer::OutgoingUpdate(key), timeout);
 
         key
     }
@@ -620,8 +638,8 @@ impl State {
     /// route table already has an entry for it, whether injected or learned.
     ///
     /// No update is sent for it at once: neighbours first learn of it from the next
-    /// periodic update, up to an Update interval later. Injected routes are meant to be
-    /// added when the node starts, before it has neighbours, which this does not delay.
+    /// periodic update. Injected routes are meant to be added when the node starts,
+    /// before any neighbour is added, which this does not delay.
     pub fn inject_route(&mut self, prefix: Ipv6Net) -> bool {
         self.route_table.inject(prefix.trunc())
     }
@@ -672,7 +690,7 @@ impl State {
         Update {
             ae: Ae::Wildcard,
             plen: 0,
-            interval: self.params.get_interval(IntervalKey::Update),
+            interval: self.params.get(IntervalKey::Update),
             seqno: self.seqno,
             metric: METRIC_INFINITY,
             prefix: [0; 16],
@@ -710,14 +728,13 @@ impl State {
         self.now = timestamp(now);
     }
 
-    /// Sends a neighbour a scheduled Hello, with an IHU every few Hellos, and sets the
-    /// timer for the next one.
-    fn send_hello(&mut self, key: NeighKey) {
-        let neigh = &mut self.neigh_table[key];
+    /// Sends a neighbour a scheduled Hello, with an IHU every few Hellos.
+    fn send_hello(&mut self, to: NeighKey) {
+        let neigh = &mut self.neigh_table[to];
 
         let hello_tlv = Tlv::Hello {
             seqno: neigh.hello_seqno,
-            interval: Some(self.params.get_interval(IntervalKey::Hello)),
+            interval: Some(self.params.get(IntervalKey::Hello)),
             transmit_timestamp: Some(0),
         };
 
@@ -725,11 +742,11 @@ impl State {
 
         neigh.hellos_until_ihu -= 1;
         let tlvs = if neigh.hellos_until_ihu == 0 {
-            neigh.hellos_until_ihu = self.params.get_u8(U8Key::HellosPerIhu);
+            neigh.hellos_until_ihu = self.params.get(U8Key::HellosPerIhu);
             tlvs[1] = Tlv::Ihu {
                 ae: Ae::Wildcard,
                 rxcost: neigh.rxcost(),
-                interval: self.params.get_interval(IntervalKey::Ihu),
+                interval: self.params.get(IntervalKey::Ihu),
                 address: [0; 8],
                 origin_receive_timestamps: neigh.origin_receive_timestamps,
             };
@@ -738,32 +755,29 @@ impl State {
             &tlvs[..1]
         };
 
-        neigh.packet_buf.put(
-            key,
-            &mut self.outputs,
-            &mut self.timers,
-            &self.params,
-            |e| e.put_tlvs(tlvs),
-        );
+        neigh
+            .packet_buf
+            .put(to, &mut self.outputs, &mut self.timers, &self.params, |e| {
+                e.put_tlvs(tlvs)
+            });
 
         neigh.hello_seqno += 1;
-        self.timers.insert(
-            Timer::OutgoingHello(key),
-            self.params.get_duration(DurationKey::HelloInterval),
-        );
     }
 
     /// Handles a timer that has expired.
     fn handle_expired_timer(&mut self, timer: Timer) {
         match timer {
-            Timer::OutgoingHello(key) => self.send_hello(key),
+            Timer::OutgoingHello(key) => {
+                self.send_hello(key);
+
+                let timeout = self.params.jittered(DurationKey::HelloInterval);
+                self.timers.insert(Timer::OutgoingHello(key), timeout);
+            }
             Timer::OutgoingUpdate(key) => {
                 self.dump_routes(key);
 
-                self.timers.insert(
-                    Timer::OutgoingUpdate(key),
-                    self.params.get_duration(DurationKey::UpdateInterval),
-                );
+                let timeout = self.params.jittered(DurationKey::UpdateInterval);
+                self.timers.insert(Timer::OutgoingUpdate(key), timeout);
             }
             Timer::IncomingHello(key) => {
                 let neigh = &mut self.neigh_table[key];
@@ -798,6 +812,26 @@ impl State {
             Timer::SourceGc(key) => {
                 assert!(self.source_table.remove(&key).is_some());
                 self.select_route(key.prefix, None);
+            }
+            Timer::RouteNearExpiry(prefix, key) => {
+                let entry = self.route_table.prefix_entries.get_mut(&prefix).unwrap();
+                let route = &mut entry.routes[key];
+
+                let multiplier = self.params.get(F64Key::RouteExpiryTimeMultiplier)
+                    - self.params.get(F64Key::RouteNearExpiryTimeMultiplier);
+                let timeout = route.last_update_interval.to_duration().mul_f64(multiplier);
+                route.timer_key = self.timers.insert(Timer::RouteExpiry(prefix, key), timeout);
+
+                // Shortly before a selected route expires, a route request SHOULD be sent
+                // to the neighbour that advertised it (RFC 8966 §3.8.2.3).
+                if entry.state.selected() == Some(key) {
+                    let tlv = Tlv::RouteRequest {
+                        ae: Ae::Ipv6,
+                        plen: prefix.prefix_len(),
+                        prefix: prefix.addr().octets(),
+                    };
+                    self.send(Some(key), None, |e| e.put_tlv(&tlv));
+                }
             }
             Timer::RouteExpiry(prefix, key) => {
                 assert!(self.route_table.remove(&prefix, key).is_some());
@@ -981,7 +1015,7 @@ impl State {
                         .collect();
                     for prefix in stale {
                         let route = self.route_table.remove(&prefix, from).unwrap();
-                        self.timers.remove(route.expiry_timer_key);
+                        self.timers.remove(route.timer_key);
                         self.updated_prefixes.push(prefix);
                     }
                 }
@@ -997,7 +1031,7 @@ impl State {
 
                 let timeout = interval
                     .to_duration()
-                    .mul_f64(self.params.get_f64(F64Key::IhuHoldTimeMultiplier));
+                    .mul_f64(self.params.get(F64Key::IhuHoldTimeMultiplier));
 
                 if let Some(timer_key) = &mut neigh.ihu_timer_key {
                     self.timers.reset(timer_key, timeout);
@@ -1075,7 +1109,7 @@ impl State {
         let update = Update {
             ae,
             plen,
-            interval: self.params.get_interval(IntervalKey::Update),
+            interval: self.params.get(IntervalKey::Update),
             seqno: advert.seqno,
             metric: advert.metric,
             prefix,
@@ -1253,7 +1287,7 @@ impl State {
     ) {
         const DEFAULT_HOP_COUNT: NonZeroU8 = NonZeroU8::new(64).unwrap();
 
-        let timeout = self.params.get_duration(DurationKey::UrgentTimeout);
+        let timeout = self.params.get(DurationKey::UrgentTimeout);
 
         let tlv = Tlv::SeqnoRequest {
             ae: Ae::Ipv6,
@@ -1274,7 +1308,7 @@ impl State {
     /// That window, 1 s by default, is shorter than the time before a requester first
     /// resends a request, so the resend is forwarded too, making up for a lost copy.
     fn seqno_request_redundant(&self, key: SourceKey, seqno: Seqno) -> bool {
-        let window = self.params.get_duration(DurationKey::InitialRequestTimeout) / 2;
+        let window = self.params.get(DurationKey::InitialRequestTimeout) / 2;
         self.seqno_request_table
             .get(&key.prefix)
             .is_some_and(|request| {
@@ -1314,7 +1348,7 @@ impl State {
 
         if metric == METRIC_INFINITY {
             if let Some(route) = self.route_table.remove(&prefix, from) {
-                self.timers.remove(route.expiry_timer_key);
+                self.timers.remove(route.timer_key);
                 self.updated_prefixes.push(prefix);
             }
             return;
@@ -1327,9 +1361,9 @@ impl State {
             return;
         }
 
-        let expiry_time = interval
+        let near_expiry_time = interval
             .to_duration()
-            .mul_f64(self.params.get_f64(F64Key::RouteExpiryTimeMultiplier));
+            .mul_f64(self.params.get(F64Key::RouteNearExpiryTimeMultiplier));
 
         let (state, route) = self
             .route_table
@@ -1340,9 +1374,10 @@ impl State {
                 metric_smoothed: Cell::new(METRIC_INFINITY as f32),
                 metric_smoothed_at: Cell::new(self.now),
                 seqno,
-                expiry_timer_key: self
+                last_update_interval: interval,
+                timer_key: self
                     .timers
-                    .insert(Timer::RouteExpiry(prefix, from), expiry_time),
+                    .insert(Timer::RouteNearExpiry(prefix, from), near_expiry_time),
             });
 
         if let Some(route) = route {
@@ -1369,8 +1404,12 @@ impl State {
             route.router_id = router_id;
             route.advertised_metric = metric;
             route.seqno = seqno;
+            route.last_update_interval = interval;
 
-            self.timers.reset(&mut route.expiry_timer_key, expiry_time);
+            // Reset the timer to `RouteNearExpiry` as it can be a `RouteExpiry`.
+            self.timers
+                .set(route.timer_key, Timer::RouteNearExpiry(prefix, from));
+            self.timers.reset(&mut route.timer_key, near_expiry_time);
         }
 
         self.updated_prefixes.push(prefix);
@@ -1383,7 +1422,7 @@ impl State {
         for prefix in &prefixes {
             let entry = self.route_table.prefix_entries.get_mut(prefix).unwrap();
             let route = entry.routes.remove(key).unwrap();
-            self.timers.remove(route.expiry_timer_key);
+            self.timers.remove(route.timer_key);
         }
         prefixes
     }
@@ -1405,7 +1444,7 @@ impl State {
     /// only these two are compared, with hysteresis. All routes are considered only when
     /// the selected route changes and becomes unusable, or when a source table entry
     /// expires while nothing is selected. A better route that has not changed is only
-    /// switched to when it is next updated, which its neighbour does at least once per
+    /// switched to when it is next updated, which its neighbour does about once per
     /// Update interval.
     fn select_route(&mut self, prefix: Ipv6Net, changed: Option<NeighKey>) {
         // A prefix may have no entry: a source table entry can outlive it, and selection
@@ -1570,7 +1609,7 @@ impl State {
 
             entry.state = RouteState::Held(self.timers.insert(
                 Timer::RouteHold(prefix),
-                self.params.get_duration(DurationKey::RouteHoldTime),
+                self.params.get(DurationKey::RouteHoldTime),
             ));
 
             let advert = entry.advert.as_mut().unwrap();
@@ -1600,7 +1639,7 @@ impl State {
         if let Some(router_id) = lost_router_id {
             let key = SourceKey { prefix, router_id };
             let seqno = self.source_table[&key].seqno + 1;
-            let resends_left = self.params.get_u8(U8Key::RequestMaxResends);
+            let resends_left = self.params.get(U8Key::RequestMaxResends);
 
             // It MUST be sent to at least one of the neighbours that advertised the
             // unfeasible routes, and SHOULD be sent to all of them. Sending it to every
@@ -1654,12 +1693,12 @@ impl State {
     ) {
         self.update_source_table(prefix, advert);
 
-        let timeout = urgent.then(|| self.params.get_duration(DurationKey::UrgentTimeout));
+        let timeout = urgent.then(|| self.params.get(DurationKey::UrgentTimeout));
 
         let update = Update {
             ae: Ae::Ipv6,
             plen: prefix.prefix_len(),
-            interval: self.params.get_interval(IntervalKey::Update),
+            interval: self.params.get(IntervalKey::Update),
             seqno: advert.seqno,
             metric: advert.metric,
             prefix: prefix.addr().octets(),
@@ -1758,7 +1797,7 @@ impl State {
         }
 
         let key = SourceKey { prefix, router_id };
-        let gc_time = self.params.get_duration(DurationKey::SourceGcTime);
+        let gc_time = self.params.get(DurationKey::SourceGcTime);
 
         match self.source_table.entry(key) {
             hash_map::Entry::Occupied(e) => {
