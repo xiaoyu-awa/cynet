@@ -42,3 +42,52 @@ fn hello_history() {
     assert_eq!(history.received(Seqno::new(9)), HelloEffect::None);
     assert_eq!(history.bits(), 0b1);
 }
+
+#[test]
+fn martian_prefixes() {
+    let martian = |s: &str| martian_prefix(s.parse().unwrap());
+
+    for s in [
+        "ff00::/8",
+        "ff02::1:6/128",
+        "fe80::/10",
+        "fe80::/64",
+        "febf::1/128",
+        "::/128",
+        "::1/128",
+        "::ffff:0:0/96",
+        "::ffff:10.0.0.1/128",
+        "0.0.0.0/8",
+        "0.1.2.3/32",
+        "127.0.0.0/8",
+        "127.0.0.1/32",
+        "224.0.0.0/4",
+        "239.1.2.3/32",
+        "255.255.255.255/32",
+    ] {
+        assert!(martian(s), "{s} should be martian");
+    }
+
+    for s in [
+        // Prefixes covering a martian range, which can still route other addresses.
+        "::/0",
+        "::/64",
+        "fe80::/9",
+        "fe00::/8",
+        "::ffff:0:0/95",
+        "0.0.0.0/0",
+        "0.0.0.0/7",
+        "224.0.0.0/3",
+        // Ordinary ones.
+        "fd42::1/128",
+        "2001:db8::/32",
+        "fec0::/10",
+        "100:0:0:1::/64",
+        "10.42.0.1/32",
+        "169.254.0.0/16",
+        "192.0.0.8/32",
+        "240.0.0.0/4",
+    ] {
+        assert!(!martian(s), "{s} should not be martian");
+    }
+}

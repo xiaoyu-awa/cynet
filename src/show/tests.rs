@@ -1,0 +1,379 @@
+use std::{fs, os::unix::net, path::PathBuf, time::Duration};
+
+use gotatun::x25519::{PublicKey, StaticSecret};
+use tokio::{
+    io::AsyncWriteExt,
+    net::{UnixListener, UnixStream},
+};
+
+use super::{
+    format_age, format_bytes, format_neighbour, format_status, read_request, read_status,
+    short_key, strip_colors,
+};
+use crate::{
+    babel::{
+        RouterId, Seqno,
+        snapshot::{NeighbourSnapshot, PrefixSnapshot, PrefixStatus, RouteSnapshot, Snapshot},
+    },
+    config::encode_key,
+};
+
+fn key(n: u8) -> PublicKey {
+    PublicKey::from(&StaticSecret::from([n; 32]))
+}
+
+#[test]
+fn ages_and_sizes_are_readable() {
+    let age = |secs| strip_colors(&format_age(Duration::from_secs(secs)));
+    assert_eq!(age(1), "1 second");
+    assert_eq!(age(42), "42 seconds");
+    assert_eq!(age(61), "1 minute, 1 second");
+    assert_eq!(age(125), "2 minutes, 5 seconds");
+    // As `wg` writes them, with every unit that isn't zero.
+    assert_eq!(age(60), "1 minute");
+    assert_eq!(age(3_600), "1 hour");
+    assert_eq!(age(3_605), "1 hour, 5 seconds");
+    assert_eq!(age(3_725), "1 hour, 2 minutes, 5 seconds");
+    assert_eq!(age(288_000), "3 days, 8 hours");
+    assert_eq!(age(90_061), "1 day, 1 hour, 1 minute, 1 second");
+    assert_eq!(age(365 * 86_400 + 1), "1 year, 1 second");
+    assert_eq!(age(2 * 365 * 86_400), "2 years");
+    // Where `wg` has `Now`, or nothing at all.
+    assert_eq!(age(0), "0 seconds");
+    assert_eq!(
+        strip_colors(&format_age(Duration::from_millis(999))),
+        "0 seconds"
+    );
+
+    let bytes = |bytes| strip_colors(&format_bytes(bytes));
+    assert_eq!(bytes(0), "0 B");
+    assert_eq!(bytes(1023), "1023 B");
+    assert_eq!(bytes(1024), "1.00 KiB");
+    assert_eq!(bytes(1_258_291), "1.20 MiB");
+}
+
+#[test]
+fn status_has_the_colors_of_wg_show() {
+    let snapshot = Snapshot {
+        router_id: RouterId::new(1).unwrap(),
+        seqno: Seqno::new(1),
+        neighbours: vec![],
+        prefixes: vec![PrefixSnapshot {
+            prefix: "10.42.0.1/32".parse().unwrap(),
+            status: PrefixStatus::Injected,
+            routes: vec![],
+        }],
+    };
+    let uptime = Duration::from_secs(61);
+    let text = format_status("cyn0", &key(1), 51820, uptime, &[], &snapshot, false);
+
+    assert!(
+        text.starts_with("\x1b[32m\x1b[1minterface\x1b[0m: \x1b[32mcyn0\x1b[0m\n"),
+        "{text:?}"
+    );
+    assert!(
+        text.contains("  \x1b[1mlistening port\x1b[0m: 51820\n"),
+        "{text:?}"
+    );
+    assert!(
+        text.contains("  10.42.0.1\x1b[36m/\x1b[0m32  \x1b[32minjected\x1b[0m\n"),
+        "{text:?}"
+    );
+    assert_eq!(
+        format_age(Duration::from_secs(42)),
+        "42 \x1b[36mseconds\x1b[0m"
+    );
+    assert_eq!(format_bytes(1024), "1.00 \x1b[36mKiB\x1b[0m");
+}
+
+#[test]
+fn colors_can_be_removed() {
+    assert_eq!(strip_colors(""), "");
+    assert_eq!(strip_colors("plain…\n"), "plain…\n");
+    assert_eq!(
+        strip_colors("\x1b[32m\x1b[1ma\x1b[0m: b…\x1b[0m\n"),
+        "a: b…\n"
+    );
+    // A sequence cut off by the end of the text.
+    assert_eq!(strip_colors("a\x1b[3"), "a");
+}
+
+/// A node with an injected prefix, and one for each other status, with a route or two.
+fn snapshot_with_routes(a: PublicKey, b: PublicKey) -> Snapshot<PublicKey> {
+    let route = |via, metric, feasible| RouteSnapshot {
+        via,
+        router_id: RouterId::new(0x3c7e).unwrap(),
+        seqno: Seqno::new(812),
+        metric,
+        smoothed_metric: metric.saturating_add(2),
+        feasible,
+    };
+    Snapshot {
+        router_id: RouterId::new(0x8f3a_21c0_7d19_e4b6).unwrap(),
+        seqno: Seqno::new(7),
+        neighbours: vec![],
+        prefixes: vec![
+            PrefixSnapshot {
+                prefix: "10.42.0.1/32".parse().unwrap(),
+                status: PrefixStatus::Injected,
+                routes: vec![],
+            },
+            PrefixSnapshot {
+                prefix: "10.42.0.2/32".parse().unwrap(),
+                status: PrefixStatus::Selected(b),
+                routes: vec![route(a, 342, true), route(b, 96, true)],
+            },
+            PrefixSnapshot {
+                prefix: "10.42.0.9/32".parse().unwrap(),
+                status: PrefixStatus::Held,
+                routes: vec![route(a, u16::MAX, false)],
+            },
+            PrefixSnapshot {
+                prefix: "fd42::7/128".parse().unwrap(),
+                status: PrefixStatus::None,
+                routes: vec![route(a, 500, false)],
+            },
+        ],
+    }
+}
+
+#[test]
+fn routes_are_listed_with_the_selected_one_first() {
+    let (a, b) = (key(2), key(3));
+    let snapshot = snapshot_with_routes(a, b);
+    let uptime = Duration::from_secs(61);
+    let text = strip_colors(&format_status(
+        "cyn0",
+        &key(1),
+        51820,
+        uptime,
+        &[],
+        &snapshot,
+        false,
+    ));
+    let (key_a, key_b) = (short_key(&a), short_key(&b));
+
+    let expected = format!(
+        "interface: cyn0\n\
+         \x20 public key: {}\n\
+         \x20 listening port: 51820\n\
+         \x20 uptime: 1 minute, 1 second\n\
+         \n\
+         routes:\n\
+         \x20 10.42.0.1/32  injected\n\
+         \x20 10.42.0.2/32  via {key_b}, metric 96\n\
+         \x20               not via {key_a}, metric 342\n\
+         \x20 10.42.0.9/32  unreachable (held)\n\
+         \x20               not via {key_a}, metric infinite\n\
+         \x20 fd42::7/128   no route selected\n\
+         \x20               not via {key_a}, metric 500\n",
+        encode_key(key(1).as_bytes())
+    );
+    assert_eq!(text, expected);
+}
+
+#[test]
+fn verbose_status_adds_what_route_choices_are_based_on() {
+    let (a, b) = (key(2), key(3));
+    let snapshot = snapshot_with_routes(a, b);
+    let uptime = Duration::from_secs(61);
+    let text = strip_colors(&format_status(
+        "cyn0",
+        &key(1),
+        51820,
+        uptime,
+        &[],
+        &snapshot,
+        true,
+    ));
+    let (key_a, key_b) = (short_key(&a), short_key(&b));
+    let source = "id 0000000000003c7e, seqno 812";
+
+    let expected = format!(
+        "interface: cyn0\n\
+         \x20 public key: {}\n\
+         \x20 listening port: 51820\n\
+         \x20 router-id: 8f3a21c07d19e4b6, seqno: 7\n\
+         \x20 uptime: 1 minute, 1 second\n\
+         \n\
+         routes:\n\
+         \x20 10.42.0.1/32  injected\n\
+         \x20 10.42.0.2/32\n\
+         \x20   via {key_b}, metric 96 (98), {source}\n\
+         \x20   not via {key_a}, metric 342 (344), {source}, feasible\n\
+         \x20 10.42.0.9/32  unreachable (held)\n\
+         \x20   not via {key_a}, metric infinite (infinite), {source}\n\
+         \x20 fd42::7/128   no route selected\n\
+         \x20   not via {key_a}, metric 500 (502), {source}, unfeasible\n",
+        encode_key(key(1).as_bytes())
+    );
+    assert_eq!(text, expected);
+}
+
+/// The labels of a selected route are bold, and an unselected route stays dimmed to the end.
+#[test]
+fn verbose_route_lines_keep_their_colors() {
+    let (a, b) = (key(2), key(3));
+    let snapshot = snapshot_with_routes(a, b);
+    let uptime = Duration::from_secs(61);
+    let text = format_status("cyn0", &key(1), 51820, uptime, &[], &snapshot, true);
+
+    let selected = "\x1b[1mmetric\x1b[0m 96 (98), \
+                    \x1b[1mid\x1b[0m 0000000000003c7e, \x1b[1mseqno\x1b[0m 812\n";
+    assert!(text.contains(selected), "{text:?}");
+
+    let unselected = format!(
+        "\x1b[2mnot via {}, metric 342 (344), id 0000000000003c7e, seqno 812, feasible\x1b[0m\n",
+        short_key(&a)
+    );
+    assert!(text.contains(&unselected), "{text:?}");
+}
+
+#[test]
+fn links_are_shown_with_more_detail_when_verbose() {
+    let neighbour = NeighbourSnapshot {
+        key: key(2),
+        cost: 99,
+        rtt: Some(Duration::from_micros(12_345)),
+        rxcost: 96,
+        txcost: 96,
+        rtt_penalty: 3,
+        hello_history: 0b1011,
+        in_startup: false,
+    };
+    let format = |neighbour: &NeighbourSnapshot<PublicKey>, verbose| {
+        let mut out = String::new();
+        format_neighbour(&mut out, neighbour, verbose);
+        out
+    };
+
+    assert_eq!(
+        strip_colors(&format(&neighbour, false)),
+        "  link cost: 99, rtt: 12.3 ms\n"
+    );
+    assert_eq!(
+        strip_colors(&format(&neighbour, true)),
+        "  link cost: 99, rtt: 12.3 ms\n\
+         \x20 rxcost: 96, txcost: 96, rtt penalty: 3\n\
+         \x20 hello history: 0000000000001011 (latest last)\n"
+    );
+
+    // A link that doesn't work stands out, and a peer that has yet to answer says so when asked.
+    let starting = NeighbourSnapshot {
+        cost: u16::MAX,
+        rtt: None,
+        rxcost: u16::MAX,
+        txcost: u16::MAX,
+        rtt_penalty: 0,
+        hello_history: 0,
+        in_startup: true,
+        ..neighbour
+    };
+    assert_eq!(
+        format(&starting, false),
+        "  \x1b[1mlink cost\x1b[0m: \x1b[31minfinite\x1b[0m\n"
+    );
+    assert_eq!(
+        strip_colors(&format(&starting, true)),
+        "  link cost: infinite\n\
+         \x20 rxcost: infinite, txcost: infinite, rtt penalty: 0\n\
+         \x20 hello history: 0000000000000000 (latest last)\n\
+         \x20 startup: waiting for an acknowledgement\n"
+    );
+}
+
+/// Returns a path for a socket of this test process, with nothing there.
+fn socket_path(label: &str) -> PathBuf {
+    let path = std::env::temp_dir().join(format!("cynet-test-{}-{label}", std::process::id()));
+    let _ = fs::remove_file(&path);
+    path
+}
+
+#[tokio::test]
+async fn status_comes_from_a_running_daemon_as_asked_for() {
+    for verbose in [false, true] {
+        let path = socket_path(&format!("running-{verbose}"));
+        let listener = UnixListener::bind(&path).unwrap();
+        let daemon = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let verbose = read_request(&mut stream).await;
+            let text = format!("verbose: {verbose}\n");
+            stream.write_all(text.as_bytes()).await.unwrap();
+        });
+
+        let text = read_status(&path, verbose).await;
+        daemon.await.unwrap();
+        fs::remove_file(&path).unwrap();
+
+        assert_eq!(text.unwrap().unwrap(), format!("verbose: {verbose}\n"));
+    }
+}
+
+/// Anything else that a client says is no reason to stop it getting a status.
+#[tokio::test]
+async fn other_requests_get_the_plain_status() {
+    for request in [
+        &b"verbos\n"[..],
+        b"verbose",
+        b"nonsense\n",
+        b"verbose\nmore",
+    ] {
+        let (mut daemon, mut client) = UnixStream::pair().unwrap();
+        client.write_all(request).await.unwrap();
+        client.shutdown().await.unwrap();
+
+        let verbose = read_request(&mut daemon).await;
+        assert_eq!(verbose, request.starts_with(b"verbose\n"), "{request:?}");
+    }
+}
+
+/// So does a client that keeps quiet without closing its side, such as `socat`, in the end.
+#[tokio::test(start_paused = true)]
+async fn silent_clients_get_the_plain_status() {
+    let (mut daemon, _client) = UnixStream::pair().unwrap();
+    assert!(!read_request(&mut daemon).await);
+}
+
+/// A crash leaves the socket behind, with nothing listening on it.
+#[tokio::test]
+async fn socket_left_by_a_crash_means_not_running() {
+    let path = socket_path("left");
+    drop(net::UnixListener::bind(&path).unwrap());
+    assert!(path.exists());
+
+    let text = read_status(&path, false).await;
+    fs::remove_file(&path).unwrap();
+
+    assert_eq!(text.unwrap(), None);
+}
+
+#[tokio::test]
+async fn missing_socket_means_not_running() {
+    let text = read_status(&socket_path("missing"), false).await;
+    assert_eq!(text.unwrap(), None);
+}
+
+/// A daemon that is there but doesn't answer is a problem to report, not one to skip.
+#[tokio::test(start_paused = true)]
+async fn silent_daemon_is_an_error() {
+    let path = socket_path("silent");
+    let listener = UnixListener::bind(&path).unwrap();
+
+    let text = read_status(&path, false).await;
+    drop(listener);
+    fs::remove_file(&path).unwrap();
+
+    assert!(format!("{:#}", text.unwrap_err()).contains("timed out"));
+}
+
+/// So is any other failure to connect.
+#[tokio::test]
+async fn unusable_path_is_an_error() {
+    let file = socket_path("file");
+    fs::write(&file, "").unwrap();
+
+    let text = read_status(&file.join("cyn0.sock"), false).await;
+    fs::remove_file(&file).unwrap();
+
+    assert!(format!("{:#}", text.unwrap_err()).contains("failed to read"));
+}

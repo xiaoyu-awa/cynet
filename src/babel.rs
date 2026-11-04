@@ -1,6 +1,8 @@
 mod base;
+pub mod driver;
 mod packet;
 mod params;
+pub mod snapshot;
 mod timer;
 
 #[cfg(test)]
@@ -21,17 +23,24 @@ use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use slotmap::{SecondaryMap, SlotMap, SparseSecondaryMap, sparse_secondary};
 
 use crate::babel::{
-    base::{Ae, COST_INFINITY, HelloEffect, HelloHistory, METRIC_INFINITY, timestamp},
-    packet::{PacketDecoder, PacketEncoder, PacketItem, Update, tlv::Tlv},
+    base::{Ae, HelloEffect, HelloHistory, timestamp},
+    packet::{
+        PacketDecoder, PacketEncoder, PacketItem, Update,
+        tlv::{Tlv, UpdateFlags},
+    },
     params::{DurationKey, F64Key, IntervalKey, U8Key},
+    snapshot::{NeighbourSnapshot, PrefixSnapshot, RouteSnapshot, Snapshot},
     timer::{TimerKey, TimerQueue},
 };
 
 pub use crate::babel::{
-    base::{Interval, RouterId, Seqno},
+    base::{COST_INFINITY, Interval, METRIC_INFINITY, RouterId, Seqno, martian_prefix},
     packet::Packet,
     params::Params,
 };
+
+/// What the IPv6 and UDP headers of a Babel packet take up of a link's MTU (RFC 8966 §4).
+pub const LINK_HEADERS_LEN: usize = 48;
 
 /// How far the seqno of a seqno request may exceed its source's seqno for the source to
 /// answer it, as in babeld. A larger difference most likely means that the source lost
@@ -71,6 +80,14 @@ impl<K: Clone + Eq + Hash> NeighKeyMap<K> {
         self.outward.insert(internal, external);
     }
 
+    /// Removes a mapping by the external key.
+    pub fn remove_by_external(&mut self, external: &K) {
+        let Some(internal) = self.inward.remove(external) else {
+            panic!("mapping should exist");
+        };
+        self.outward.remove(internal);
+    }
+
     /// Returns the corresponding internal key, if any.
     pub fn internal(&self, external: &K) -> Option<NeighKey> {
         self.inward.get(external).copied()
@@ -88,13 +105,28 @@ struct NeighEntry {
     /// The link cost, as last computed by `update_cost`.
     cost: u16,
     last_hello_interval: Option<Interval>,
-    hello_timer_key: Option<TimerKey>,
-    ihu_timer_key: Option<TimerKey>,
+    incoming_hello_timer_key: Option<TimerKey>,
+    incoming_ihu_timer_key: Option<TimerKey>,
+    outgoing_hello_timer_key: Option<TimerKey>,
+    outgoing_update_timer_key: Option<TimerKey>,
     hello_seqno: Seqno,
     hellos_until_ihu: u8,
     packet_buf: PacketBuf,
     origin_receive_timestamps: Option<(u32, u32)>,
     rtt: Option<f64>,
+    /// What is awaited from the neighbour before anything else it sends is taken in, if anything
+    /// (see [Reboots](State#reboots)).
+    startup: Option<Startup>,
+}
+
+/// A startup packet to a neighbour that hasn't been acknowledged yet.
+struct Startup {
+    /// The Opaque value of its acknowledgement.
+    opaque: u16,
+    /// How long was last waited, or is being waited, before sending it again.
+    timeout: Duration,
+    /// The timer that sends it again.
+    timer_key: TimerKey,
 }
 
 impl NeighEntry {
@@ -104,17 +136,19 @@ impl NeighEntry {
             txcost: COST_INFINITY,
             cost: COST_INFINITY,
             last_hello_interval: None,
-            hello_timer_key: None,
-            ihu_timer_key: None,
+            incoming_hello_timer_key: None,
+            incoming_ihu_timer_key: None,
+            outgoing_hello_timer_key: None,
+            outgoing_update_timer_key: None,
             hello_seqno,
             hellos_until_ihu: params.get(U8Key::HellosPerIhu),
             packet_buf: PacketBuf {
-                // Leave room for IPv6 and UDP headers (RFC 8966 §4).
-                encoder: PacketEncoder::new(params.get_mtu() as usize - 48),
+                encoder: PacketEncoder::new(params.get_mtu() as usize - LINK_HEADERS_LEN),
                 flush_timer_key: None,
             },
             origin_receive_timestamps: None,
             rtt: None,
+            startup: None,
         }
     }
 
@@ -122,16 +156,45 @@ impl NeighEntry {
     /// the Hello, if any, that caused the flush, and the packet buffer, the TLVs
     /// in which, if any, are still to be sent.
     fn flush(&mut self, timers: &mut TimerQueue<Timer>) {
-        if let Some(key) = self.hello_timer_key.take() {
+        if let Some(key) = self.incoming_hello_timer_key.take() {
             timers.remove(key);
         }
-        if let Some(key) = self.ihu_timer_key.take() {
+        if let Some(key) = self.incoming_ihu_timer_key.take() {
             timers.remove(key);
         }
         self.txcost = COST_INFINITY;
         self.last_hello_interval = None;
         self.origin_receive_timestamps = None;
         self.rtt = None;
+    }
+
+    /// Returns a timestamped Hello with the next seqno, which has an interval if it is scheduled.
+    fn hello(&self, interval: Option<Interval>) -> Tlv {
+        Tlv::Hello {
+            seqno: self.hello_seqno,
+            interval,
+            transmit_timestamp: Some(0),
+        }
+    }
+
+    /// Returns a Hello with a seqno far from the next one, and no timestamp.
+    fn far_hello(&self, interval: Option<Interval>) -> Tlv {
+        Tlv::Hello {
+            seqno: self.hello_seqno + FAR_HELLO_SEQNO_OFFSET,
+            interval,
+            transmit_timestamp: None,
+        }
+    }
+
+    /// Returns an IHU, echoing the timestamps of the last Hello heard, if any.
+    fn ihu(&self, interval: Interval) -> Tlv {
+        Tlv::Ihu {
+            ae: Ae::Wildcard,
+            rxcost: self.rxcost(),
+            interval,
+            address: [0; 8],
+            origin_receive_timestamps: self.origin_receive_timestamps,
+        }
     }
 
     /// Computes the rxcost by 2-out-of-3 link sensing with a nominal cost of 96
@@ -304,9 +367,9 @@ fn encode_prefix(prefix: IpNet, ipv4_ae: Ae) -> (Ae, u8, [u8; 16]) {
     (ae, prefix.prefix_len(), octets)
 }
 
-/// The state of a prefix.
+/// The status of a prefix.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-enum PrefixState {
+enum PrefixStatus {
     /// A route for the prefix is injected into the Babel domain by the local node.
     Injected,
     /// The route through this neighbour is selected for the prefix.
@@ -325,7 +388,7 @@ enum PrefixState {
     None,
 }
 
-impl PrefixState {
+impl PrefixStatus {
     /// Returns the selected next-hop neighbour, if any.
     fn selected(self) -> Option<NeighKey> {
         match self {
@@ -345,7 +408,7 @@ struct Advert {
 #[derive(Default)]
 struct PrefixEntry {
     routes: SparseSecondaryMap<NeighKey, RouteEntry>,
-    state: PrefixState,
+    status: PrefixStatus,
     /// Advertisement for a selected or held route: the selected route's router-id, seqno,
     /// and metric, kept with an infinite metric while held. `None` for an injected route
     /// or when no route to the prefix is selected. An injected route is advertised with
@@ -357,7 +420,7 @@ impl PrefixEntry {
     /// Checks whether no route to the prefix is selected and no fallback route exists,
     /// so that the entry can be safely removed.
     fn is_empty(&self) -> bool {
-        self.state == PrefixState::None && self.routes.is_empty()
+        self.status == PrefixStatus::None && self.routes.is_empty()
     }
 }
 
@@ -373,7 +436,7 @@ impl RouteTable {
             hash_map::Entry::Occupied(_) => false,
             hash_map::Entry::Vacant(e) => {
                 e.insert(PrefixEntry {
-                    state: PrefixState::Injected,
+                    status: PrefixStatus::Injected,
                     ..Default::default()
                 });
                 true
@@ -381,7 +444,7 @@ impl RouteTable {
         }
     }
 
-    /// Returns the state of the prefix, and the route entry for the prefix
+    /// Returns the status of the prefix, and the route entry for the prefix
     /// through the neighbour, or `None` if it is not present, in which case
     /// a new route returned by `f` is inserted.
     fn get_or_insert_with(
@@ -389,7 +452,7 @@ impl RouteTable {
         prefix: IpNet,
         key: NeighKey,
         f: impl FnOnce() -> RouteEntry,
-    ) -> (PrefixState, Option<&mut RouteEntry>) {
+    ) -> (PrefixStatus, Option<&mut RouteEntry>) {
         let entry = self.prefix_entries.entry(prefix).or_default();
         let route = match entry.routes.entry(key).unwrap() {
             sparse_secondary::Entry::Occupied(e) => Some(e.into_mut()),
@@ -399,7 +462,7 @@ impl RouteTable {
                 None
             }
         };
-        (entry.state, route)
+        (entry.status, route)
     }
 
     fn remove(&mut self, prefix: &IpNet, key: NeighKey) -> Option<RouteEntry> {
@@ -509,6 +572,7 @@ impl PacketBuf {
 }
 
 enum Timer {
+    Startup(NeighKey),
     OutgoingHello(NeighKey),
     OutgoingUpdate(NeighKey),
     IncomingHello(NeighKey),
@@ -521,17 +585,34 @@ enum Timer {
     BufferFlush(NeighKey),
 }
 
-/// An output of a Babel router.
-pub enum Output {
-    /// Sends a Babel packet to a neighbour.
-    Packet(NeighKey, Packet),
+/// An output of a Babel router, with neighbours identified by `K`.
+pub enum Output<K = NeighKey> {
+    /// Sends a Babel packet to a neighbour. Its transmit timestamp is left to be filled in just
+    /// before it is sent (see [`Packet::timestamp`]).
+    Packet(K, Packet),
     /// Selects a neighbour as the next-hop router to a prefix.
-    RouteSelect(IpNet, NeighKey),
+    RouteSelect(IpNet, K),
     /// Holds a prefix by installing an unreachable route.
     RouteHold(IpNet),
     /// Removes the route to a prefix.
     RouteRemove(IpNet),
 }
+
+impl Output {
+    /// Identifies the neighbour, if any, by something other than its internal key.
+    pub fn with_key<K>(self, f: impl FnOnce(NeighKey) -> K) -> Output<K> {
+        match self {
+            Self::Packet(key, packet) => Output::Packet(f(key), packet),
+            Self::RouteSelect(prefix, key) => Output::RouteSelect(prefix, f(key)),
+            Self::RouteHold(prefix) => Output::RouteHold(prefix),
+            Self::RouteRemove(prefix) => Output::RouteRemove(prefix),
+        }
+    }
+}
+
+/// How far a Hello seqno is put from the current one to be sure of being far from what a neighbour
+/// expects: half of the seqno space. A Hello right after it is then as far away again.
+const FAR_HELLO_SEQNO_OFFSET: u16 = 0x8000;
 
 /// The state of a Babel router.
 ///
@@ -564,21 +645,30 @@ pub enum Output {
 /// route is not through node 1. Node 1 has no feasibility distance for P left, so it
 /// selects that route, and packets for P go round nodes 1, 3 and 2.
 ///
-/// So the routes through a node from before it reboots need to be removed, in three ways.
-/// It sends every neighbour a wildcard retraction as it shuts down (see
-/// [`State::shutdown`]), which removes the routes before it reboots, and another to each
-/// neighbour after rebooting (see [`State::add_neighbour`]), which also covers a crash.
-/// And a neighbour removes the routes as it notices the reboot from the node's Hello
-/// seqno (RFC 8966 Appendix A.1), which covers a node that sends no retraction.
+/// So the routes through a node from before it reboots need to be removed before it learns
+/// anything new. It says goodbye to every neighbour as it shuts down (see [`State::shutdown`]),
+/// which removes the routes before it reboots, and after rebooting, which also covers a crash, it
+/// sends each one a startup packet, and takes in nothing from it until that is acknowledged:
 ///
-/// In the extremely rare case where no retraction is delivered and the node's new Hello
-/// seqno happens to be close to the old one, a loop can still form. With neighbours
-/// running this code, it ends when the stale routes expire, 3.5 Update intervals after
-/// the last update received from before the reboot (56 s by default), or sooner if the
-/// prefix becomes reachable again and a node in the loop switches to the new route. No
-/// update from around the loop is feasible, and an unfeasible update for a selected route
-/// is ignored rather than refreshing the route. A neighbour that applies it instead, as
-/// babeld does, can loop until the metric reaches infinity.
+/// - A wildcard retraction removes the routes through the node.
+/// - Two Hellos flush the neighbour's entry for it (RFC 8966 Appendix A.1), whatever Hello seqno
+///   the neighbour expects: the first moves the seqno it expects far away from the second. This
+///   goes against the SHOULD NOT of RFC 8966 §4.6.5, for a reset that can't depend on chance.
+/// - An acknowledgement request, with a short deadline, shows when it has all been handled. The
+///   packet is sent again until then, which also keeps asking for a session in a daemon that sends
+///   nothing over a WireGuard session it doesn't have.
+///
+/// The acknowledgement is also a barrier for timestamps. A neighbour's IHU echoes the last Hello it
+/// heard, which after a restart can be one from the old process, on a clock with another origin
+/// (RFC 9616 §3.3). Flushing the entry removes the echo, but not an IHU already in the neighbour's
+/// packet buffer, which leaves with the acknowledgement at the latest. So the rest of the packet
+/// with the acknowledgement is discarded too.
+///
+/// A small window remains, as the node starts up with each neighbour separately. It can learn
+/// routes from one while its startup packet to another hasn't arrived, and that one still routes
+/// through it. That takes the packets to that neighbour being lost for the few seconds it takes
+/// the first to become usable, while those from it get through. It ends with the first startup
+/// packet to arrive, or when the neighbour counts two of this node's Hellos as missed.
 pub struct State {
     params: Params,
     router_id: RouterId,
@@ -628,15 +718,16 @@ impl State {
 
     /// Adds a neighbour and returns its key.
     ///
-    /// The neighbour is sent a wildcard retraction at once, unbuffered, to remove any
-    /// route through this node from before a reboot (see [Reboots]). If this node has
-    /// already learnt routes, packets coming from the neighbour could loop until the
-    /// retraction arrives, for example when node 1 adds node 2 after node 3 in the
-    /// network of [Reboots].
+    /// The neighbour is sent a startup packet at once, unbuffered, to remove any route
+    /// through this node from before a reboot, and anything else it sends is discarded
+    /// until that is acknowledged (see [Reboots]). If this node has already learnt routes,
+    /// packets coming from the neighbour could loop until it arrives, for example when
+    /// node 1 adds node 2 after node 3 in the network of [Reboots].
     ///
-    /// The neighbour is then sent the first Hello and the first full route table dump,
-    /// buffered as usual. The second of each goes a random part of its interval later,
-    /// and each one after that 0.96875 to 1.03125 intervals after the one before.
+    /// Once it is acknowledged, the neighbour is sent the first Hello, a request for a
+    /// full route table dump, and the first such dump of this node, buffered as usual.
+    /// The second Hello and dump go a random part of their intervals later, and each one
+    /// after that 0.96875 to 1.03125 intervals after the one before.
     ///
     /// [Reboots]: State#reboots
     pub fn add_neighbour(&mut self, now: Instant) -> NeighKey {
@@ -650,21 +741,98 @@ impl State {
         let key = (self.neigh_table).insert(NeighEntry::new(&self.params, hello_seqno));
         self.route_table.neigh_prefixes.insert(key, HashSet::new());
 
-        let retraction = self.wildcard_retraction();
-        self.send(Some(key), Some(Duration::ZERO), |e| {
-            e.put_update(&retraction)
+        let opaque = rand::random();
+        let timeout = (self.params.get(DurationKey::StartupTimeout))
+            .min(self.params.get(DurationKey::HelloInterval));
+        self.neigh_table[key].startup = Some(Startup {
+            opaque,
+            timeout,
+            timer_key: self.timers.insert(Timer::Startup(key), timeout),
         });
-
-        self.send_hello(key);
-        self.dump_routes(key);
-
-        let timeout = self.params.random_part(DurationKey::HelloInterval);
-        self.timers.insert(Timer::OutgoingHello(key), timeout);
-
-        let timeout = self.params.random_part(DurationKey::UpdateInterval);
-        self.timers.insert(Timer::OutgoingUpdate(key), timeout);
+        self.send_startup_packet(key, opaque);
 
         key
+    }
+
+    /// Sends a neighbour the startup packet.
+    fn send_startup_packet(&mut self, key: NeighKey, opaque: u16) {
+        let retraction = self.wildcard_retraction();
+        let neigh = &mut self.neigh_table[key];
+        let tlvs = [
+            retraction,
+            neigh.far_hello(None),
+            neigh.hello(Some(self.params.get(IntervalKey::Hello))),
+            Tlv::AcknowledgementRequest {
+                opaque,
+                interval: Interval::new(1).expect("the interval should not be zero"),
+            },
+        ];
+        neigh.hello_seqno += 1;
+
+        self.send(Some(key), Some(Duration::ZERO), |e| e.put_tlvs(&tlvs));
+    }
+
+    /// Starts on the usual exchange with a neighbour, whose startup is over.
+    fn finish_startup(&mut self, key: NeighKey) {
+        let startup = self.neigh_table[key].startup.take();
+        self.timers.remove(
+            startup
+                .expect("the neighbour should be starting up")
+                .timer_key,
+        );
+
+        self.send_hello(key);
+        let request = Tlv::RouteRequest {
+            ae: Ae::Wildcard,
+            plen: 0,
+            prefix: [0; 16],
+        };
+        self.send(Some(key), None, |e| e.put_tlv(&request));
+        self.dump_routes(key);
+
+        let neigh = &mut self.neigh_table[key];
+        let timeout = self.params.random_part(DurationKey::HelloInterval);
+        neigh.outgoing_hello_timer_key =
+            Some(self.timers.insert(Timer::OutgoingHello(key), timeout));
+        let timeout = self.params.random_part(DurationKey::UpdateInterval);
+        neigh.outgoing_update_timer_key =
+            Some(self.timers.insert(Timer::OutgoingUpdate(key), timeout));
+    }
+
+    /// Removes a neighbour, for example because it can't be reached for the time being. Nothing
+    /// more is sent to it, including anything not yet polled with [`Self::poll_output`], and its
+    /// routes are removed at once, as if it had been flushed. It can be added again later, with a
+    /// new key, and is then treated as any new neighbour.
+    pub fn remove_neighbour(&mut self, now: Instant, key: NeighKey) {
+        self.set_now(now);
+
+        let mut neigh = self
+            .neigh_table
+            .remove(key)
+            .expect("the neighbour should exist");
+        neigh.flush(&mut self.timers);
+
+        let timer_keys = [
+            neigh.outgoing_hello_timer_key,
+            neigh.outgoing_update_timer_key,
+            neigh.packet_buf.flush_timer_key,
+            neigh.startup.map(|startup| startup.timer_key),
+        ];
+        for timer_key in timer_keys.into_iter().flatten() {
+            self.timers.remove(timer_key);
+        }
+
+        self.outputs.retain(|output| match output {
+            Output::Packet(to, _) => *to != key,
+            Output::RouteSelect(_, via) => *via != key,
+            Output::RouteHold(_) | Output::RouteRemove(_) => true,
+        });
+
+        let prefixes = self.remove_neigh_routes(key);
+        self.route_table.neigh_prefixes.remove(key);
+        for prefix in prefixes {
+            self.select_route(prefix, Some(key));
+        }
     }
 
     /// Injects a route for a prefix that this node originates, returning `false` if the
@@ -673,6 +841,8 @@ impl State {
     /// No update is sent for it at once: neighbours first learn of it from the next
     /// periodic update. Injected routes are meant to be added when the node starts,
     /// before any neighbour is added, which this does not delay.
+    ///
+    /// The prefix should not be martian (see [`martian_prefix`]), as neighbours would ignore it.
     pub fn inject_route(&mut self, prefix: IpNet) -> bool {
         self.route_table.inject(prefix.trunc())
     }
@@ -682,13 +852,14 @@ impl State {
     /// those of the shutdown.
     ///
     /// Each neighbour is sent at once a packet of a wildcard retraction and a Hello with
-    /// an interval of 0.1 s, as babeld does, and any other buffered TLVs are dropped. On
+    /// a far seqno and an interval of 10 ms, and any other buffered TLVs are dropped. On
     /// the retraction, it switches to other routes, or holds the prefixes, rather than
     /// routing through this node until the link fails, and no such route is left to loop
-    /// should this node come back soon (see [Reboots](State#reboots)). It then counts
-    /// this node's Hellos as missed every 0.1 s, so that the link fails after 0.25 s, and
-    /// this node's entry is flushed after 1.65 s, once the 16-Hello history is empty
-    /// (if RFC 8966 Appendix A.1 is exactly implemented).
+    /// should this node come back soon (see [Reboots](State#reboots)). The seqno has it
+    /// flush its entry for this node at once, so that the link fails there and then. It
+    /// then counts this node's Hellos as missed every 10 ms, so that even a neighbour that
+    /// takes the seqno as new has an empty history after 165 ms, as long as it implements
+    /// RFC 8966 Appendix A.1 exactly.
     pub fn shutdown(mut self, now: Instant) -> impl Iterator<Item = Output> {
         self.set_now(now);
 
@@ -696,20 +867,18 @@ impl State {
         let keys: Vec<_> = self.neigh_table.keys().collect();
 
         for key in keys {
-            let hello = Tlv::Hello {
-                seqno: self.neigh_table[key].hello_seqno,
-                interval: Interval::new(10),
-                transmit_timestamp: None,
-            };
+            let tlvs = [
+                retraction.clone(),
+                self.neigh_table[key].far_hello(Interval::new(1)),
+            ];
             self.send(Some(key), Some(Duration::ZERO), |e| {
                 e.clear();
-                assert!(e.put_update(&retraction) && e.put_tlv(&hello));
-                true
+                e.put_tlvs(&tlvs)
             });
         }
 
         for (&prefix, entry) in &self.route_table.prefix_entries {
-            if let PrefixState::Selected(_) | PrefixState::Held(_) = entry.state {
+            if let PrefixStatus::Selected(_) | PrefixStatus::Held(_) = entry.status {
                 self.outputs.push_back(Output::RouteRemove(prefix));
             }
         }
@@ -717,17 +886,78 @@ impl State {
         self.outputs.into_iter()
     }
 
+    /// Returns a view of this router's neighbours and route table at `now`, with each neighbour
+    /// identified by what `external` returns for it. Unlike the methods that handle events, this
+    /// is not cheap: it copies out the whole route table.
+    pub fn snapshot<K>(&self, now: Instant, external: impl Fn(NeighKey) -> K) -> Snapshot<K> {
+        let (now, tau) = (timestamp(now), self.params.get_tau());
+
+        let neighbours = (self.neigh_table.iter())
+            .map(|(key, neigh)| NeighbourSnapshot {
+                key: external(key),
+                cost: neigh.cost,
+                rtt: neigh.rtt.map(|rtt| Duration::from_secs_f64(rtt / 1e6)),
+                rxcost: neigh.rxcost(),
+                txcost: neigh.txcost,
+                rtt_penalty: neigh.rtt_penalty(),
+                hello_history: neigh.hello_history.bits(),
+                in_startup: neigh.startup.is_some(),
+            })
+            .collect();
+
+        let mut prefixes: Vec<_> = (self.route_table.prefix_entries.iter())
+            .map(|(&prefix, entry)| {
+                let mut routes: Vec<_> = entry.routes.iter().collect();
+                routes.sort_unstable_by_key(|&(via, _)| via);
+
+                PrefixSnapshot {
+                    prefix,
+                    status: match entry.status {
+                        PrefixStatus::Injected => snapshot::PrefixStatus::Injected,
+                        PrefixStatus::Selected(key) => {
+                            snapshot::PrefixStatus::Selected(external(key))
+                        }
+                        PrefixStatus::Held(_) => snapshot::PrefixStatus::Held,
+                        PrefixStatus::None => snapshot::PrefixStatus::None,
+                    },
+                    routes: (routes.into_iter())
+                        .map(|(via, route)| RouteSnapshot {
+                            via: external(via),
+                            router_id: route.router_id,
+                            seqno: route.seqno,
+                            metric: route.metric.get(),
+                            smoothed_metric: route.ms_at(now, tau).round() as u16,
+                            feasible: route.is_feasible(prefix, &self.source_table),
+                        })
+                        .collect(),
+                }
+            })
+            .collect();
+        prefixes.sort_unstable_by_key(|entry| entry.prefix);
+
+        Snapshot {
+            router_id: self.router_id,
+            seqno: self.seqno,
+            neighbours,
+            prefixes,
+        }
+    }
+
     /// Returns a wildcard retraction (RFC 8966 §4.6.9), which retracts every route that
     /// this node has advertised to the neighbour it is sent to.
-    fn wildcard_retraction(&self) -> Update {
-        Update {
+    fn wildcard_retraction(&self) -> Tlv {
+        Tlv::Update {
             ae: Ae::Wildcard,
+            flags: UpdateFlags {
+                prefix: false,
+                router_id: false,
+            },
             plen: 0,
+            omitted: 0,
             interval: self.params.get(IntervalKey::Update),
             seqno: self.seqno,
             metric: METRIC_INFINITY,
             prefix: [0; 16],
-            router_id: None,
         }
     }
 
@@ -765,24 +995,15 @@ impl State {
     fn send_hello(&mut self, to: NeighKey) {
         let neigh = &mut self.neigh_table[to];
 
-        let hello_tlv = Tlv::Hello {
-            seqno: neigh.hello_seqno,
-            interval: Some(self.params.get(IntervalKey::Hello)),
-            transmit_timestamp: Some(0),
-        };
-
-        let mut tlvs = [hello_tlv, Tlv::Pad1];
+        let mut tlvs = [
+            neigh.hello(Some(self.params.get(IntervalKey::Hello))),
+            Tlv::Pad1,
+        ];
 
         neigh.hellos_until_ihu -= 1;
         let tlvs = if neigh.hellos_until_ihu == 0 {
             neigh.hellos_until_ihu = self.params.get(U8Key::HellosPerIhu);
-            tlvs[1] = Tlv::Ihu {
-                ae: Ae::Wildcard,
-                rxcost: neigh.rxcost(),
-                interval: self.params.get(IntervalKey::Ihu),
-                address: [0; 8],
-                origin_receive_timestamps: neigh.origin_receive_timestamps,
-            };
+            tlvs[1] = neigh.ihu(self.params.get(IntervalKey::Ihu));
             &tlvs
         } else {
             &tlvs[..1]
@@ -797,26 +1018,57 @@ impl State {
         neigh.hello_seqno += 1;
     }
 
+    /// Tells a neighbour at once that this node now hears it, which its link cost needs in order to
+    /// become finite. The next scheduled IHU can be several Hellos away, and the last one may have
+    /// reported an infinite rxcost. With timestamps to echo, the IHU has to carry them, in a packet
+    /// with a timestamped Hello (RFC 9616 §3.2), so that the neighbour gets an RTT sample as well.
+    fn send_unscheduled_ihu(&mut self, to: NeighKey) {
+        let neigh = &mut self.neigh_table[to];
+
+        let mut tlvs = [Tlv::Pad1, neigh.ihu(self.params.get(IntervalKey::Ihu))];
+
+        let tlvs = if neigh.origin_receive_timestamps.is_some() {
+            tlvs[0] = neigh.hello(None);
+            neigh.hello_seqno += 1;
+            &tlvs[..]
+        } else {
+            &tlvs[1..]
+        };
+
+        self.send(Some(to), Some(Duration::ZERO), |e| e.put_tlvs(tlvs));
+    }
+
     /// Handles a timer that has expired.
     fn handle_expired_timer(&mut self, timer: Timer) {
         match timer {
+            Timer::Startup(key) => {
+                let max_timeout = self.params.get(DurationKey::HelloInterval);
+                let startup = (self.neigh_table[key].startup.as_mut())
+                    .expect("the neighbour should be starting up");
+                startup.timeout = (startup.timeout * 2).min(max_timeout);
+                startup.timer_key = self.timers.insert(Timer::Startup(key), startup.timeout);
+                let opaque = startup.opaque;
+                self.send_startup_packet(key, opaque);
+            }
             Timer::OutgoingHello(key) => {
                 self.send_hello(key);
 
                 let timeout = self.params.jittered(DurationKey::HelloInterval);
-                self.timers.insert(Timer::OutgoingHello(key), timeout);
+                self.neigh_table[key].outgoing_hello_timer_key =
+                    Some(self.timers.insert(Timer::OutgoingHello(key), timeout));
             }
             Timer::OutgoingUpdate(key) => {
                 self.dump_routes(key);
 
                 let timeout = self.params.jittered(DurationKey::UpdateInterval);
-                self.timers.insert(Timer::OutgoingUpdate(key), timeout);
+                self.neigh_table[key].outgoing_update_timer_key =
+                    Some(self.timers.insert(Timer::OutgoingUpdate(key), timeout));
             }
             Timer::IncomingHello(key) => {
                 let neigh = &mut self.neigh_table[key];
 
                 if neigh.hello_history.missed() == HelloEffect::Flush {
-                    neigh.hello_timer_key = None;
+                    neigh.incoming_hello_timer_key = None;
                     neigh.flush(&mut self.timers);
 
                     for prefix in self.remove_neigh_routes(key) {
@@ -824,7 +1076,7 @@ impl State {
                     }
                 } else {
                     let timeout = neigh.last_hello_interval.unwrap().to_duration();
-                    neigh.hello_timer_key =
+                    neigh.incoming_hello_timer_key =
                         Some(self.timers.insert(Timer::IncomingHello(key), timeout));
 
                     if neigh.update_cost() {
@@ -835,7 +1087,7 @@ impl State {
             Timer::IncomingIhu(key) => {
                 let neigh = &mut self.neigh_table[key];
 
-                neigh.ihu_timer_key = None;
+                neigh.incoming_ihu_timer_key = None;
                 neigh.txcost = COST_INFINITY;
 
                 if neigh.update_cost() {
@@ -857,7 +1109,7 @@ impl State {
 
                 // Shortly before a selected route expires, a route request SHOULD be sent
                 // to the neighbour that advertised it (RFC 8966 §3.8.2.3).
-                if entry.state.selected() == Some(key) {
+                if entry.status.selected() == Some(key) {
                     let (ae, plen, prefix) = encode_prefix(prefix, Ae::Ipv4);
                     let tlv = Tlv::RouteRequest { ae, plen, prefix };
                     self.send(Some(key), None, |e| e.put_tlv(&tlv));
@@ -869,7 +1121,7 @@ impl State {
             }
             Timer::RouteHold(prefix) => {
                 let entry = self.route_table.prefix_entries.get_mut(&prefix).unwrap();
-                assert_matches!(entry.state, PrefixState::Held(_));
+                assert_matches!(entry.status, PrefixStatus::Held(_));
 
                 self.outputs.push_back(Output::RouteRemove(prefix));
 
@@ -877,7 +1129,7 @@ impl State {
                     // Nothing is left to keep the entry for.
                     self.route_table.prefix_entries.remove(&prefix);
                 } else {
-                    entry.state = PrefixState::None;
+                    entry.status = PrefixStatus::None;
                     entry.advert = None;
                 }
             }
@@ -920,6 +1172,13 @@ impl State {
         self.set_now(now);
         self.receive_timestamp = timestamp(received_at);
 
+        if let Some(startup) = &self.neigh_table[from].startup {
+            self.handle_packet_during_startup(from, startup.opaque, decoder);
+            return;
+        }
+
+        let was_deaf = self.neigh_table[from].rxcost() == COST_INFINITY;
+
         for res in decoder {
             let Ok(item) = res else {
                 continue;
@@ -928,6 +1187,10 @@ impl State {
                 PacketItem::Tlv(tlv) => self.handle_tlv(from, &tlv),
                 PacketItem::Update(update) => self.handle_update(from, &update),
             }
+        }
+
+        if was_deaf && self.neigh_table[from].rxcost() != COST_INFINITY {
+            self.send_unscheduled_ihu(from);
         }
 
         // Delay-based metric extension (RFC 9616).
@@ -993,7 +1256,8 @@ impl State {
                 self.send(Some(from), Some(timeout), |e| e.put_tlv(&tlv));
             }
             Tlv::Acknowledgement { .. } => {
-                // Ignore it as we never send an acknowledgement request.
+                // Ignore it, as it is late: a startup packet can be sent again before the
+                // acknowledgement of the one before arrives.
             }
             Tlv::Hello {
                 seqno,
@@ -1018,10 +1282,10 @@ impl State {
                     // (RFC 8966 Appendix A.1). See also `PacketBuf::put`.
                     let timeout = interval.to_duration().mul_f64(1.5);
 
-                    if let Some(timer_key) = &mut neigh.hello_timer_key {
+                    if let Some(timer_key) = &mut neigh.incoming_hello_timer_key {
                         self.timers.reset(timer_key, timeout);
                     } else {
-                        neigh.hello_timer_key =
+                        neigh.incoming_hello_timer_key =
                             Some(self.timers.insert(Timer::IncomingHello(from), timeout));
                     }
                 }
@@ -1063,10 +1327,10 @@ impl State {
                     .to_duration()
                     .mul_f64(self.params.get(F64Key::IhuHoldTimeMultiplier));
 
-                if let Some(timer_key) = &mut neigh.ihu_timer_key {
+                if let Some(timer_key) = &mut neigh.incoming_ihu_timer_key {
                     self.timers.reset(timer_key, timeout);
                 } else {
-                    neigh.ihu_timer_key =
+                    neigh.incoming_ihu_timer_key =
                         Some(self.timers.insert(Timer::IncomingIhu(from), timeout));
                 }
 
@@ -1209,7 +1473,7 @@ impl State {
         // feasibility ignores the link cost, so a route over a failed link would
         // otherwise come first.
         let feasible = |r: &RouteEntry| r.is_feasible(prefix, &self.source_table);
-        let to = entry.state.selected().filter(|&k| k != from).or_else(|| {
+        let to = entry.status.selected().filter(|&k| k != from).or_else(|| {
             entry
                 .routes
                 .iter()
@@ -1328,6 +1592,33 @@ impl State {
             })
     }
 
+    /// Handles a packet from a neighbour that hasn't acknowledged this node's startup packet yet,
+    /// whose packets can only be discarded, whole, even if one has the acknowledgement (see
+    /// [Reboots](State#reboots)). A request for an acknowledgement is still answered, or two nodes
+    /// starting up together would wait for each other forever.
+    fn handle_packet_during_startup(
+        &mut self,
+        from: NeighKey,
+        opaque: u16,
+        decoder: PacketDecoder<'_>,
+    ) {
+        let mut acknowledged = false;
+        for res in decoder {
+            match res {
+                Ok(PacketItem::Tlv(Tlv::Acknowledgement { opaque: other })) => {
+                    acknowledged |= other == opaque;
+                }
+                Ok(PacketItem::Tlv(tlv @ Tlv::AcknowledgementRequest { .. })) => {
+                    self.handle_tlv(from, &tlv);
+                }
+                _ => {}
+            }
+        }
+        if acknowledged {
+            self.finish_startup(from);
+        }
+    }
+
     /// Handles an update (RFC 8966 §3.5.3), recording the prefix of any route it changes
     /// for route selection at the end of the packet.
     fn handle_update(&mut self, from: NeighKey, update: &Update) {
@@ -1350,6 +1641,12 @@ impl State {
             return;
         };
 
+        // Routes to such prefixes are ignored, so that no node selects or advertises them
+        // (RFC 8966 Appendix C allows this filtering).
+        if martian_prefix(prefix) {
+            return;
+        }
+
         if metric == METRIC_INFINITY {
             if let Some(route) = self.route_table.remove(&prefix, from) {
                 self.timers.remove(route.timer_key);
@@ -1369,7 +1666,7 @@ impl State {
             .to_duration()
             .mul_f64(self.params.get(F64Key::RouteNearExpiryTimeMultiplier));
 
-        let (state, route) = self
+        let (status, route) = self
             .route_table
             .get_or_insert_with(prefix, from, || RouteEntry {
                 router_id,
@@ -1395,9 +1692,9 @@ impl State {
             // long as the neighbour keeps its feasibility distances, but after it
             // reboots, the update refreshes a stale route through it, so that a loop can
             // last until the metric reaches infinity. An ignored update leaves such a
-            // route to expire (see Reboots in the doc of `State`).
+            // route to expire.
             let key = SourceKey { prefix, router_id };
-            if state == PrefixState::Selected(from)
+            if status == PrefixStatus::Selected(from)
                 && route.router_id == router_id
                 && !update_feasible(&self.source_table, key, seqno, metric)
             {
@@ -1466,7 +1763,7 @@ impl State {
             route.set_metric(metric, self.now, self.params.get_tau());
         }
 
-        if entry.state == PrefixState::Injected {
+        if entry.status == PrefixStatus::Injected {
             return;
         }
 
@@ -1489,13 +1786,13 @@ impl State {
         // The route to select, and the candidate if it is selected, or would be selected
         // if it were feasible. In the latter case, a node SHOULD send a seqno request to
         // the neighbour that advertised it (RFC 8966 §3.8.2.2, with Erratum 7373).
-        let (selection, wanted) = match entry.state {
-            PrefixState::Injected => unreachable!(),
+        let (selection, wanted) = match entry.status {
+            PrefixStatus::Injected => unreachable!(),
             // The selected route has not changed, so it is still usable. Its metric is
             // still finite, and it is still feasible: only advertising tightens
             // feasibility, and advertising the selected route keeps it feasible.
             // This includes a source table entry expiring, with no changed route.
-            PrefixState::Selected(key) if changed != Some(key) => {
+            PrefixStatus::Selected(key) if changed != Some(key) => {
                 let selected = &entry.routes[key];
                 debug_assert!(selected.is_usable(prefix, &self.source_table));
 
@@ -1516,14 +1813,14 @@ impl State {
             // if its router-id has changed, making it a route for another source, or if
             // an update added it anew after a retraction in the same packet. Either way,
             // it is unselected, as RFC 8966 requires (§3.5.3, §3.6).
-            PrefixState::Selected(_) => {
+            PrefixStatus::Selected(_) => {
                 let kept = candidate.filter(|_| candidate_feasible);
                 (kept.or_else(best_usable), candidate)
             }
             // Nothing is selected, so no route is usable: one only becomes usable without
             // changing as its source table entry expires. So select the changed route if
             // it is usable, or after such an expiry, the best usable route.
-            PrefixState::Held(_) | PrefixState::None => match changed {
+            PrefixStatus::Held(_) | PrefixStatus::None => match changed {
                 Some(_) => (candidate.filter(|_| candidate_feasible), candidate),
                 None => (best_usable(), None),
             },
@@ -1545,19 +1842,19 @@ impl State {
         let mut lost_router_id = None;
 
         if let Some((key, route)) = selection {
-            match entry.state {
-                PrefixState::Injected => unreachable!(),
+            match entry.status {
+                PrefixStatus::Injected => unreachable!(),
                 // The prefix is still reachable, possibly with another router-id.
-                PrefixState::Selected(_) => {
+                PrefixStatus::Selected(_) => {
                     trigger_update = route.router_id != entry.advert.unwrap().router_id;
                 }
                 // The prefix is newly reachable after a retraction.
-                PrefixState::Held(timer_key) => {
+                PrefixStatus::Held(timer_key) => {
                     self.timers.remove(timer_key);
                     trigger_update = true;
                 }
                 // The prefix is newly reachable.
-                PrefixState::None => trigger_update = true,
+                PrefixStatus::None => trigger_update = true,
             }
 
             // A route is selected for a prefix that had none, so this node no longer
@@ -1565,7 +1862,7 @@ impl State {
             // the lost route (RFC 8966 §3.8.2.1). The request is kept as long as if its
             // last send had been its last resend, to tell redundant requests and to
             // forward a reply (§3.8.1.2). Its timer was set at that send.
-            if !matches!(entry.state, PrefixState::Selected(_))
+            if !matches!(entry.status, PrefixStatus::Selected(_))
                 && let Some(request) = self.seqno_request_table.get_mut(&prefix)
             {
                 let new_deadline = self.timers.deadline(request.timer_key)
@@ -1575,11 +1872,11 @@ impl State {
                 self.timers.reset_at(&mut request.timer_key, new_deadline);
             }
 
-            if entry.state != PrefixState::Selected(key) {
+            if entry.status != PrefixStatus::Selected(key) {
                 self.outputs.push_back(Output::RouteSelect(prefix, key));
             }
 
-            entry.state = PrefixState::Selected(key);
+            entry.status = PrefixStatus::Selected(key);
 
             let advert = Advert {
                 router_id: route.router_id,
@@ -1605,13 +1902,13 @@ impl State {
             }
 
             entry.advert = Some(advert);
-        } else if let PrefixState::Selected(_) = entry.state {
+        } else if let PrefixStatus::Selected(_) = entry.status {
             // The prefix is retracted and no longer reachable.
             trigger_update = true;
 
             self.outputs.push_back(Output::RouteHold(prefix));
 
-            entry.state = PrefixState::Held(self.timers.insert(
+            entry.status = PrefixStatus::Held(self.timers.insert(
                 Timer::RouteHold(prefix),
                 self.params.get(DurationKey::RouteHoldTime),
             ));
@@ -1622,7 +1919,7 @@ impl State {
         }
 
         let triggered_update =
-            trigger_update.then(|| (entry.state.selected(), entry.advert.unwrap()));
+            trigger_update.then(|| (entry.status.selected(), entry.advert.unwrap()));
 
         if entry.is_empty() {
             // Nothing is left to keep the entry for.
@@ -1666,7 +1963,7 @@ impl State {
         let mut updates: Vec<_> = (self.route_table.prefix_entries.iter())
             .filter_map(|(&prefix, entry)| {
                 let advert = self.advert_for_prefix(entry)?;
-                Some((prefix, advert, entry.state.selected()))
+                Some((prefix, advert, entry.status.selected()))
             })
             .collect();
 
@@ -1715,30 +2012,7 @@ impl State {
             router_id: Some(advert.router_id),
         };
 
-        let mut send = |key, neigh: &mut NeighEntry| {
-            neigh.packet_buf.put(
-                key,
-                &mut self.outputs,
-                &mut self.timers,
-                &self.params,
-                |e| e.put_update(&update),
-            );
-            if let Some(timeout) = timeout {
-                neigh.packet_buf.schedule_flush(&mut self.timers, timeout);
-            }
-        };
-
-        if let Some(key) = to {
-            if not_to != Some(key) {
-                send(key, &mut self.neigh_table[key]);
-            }
-        } else {
-            for (key, neigh) in &mut self.neigh_table {
-                if not_to != Some(key) {
-                    send(key, neigh);
-                }
-            }
-        }
+        self.send_except(to, not_to, timeout, |e| e.put_update(&update));
     }
 
     /// Puts what `f` encodes in the packet buffer of the given neighbour or of every one,
@@ -1755,7 +2029,23 @@ impl State {
         timeout: Option<Duration>,
         f: impl Fn(&mut PacketEncoder) -> bool,
     ) {
+        self.send_except(to, None, timeout, f);
+    }
+
+    /// Does what [`Self::send`] does, leaving out `not_to`, if any. Sending to every neighbour
+    /// leaves out those starting up as well, which would discard it, and which the next startup
+    /// packet would retract it from.
+    fn send_except(
+        &mut self,
+        to: Option<NeighKey>,
+        not_to: Option<NeighKey>,
+        timeout: Option<Duration>,
+        f: impl Fn(&mut PacketEncoder) -> bool,
+    ) {
         let mut send = |key, neigh: &mut NeighEntry| {
+            if not_to == Some(key) {
+                return;
+            }
             let buf = &mut neigh.packet_buf;
             buf.put(key, &mut self.outputs, &mut self.timers, &self.params, &f);
             if let Some(timeout) = timeout {
@@ -1772,7 +2062,9 @@ impl State {
             send(key, &mut self.neigh_table[key]);
         } else {
             for (key, neigh) in &mut self.neigh_table {
-                send(key, neigh);
+                if neigh.startup.is_none() {
+                    send(key, neigh);
+                }
             }
         }
     }
@@ -1782,9 +2074,9 @@ impl State {
     /// or the last advertised router-id, seqno, and an infinite metric for a held prefix,
     /// or `None` when no route to the prefix is selected.
     fn advert_for_prefix(&self, entry: &PrefixEntry) -> Option<Advert> {
-        match entry.state {
+        match entry.status {
             // A route injected by this node (RFC 8966 §3.7).
-            PrefixState::Injected => Some(Advert {
+            PrefixStatus::Injected => Some(Advert {
                 router_id: self.router_id,
                 seqno: self.seqno,
                 metric: 0,

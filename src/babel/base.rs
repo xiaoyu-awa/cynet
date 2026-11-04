@@ -8,7 +8,11 @@ use std::{
     time::{Duration, Instant},
 };
 
+use ipnet::IpNet;
+
+/// The cost of a link that can't be used.
 pub const COST_INFINITY: u16 = 0xffff;
+/// The metric of a route that can't be used.
 pub const METRIC_INFINITY: u16 = 0xffff;
 
 /// A router-id, assumed unique across the routing domain.
@@ -252,4 +256,29 @@ pub fn timestamp(at: Instant) -> u32 {
         None => ((origin - at).as_nanos().div_ceil(1000) as u32).wrapping_neg(),
     };
     offset.wrapping_add(micros)
+}
+
+/// Checks whether a prefix can never be routed, so that it must not be advertised, and routes to
+/// it are ignored: one inside a multicast, loopback, unspecified or link-local range, IPv4-mapped
+/// or not. A prefix that merely covers such a range, such as `::/0`, is fine.
+///
+/// This follows `martian_prefix` in babeld, except that every IPv4-mapped IPv6 prefix counts, since
+/// IPv4 prefixes have address encodings of their own.
+pub fn martian_prefix(prefix: IpNet) -> bool {
+    let plen = prefix.prefix_len();
+    match prefix.trunc() {
+        IpNet::V4(net) => {
+            let addr = net.addr();
+            (plen >= 8 && (addr.octets()[0] == 0 || addr.is_loopback()))
+                || (plen >= 4 && addr.is_multicast())
+                || (plen == 32 && addr.is_broadcast())
+        }
+        IpNet::V6(net) => {
+            let addr = net.addr();
+            (plen >= 8 && addr.is_multicast())
+                || (plen >= 10 && addr.is_unicast_link_local())
+                || (plen == 128 && (addr.is_unspecified() || addr.is_loopback()))
+                || (plen >= 96 && addr.to_ipv4_mapped().is_some())
+        }
+    }
 }

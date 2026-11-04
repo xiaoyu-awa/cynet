@@ -15,11 +15,17 @@ pub struct Params {
 }
 
 impl Params {
+    /// The default MTU of the links, in octets.
+    pub const DEFAULT_MTU: u16 = 1400;
+
+    /// The smallest MTU of the links, in octets, which is the minimum MTU of IPv6 (RFC 8200 §5).
+    pub const MIN_MTU: u16 = 1280;
+
     /// Returns the default parameters.
     #[expect(clippy::new_without_default)]
     pub fn new() -> Self {
         Self {
-            mtu: 1400,
+            mtu: Self::DEFAULT_MTU,
             hello_interval: Interval::new(400).unwrap(),
             ihu_interval: Interval::new(400 * 3).unwrap(),
             update_interval: Interval::new(400 * 4).unwrap(),
@@ -28,7 +34,7 @@ impl Params {
         }
     }
 
-    /// Returns the MTU of the links, in octets. Defaults to 1400.
+    /// Returns the MTU of the links, in octets.
     pub fn get_mtu(&self) -> u16 {
         self.mtu
     }
@@ -37,9 +43,9 @@ impl Params {
     ///
     /// # Panics
     ///
-    /// Panics if `mtu` is less than 1280, the minimum MTU of IPv6 (RFC 8200 §5).
+    /// Panics if `mtu` is less than [`Self::MIN_MTU`].
     pub fn set_mtu(&mut self, mtu: u16) -> &mut Self {
-        assert!(mtu >= 1280);
+        assert!(mtu >= Self::MIN_MTU);
         self.mtu = mtu;
         self
     }
@@ -131,6 +137,9 @@ pub enum DurationKey {
     InitialRequestTimeout,
     /// Urgent timeout. Defaults to 0.2 seconds.
     UrgentTimeout,
+    /// How long to wait for the acknowledgement of a startup packet before sending it again, which
+    /// doubles each time, up to the Hello interval. Defaults to 0.25 seconds.
+    StartupTimeout,
     /// Source GC time. Defaults to 3 minutes.
     SourceGcTime,
     /// Route hold time. Defaults to 4 times the Update interval.
@@ -146,6 +155,7 @@ impl Key for DurationKey {
             DurationKey::UpdateInterval => params.update_interval.to_duration(),
             DurationKey::InitialRequestTimeout => Duration::from_secs(2),
             DurationKey::UrgentTimeout => Duration::from_millis(200),
+            DurationKey::StartupTimeout => Duration::from_millis(250),
             DurationKey::SourceGcTime => Duration::from_mins(3),
             DurationKey::RouteHoldTime => params.update_interval.to_duration() * 4,
         }

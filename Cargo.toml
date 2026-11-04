@@ -4,10 +4,33 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+base64 = "0.22"
+blake2 = "0.10"
 bytes = "1.12.1"
-gotatun = { path = "gotatun/gotatun" }
-ipnet = "2.12.2"
+clap = { version = "4", features = ["derive"] }
+eyre = "0.6.14"
+futures = "0.3.34"
+getrandom = "0.4.3"
+gotatun = { version = "0.10.2", path = "gotatun/gotatun", features = ["device", "tun"] }
+ipnet = { version = "2.12.2", features = ["serde"] }
+parking_lot = "0.13.0"
+prefix-trie = "0.10.1"
 rand = "0.10.2"
+rtnetlink = "0.23.0"
+serde = { version = "1.0.229", features = ["derive"] }
 slotmap = "1.1.1"
 strum = { version = "0.28.0", features = ["derive"] }
 tokio = { version = "1.53.1", features = ["full"] }
+toml = "1.1.8"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+zerocopy = "0.8.63"
+
+[dev-dependencies]
+tokio = { version = "1.53.1", features = ["test-util"] }
+
+[profile.release]
+strip = true
+lto = true
+panic = "abort"
+codegen-units = 1

@@ -138,8 +138,13 @@ impl PacketEncoder {
     /// or if they include a Hello and the packet already contains one, since multiple
     /// Hello TLVs SHOULD NOT be sent in the same packet (RFC 8966 §4.6.5).
     ///
+    /// An unscheduled Hello with no timestamp doesn't count as one. It only exists to move
+    /// a neighbour's expected Hello seqno, ahead of the Hello that flushes its entry (see
+    /// [Reboots](super::State#reboots)).
+    ///
     /// Router-Id and Update TLVs modify the parser state, which the encoder tracks
-    /// for compression, so they must be put with [`put_update`] instead.
+    /// for compression, so they must be put with [`put_update`] instead, apart from a
+    /// wildcard retraction with no flags set, which leaves the parser state as it is.
     ///
     /// A Hello's Transmit Timestamp, if any, is a placeholder, to be filled in as the
     /// packet is sent (see [`Packet::timestamp`]). An IHU carrying timestamps MUST be
@@ -155,9 +160,23 @@ impl PacketEncoder {
 
         for tlv in tlvs {
             match tlv {
+                Tlv::Update {
+                    ae: Ae::Wildcard,
+                    flags:
+                        UpdateFlags {
+                            prefix: false,
+                            router_id: false,
+                        },
+                    ..
+                } => {}
                 Tlv::RouterId { .. } | Tlv::Update { .. } => {
                     panic!("Router-Id and Update TLVs should be put with put_update")
                 }
+                Tlv::Hello {
+                    interval: None,
+                    transmit_timestamp: None,
+                    ..
+                } => {}
                 Tlv::Hello {
                     transmit_timestamp, ..
                 } => {

@@ -115,12 +115,40 @@ impl Net {
         }
     }
 
-    /// Adds node `j` as a neighbour of node `i`, which may be outside the simulation, and
-    /// sends the wildcard retraction that node `i` outputs for it.
+    /// Adds node `j` as a neighbour of node `i`, and sends the startup packet that node `i`
+    /// outputs for it. A node outside the simulation acknowledges it at once, so that a test
+    /// can go on to script its packets, which are discarded until then.
     fn add_neighbour(&mut self, i: usize, j: usize) {
-        let key = self.nodes[i].add_neighbour(self.now);
-        self.key_maps[i].insert(j, key);
-        self.process_outputs(i);
+        self.add_neighbour_unacknowledged(i, j);
+        if j >= self.nodes.len() {
+            self.acknowledge_startup(i, j);
+        }
+    }
+
+    /// Adds node `j` as a neighbour of node `i` (see [`Self::add_neighbour`]), leaving the startup
+    /// packet unacknowledged whichever node it is.
+    fn add_neighbour_unacknowledged(&mut self, i: usize, j: usize) {
+        self.add_neighbour_with_hello_seqno(i, j, Seqno::new(rand::random()));
+    }
+
+    /// Returns the Opaque value of the acknowledgement that node `i` awaits from node `j`.
+    fn startup_opaque(&self, i: usize, j: usize) -> u16 {
+        let startup = self.neigh(i, j).startup.as_ref();
+        startup.expect("the neighbour should be starting up").opaque
+    }
+
+    /// Hands node `i` the acknowledgement of its startup packet to node `j`, as if it came from
+    /// there.
+    fn acknowledge_startup(&mut self, i: usize, j: usize) {
+        let opaque = self.startup_opaque(i, j);
+        self.inject_tlv(j, i, &Tlv::Acknowledgement { opaque });
+    }
+
+    /// Hands node `to` a packet of one TLV, as if it came from node `from`.
+    fn inject_tlv(&mut self, from: usize, to: usize, tlv: &Tlv) {
+        let mut encoder = PacketEncoder::new(1400);
+        assert!(encoder.put_tlv(tlv));
+        self.inject(from, to, encoder.finalize().as_bytes());
     }
 
     /// Adds node `j` as a neighbour of node `i` (see [`Self::add_neighbour`]), with the seqno
@@ -136,6 +164,18 @@ impl Net {
         self.links.insert((b, a), latency);
         self.add_neighbour(a, b);
         self.add_neighbour(b, a);
+    }
+
+    /// Takes the link between two nodes down, and has each remove the other as a neighbour.
+    fn disconnect(&mut self, a: usize, b: usize) {
+        self.links.remove(&(a, b));
+        self.links.remove(&(b, a));
+        for (i, j) in [(a, b), (b, a)] {
+            let key = self.key(i, j);
+            self.nodes[i].remove_neighbour(self.now, key);
+            self.key_maps[i].remove_by_external(&j);
+            self.process_outputs(i);
+        }
     }
 
     /// Restarts node `i` as `state`, which has no neighbours yet. The node is stopped for a
@@ -223,7 +263,10 @@ impl Net {
             }
             Event::Arrival(_, to, _) if self.stopped[to] => return,
             Event::Arrival(from, to, buf) => {
-                let key = self.key(to, from);
+                // It may have been removed as a neighbour while this was on the way.
+                let Some(key) = self.key_maps[to].internal(&from) else {
+                    return;
+                };
                 self.nodes[to].handle_packet(self.now, self.now, key, &buf);
                 to
             }
@@ -417,6 +460,24 @@ fn updates(buf: &[u8]) -> Vec<Update> {
         .collect()
 }
 
+/// Checks whether a packet is a startup packet, which is the only one to ask for an
+/// acknowledgement.
+fn is_startup(buf: &[u8]) -> bool {
+    (tlvs(buf).iter()).any(|tlv| matches!(tlv, Tlv::AcknowledgementRequest { .. }))
+}
+
+/// Has the first two startup packets from now on lost, for example while there is no session yet.
+fn lose_first_two_startup_packets(net: &mut Net) {
+    thread_local! {
+        static LOST: Cell<u32> = const { Cell::new(0) };
+    }
+    LOST.set(0);
+    net.filter = |_, _, packet| {
+        let lost = is_startup(packet.as_bytes()) && LOST.replace(LOST.get() + 1) < 2;
+        (!lost).then_some(packet)
+    };
+}
+
 /// Builds a packet with the given body.
 fn packet(body: &[u8]) -> Vec<u8> {
     let mut buf = vec![42, 2];
@@ -566,6 +627,28 @@ fn link_cost() {
 }
 
 #[test]
+fn snapshots_show_what_a_link_cost_is_made_of() {
+    let mut net = Net::new(2);
+    net.connect(0, 1, Duration::from_millis(30));
+
+    let snapshot = net.nodes[0].snapshot(net.now, |key| key);
+    let neigh = &snapshot.neighbours[0];
+    assert!(neigh.in_startup);
+    assert_eq!((neigh.rxcost, neigh.txcost, neigh.cost), (INF, INF, INF));
+    assert_eq!((neigh.rtt_penalty, neigh.hello_history), (0, 0));
+
+    net.run_for(Duration::from_secs(60));
+
+    // The RTT is 60 ms, as in `neighbours_acquire_each_other`.
+    let snapshot = net.nodes[0].snapshot(net.now, |key| key);
+    let neigh = &snapshot.neighbours[0];
+    assert!(!neigh.in_startup);
+    assert_eq!((neigh.rxcost, neigh.txcost), (NOMINAL_COST, NOMINAL_COST));
+    assert_eq!((neigh.rtt_penalty, neigh.cost), (68, 164));
+    assert_eq!(neigh.hello_history & 0b111, 0b111);
+}
+
+#[test]
 fn neighbours_acquire_each_other() {
     let mut net = Net::new(2);
     net.connect(0, 1, Duration::from_millis(30));
@@ -591,9 +674,15 @@ fn hellos_and_ihus_follow_the_rfcs() {
     net.connect(0, 1, LATENCY);
     net.run_for(Duration::from_secs(60));
 
-    /// Returns the seqno, interval and transmit timestamp of the Hellos among TLVs.
+    /// Returns the seqno, interval and transmit timestamp of the Hellos among TLVs, other than
+    /// the far one of a startup packet, which has neither an interval nor a timestamp.
     fn hellos(tlvs: &[Tlv]) -> Vec<(Seqno, Option<Interval>, Option<u32>)> {
         let hellos = tlvs.iter().filter_map(|tlv| match *tlv {
+            Tlv::Hello {
+                interval: None,
+                transmit_timestamp: None,
+                ..
+            } => None,
             Tlv::Hello {
                 seqno,
                 interval,
@@ -629,7 +718,8 @@ fn hellos_and_ihus_follow_the_rfcs() {
         assert!(hellos.len() <= 1, "packet should carry at most one Hello");
 
         if let Some(&(seqno, interval, transmit_timestamp)) = hellos.first() {
-            assert_eq!(interval, Interval::new(400));
+            // A Hello that only carries an unscheduled IHU has no interval.
+            assert!(interval == Interval::new(400) || interval.is_none());
             let transmit_timestamp = transmit_timestamp.expect("Hello should be timestamped");
             assert_eq!(transmit_timestamp, timestamp(sent.time));
 
@@ -691,11 +781,12 @@ fn neighbours_are_sent_hellos_and_dumps_on_schedules_of_their_own() {
     // Each neighbour is on a point-to-point link of its own, so it is sent Hellos with
     // consecutive seqnos of its own (RFC 8966 §3.4.1). With timers not randomized, it is sent
     // one every Hello interval and a full dump every Update interval, both counted from when
-    // it was added, and each sent after the 0.75 to 1.25 s for which TLVs are buffered.
+    // it was added, and each sent after the 0.75 to 1.25 s for which TLVs are buffered. The
+    // Hello in its startup packet, acknowledged at once here, comes before all of those.
     let buffered = Duration::from_millis(750)..Duration::from_millis(1250);
     for (j, added) in added {
         let sent: Vec<_> = (net.sent.iter())
-            .filter(|sent| (sent.from, sent.to) == (0, j))
+            .filter(|sent| (sent.from, sent.to) == (0, j) && !is_startup(&sent.buf))
             .collect();
 
         let hellos: Vec<_> = (sent.iter())
@@ -754,7 +845,7 @@ fn hellos_and_full_dumps_are_spread_out_by_default() {
         for sent in net
             .sent
             .iter()
-            .filter(|sent| (sent.from, sent.to) == (0, j))
+            .filter(|sent| (sent.from, sent.to) == (0, j) && !is_startup(&sent.buf))
         {
             let tlvs = tlvs(&sent.buf);
             let count = tlvs
@@ -839,13 +930,98 @@ fn silent_neighbour_is_flushed_and_reacquired() {
         let neigh = net.neigh(i, j);
         assert_eq!(neigh.hello_history.bits(), 0);
         assert_eq!((neigh.txcost, neigh.rtt), (INF, None));
-        assert!(neigh.hello_timer_key.is_none() && neigh.ihu_timer_key.is_none());
+        assert!(neigh.incoming_hello_timer_key.is_none() && neigh.incoming_ihu_timer_key.is_none());
     }
 
     net.links = links;
     net.run_for(Duration::from_secs(30));
     assert_eq!(net.costs(0, 1), UP);
     assert_eq!(net.costs(1, 0), UP);
+}
+
+#[test]
+fn removed_neighbour_leaves_nothing_behind() {
+    let now = Instant::now();
+    let mut node = state(0, now);
+    let key = node.add_neighbour(now);
+
+    // Its startup packet hasn't been polled yet, and the timer to send it again is running.
+    node.remove_neighbour(now, key);
+
+    assert!(node.poll_output().is_none());
+    assert_eq!(node.poll_timeout(), None);
+    assert!(node.snapshot(now, |key| key).neighbours.is_empty());
+}
+
+#[test]
+fn removed_neighbour_is_sent_nothing_more() {
+    let mut net = Net::new(2);
+    net.connect(0, 1, Duration::ZERO);
+    net.run_for(Duration::from_secs(31));
+
+    net.disconnect(0, 1);
+    let start = net.now;
+    net.run_for(Duration::from_secs(120));
+    assert!(!net.sent.iter().any(|sent| sent.time >= start));
+}
+
+#[test]
+fn routes_through_the_only_removed_neighbour_are_held_at_once() {
+    let p = prefix("fd00:1::/64");
+    let mut net = Net::new(2);
+    net.originate(1, p);
+    net.connect(0, 1, Duration::ZERO);
+    net.run_for(Duration::from_secs(31));
+    assert_eq!(net.fib(0, p), Some(Fib::Via(1)));
+
+    net.disconnect(0, 1);
+    assert_eq!(net.fib(0, p), Some(Fib::Unreachable));
+
+    let hold_time = params().get(DurationKey::RouteHoldTime);
+    net.run_for(hold_time + Duration::from_secs(1));
+    assert_eq!(net.fib(0, p), None);
+}
+
+#[test]
+fn routes_through_a_removed_neighbour_move_to_another() {
+    // Node 0 reaches node 3 through node 1 and node 2.
+    let p = prefix("fd00:3::/64");
+    let mut net = Net::new(4);
+    net.originate(3, p);
+    for (a, b) in [(0, 1), (0, 2), (1, 3), (2, 3)] {
+        net.connect(a, b, Duration::from_millis(10));
+    }
+    net.run_for(Duration::from_secs(60));
+    let Some(Fib::Via(selected)) = net.fib(0, p) else {
+        panic!("node 0 should have a route");
+    };
+
+    net.disconnect(0, selected);
+    net.run_for(Duration::from_secs(5));
+    assert_eq!(net.fib(0, p), Some(Fib::Via(3 - selected)));
+}
+
+#[test]
+fn removed_neighbour_is_reacquired_when_added_again() {
+    let p = prefix("fd00:1::/64");
+    let q = prefix("fd00:2::/64");
+    let mut net = Net::new(2);
+    net.originate(0, q);
+    net.originate(1, p);
+    net.connect(0, 1, Duration::ZERO);
+    net.run_for(Duration::from_secs(31));
+    let old_key = net.key(0, 1);
+
+    net.disconnect(0, 1);
+    net.run_for(Duration::from_secs(120));
+
+    net.connect(0, 1, Duration::ZERO);
+    assert_ne!(net.key(0, 1), old_key);
+    net.run_for(Duration::from_secs(31));
+    assert_eq!(net.costs(0, 1), UP);
+    assert_eq!(net.costs(1, 0), UP);
+    assert_eq!(net.fib(0, p), Some(Fib::Via(1)));
+    assert_eq!(net.fib(1, q), Some(Fib::Via(0)));
 }
 
 #[test]
@@ -859,8 +1035,8 @@ fn rebooted_neighbour_is_reacquired() {
     net.restart(1, state(1, net.now));
     net.add_neighbour_with_hello_seqno(1, 0, hello_seqno);
 
-    // Its first Hello flushes node 0's entry for it, restarting the history.
-    net.run_for(Duration::from_secs(3));
+    // Its startup packet flushes node 0's entry for it, restarting the history.
+    net.run_for(Duration::from_millis(1));
     let neigh = net.neigh(0, 1);
     assert_eq!(neigh.hello_history.bits(), 0b1);
     assert_eq!((neigh.txcost, neigh.rtt), (INF, None));
@@ -889,10 +1065,9 @@ fn rebooted_neighbour_routes_wait_for_the_link() {
     net.connect(0, 1, Duration::ZERO);
     net.run_for(Duration::from_secs(31));
 
-    // Node 1 reboots, its Hello seqno jumps, and it originates P. It sends node 0 a wildcard
-    // retraction at once (see `State::add_neighbour`), then a packet with an update for P and a
-    // Hello, which flushes node 0's entry for it, but keeps the route to P that the packet
-    // refreshed.
+    // Node 1 reboots, its Hello seqno jumps, and it originates P. It sends node 0 a startup packet
+    // at once (see `State::add_neighbour`), which flushes node 0's entry for it, and once that is
+    // acknowledged, a packet with a Hello and an update for P.
     let hello_seqno = net.neigh(1, 0).hello_seqno + 1000;
     net.restart(1, state(1, net.now));
     net.add_neighbour_with_hello_seqno(1, 0, hello_seqno);
@@ -927,8 +1102,8 @@ fn rebooted_neighbour_old_routes_are_held_at_its_first_packet() {
     net.add_neighbour_with_hello_seqno(1, 0, hello_seqno);
     net.locals[1].clear();
 
-    // It sends node 0 a wildcard retraction at once (see `State::add_neighbour`), which removes
-    // node 0's route to P through it, learnt before the reboot, so P is held at once.
+    // It sends node 0 a startup packet at once (see `State::add_neighbour`), whose retraction
+    // removes node 0's route to P through it, learnt before the reboot, so P is held at once.
     net.run_for(Duration::from_millis(1));
     assert_eq!(net.fib(0, p), Some(Fib::Unreachable));
     assert!(
@@ -937,16 +1112,14 @@ fn rebooted_neighbour_old_routes_are_held_at_its_first_packet() {
             .is_empty()
     );
 
-    // Its first Hello, flushed within 2 s, flushes node 0's entry for it, so the link cost
-    // becomes infinite.
-    net.run_for(Duration::from_secs(3));
+    // Its Hellos flush node 0's entry for it, so the link cost is infinite as well.
     assert_eq!(net.costs(0, 1).2, INF);
 }
 
 #[test]
-fn added_neighbours_are_sent_a_wildcard_retraction_alone_at_once() {
+fn added_neighbours_are_sent_a_startup_packet_alone_at_once() {
     // Node 0 has been running for a while, and has learnt a route from neighbour 9, when it
-    // adds neighbour 8. The retraction for neighbour 8 goes in a packet of its own, at once,
+    // adds neighbour 8. The startup packet for neighbour 8 goes in a packet of its own, at once,
     // rather than with the next packet, up to 1.25 s later (see `State::add_neighbour`).
     let p = prefix("fd00:9::/64");
     let mut net = Net::new(1);
@@ -959,7 +1132,7 @@ fn added_neighbours_are_sent_a_wildcard_retraction_alone_at_once() {
     assert_eq!(net.fib(0, p), Some(Fib::Via(9)));
 
     let start = net.now;
-    net.add_neighbour(0, 8);
+    net.add_neighbour_unacknowledged(0, 8);
     let sent: Vec<_> = (net.sent.iter())
         .filter(|sent| sent.from == 0 && sent.time >= start)
         .collect();
@@ -967,15 +1140,388 @@ fn added_neighbours_are_sent_a_wildcard_retraction_alone_at_once() {
         panic!("node 0 should send exactly one packet");
     };
     assert_eq!(sent.to, 8);
-    assert!(tlvs(&sent.buf).is_empty());
-    let updates = updates(&sent.buf);
-    let [retraction] = &updates[..] else {
-        panic!("the packet should have exactly one update");
+    let items: Vec<_> = (PacketDecoder::new(&sent.buf).unwrap())
+        .map(Result::unwrap)
+        .collect();
+    let [
+        PacketItem::Update(retraction),
+        PacketItem::Tlv(Tlv::Hello {
+            seqno: far_seqno,
+            interval: None,
+            transmit_timestamp: None,
+        }),
+        PacketItem::Tlv(Tlv::Hello {
+            seqno,
+            interval,
+            transmit_timestamp: Some(_),
+        }),
+        PacketItem::Tlv(Tlv::AcknowledgementRequest {
+            interval: within, ..
+        }),
+    ] = &items[..]
+    else {
+        panic!("the packet should have a retraction, two Hellos and a request only: {items:?}");
     };
     assert_eq!(
         (retraction.ae, retraction.metric),
         (Ae::Wildcard, METRIC_INFINITY)
     );
+    assert_eq!(*interval, Interval::new(400));
+    assert_eq!(*far_seqno, *seqno + FAR_HELLO_SEQNO_OFFSET);
+    assert_eq!(within.to_duration(), Duration::from_millis(10));
+}
+
+#[test]
+fn startup_packets_are_sent_again_until_acknowledged() {
+    let mut net = Net::new(1);
+    let added = net.now;
+    net.add_neighbour_unacknowledged(0, 9);
+    net.run_for(Duration::from_secs(20));
+
+    // They go out with new Hello seqnos, 0.25 s after the first, then twice as long each time,
+    // up to the Hello interval, with nothing else in between.
+    let sent: Vec<_> = (net.sent.iter()).filter(|sent| sent.to == 9).collect();
+    assert!(sent.iter().all(|sent| is_startup(&sent.buf)));
+    let times: Vec<_> = (sent.iter())
+        .map(|sent| (sent.time - added).as_millis())
+        .collect();
+    assert_eq!(times, [0, 250, 750, 1750, 3750, 7750, 11750, 15750, 19750]);
+    let opaques: HashSet<_> = (sent.iter())
+        .flat_map(|sent| tlvs(&sent.buf))
+        .filter_map(|tlv| match tlv {
+            Tlv::AcknowledgementRequest { opaque, .. } => Some(opaque),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(opaques.len(), 1);
+    let scheduled_seqnos: Vec<_> = (sent.iter())
+        .flat_map(|sent| tlvs(&sent.buf))
+        .filter_map(|tlv| match tlv {
+            Tlv::Hello {
+                seqno,
+                interval: Some(_),
+                ..
+            } => Some(seqno),
+            _ => None,
+        })
+        .collect();
+    for pair in scheduled_seqnos.windows(2) {
+        assert_eq!(pair[1], pair[0] + 1);
+    }
+
+    // Once acknowledged, it gets the first Hello, a request for a full dump, and the first full
+    // dump, and no more startup packets.
+    let p = prefix("fd00::/64");
+    net.originate(0, p);
+    let start = net.now;
+    net.acknowledge_startup(0, 9);
+    net.run_for(Duration::from_secs(2));
+    let sent: Vec<_> = (net.sent.iter())
+        .filter(|sent| sent.to == 9 && sent.time >= start)
+        .collect();
+    assert!(sent.iter().all(|sent| !is_startup(&sent.buf)));
+    let tlvs_sent: Vec<_> = sent.iter().flat_map(|sent| tlvs(&sent.buf)).collect();
+    assert_matches!(
+        tlvs_sent[0],
+        Tlv::Hello {
+            interval: Some(_),
+            ..
+        }
+    );
+    assert_matches!(
+        tlvs_sent[1],
+        Tlv::RouteRequest {
+            ae: Ae::Wildcard,
+            ..
+        }
+    );
+    assert!(updates_sent(&net, 0, 9, start).iter().any(|u| is_for(u, p)));
+}
+
+#[test]
+fn nothing_but_acknowledgements_is_taken_in_during_startup() {
+    let p = prefix("fd00:9::/64");
+    let mut net = Net::new(1);
+    net.add_neighbour_unacknowledged(0, 9);
+    let mut n9 = Scripted::new(9);
+
+    for _ in 0..4 {
+        n9.send(&mut net, 0, &[update(p, 42, 1, 100, 0x8000)]);
+        net.run_for(Duration::from_millis(100));
+    }
+    assert_eq!(net.fib(0, p), None);
+    assert!(net.nodes[0].route_table.prefix_entries.is_empty());
+    let neigh = net.neigh(0, 9);
+    assert_eq!(neigh.hello_history.bits(), 0);
+    assert_eq!(neigh.txcost, INF);
+
+    // A request for an acknowledgement is answered, within its deadline, or two nodes starting up
+    // together would wait for each other forever.
+    let start = net.now;
+    let request = Tlv::AcknowledgementRequest {
+        opaque: 77,
+        interval: Interval::new(1).unwrap(),
+    };
+    net.inject_tlv(9, 0, &request);
+    net.run_for(Duration::from_millis(10));
+    let answers = tlvs_sent(&net, 0, 9, start);
+    assert!(answers.contains(&Tlv::Acknowledgement { opaque: 77 }));
+
+    // An acknowledgement of something else changes nothing.
+    let opaque = net.startup_opaque(0, 9).wrapping_add(1);
+    net.inject_tlv(9, 0, &Tlv::Acknowledgement { opaque });
+    assert!(net.neigh(0, 9).startup.is_some());
+
+    // Once acknowledged, everything is taken in again.
+    net.acknowledge_startup(0, 9);
+    for _ in 0..3 {
+        n9.send(&mut net, 0, &[update(p, 42, 1, 100, 0x8000)]);
+    }
+    assert_eq!(net.fib(0, p), Some(Fib::Via(9)));
+}
+
+/// A neighbour's IHU can be waiting in its buffer with an echo from before this node restarted,
+/// and it leaves with the acknowledgement at the latest, in the same packet at the latest.
+#[test]
+fn the_packet_with_the_acknowledgement_is_discarded_with_any_echo_in_it() {
+    let p = prefix("fd00:9::/64");
+    let mut net = Net::new(1);
+    net.add_neighbour_unacknowledged(0, 9);
+    let opaque = net.startup_opaque(0, 9);
+
+    let now = timestamp(net.now);
+    let mut encoder = PacketEncoder::new(1400);
+    assert!(encoder.put_update(&update(p, 42, 1, 100, 0x8000)));
+    let tlvs = [
+        Tlv::Hello {
+            seqno: Seqno::new(5),
+            interval: Interval::new(400),
+            transmit_timestamp: Some(0),
+        },
+        // An echo from 20 s ago, a little after which the neighbour heard it.
+        Tlv::Ihu {
+            ae: Ae::Wildcard,
+            rxcost: NOMINAL_COST,
+            interval: Interval::new(1200).unwrap(),
+            address: [0; 8],
+            origin_receive_timestamps: Some((now.wrapping_sub(20_000_000), 1000)),
+        },
+        Tlv::Acknowledgement { opaque },
+    ];
+    assert!(encoder.put_tlvs(&tlvs));
+    let mut packet = encoder.finalize();
+    net.inject(9, 0, packet.timestamp(net.now));
+
+    let neigh = net.neigh(0, 9);
+    assert!(neigh.startup.is_none());
+    assert_eq!(neigh.rtt, None);
+    assert_eq!(neigh.txcost, INF);
+    assert_eq!(neigh.hello_history.bits(), 0);
+    assert_eq!(neigh.origin_receive_timestamps, None);
+    assert_eq!(net.fib(0, p), None);
+}
+
+#[test]
+fn neighbours_are_sent_nothing_else_during_startup() {
+    // Node 0 learns P from neighbour 9, and tells neighbour 7, but neighbour 8 hasn't acknowledged
+    // its startup packet, and whatever it were told, the next one would retract.
+    let p = prefix("fd00:9::/64");
+    let mut net = Net::new(1);
+    net.add_neighbour(0, 7);
+    net.add_neighbour(0, 9);
+    net.add_neighbour_unacknowledged(0, 8);
+    let (mut n7, mut n9) = (Scripted::new(7), Scripted::new(9));
+    for _ in 0..4 {
+        n7.send(&mut net, 0, &[]);
+        n9.send(&mut net, 0, &[update(p, 42, 1, 100, 0x8000)]);
+        net.run_for(Duration::from_secs(1));
+    }
+    assert_eq!(net.fib(0, p), Some(Fib::Via(9)));
+    assert!(
+        updates_sent(&net, 0, 7, net.now - Duration::from_secs(4))
+            .iter()
+            .any(|u| is_for(u, p))
+    );
+
+    // It only hears of P on its acknowledgement, in the first full dump.
+    let sent = (net.sent.iter()).filter(|sent| sent.to == 8);
+    assert!(sent.into_iter().all(|sent| is_startup(&sent.buf)));
+    let start = net.now;
+    net.acknowledge_startup(0, 8);
+    net.run_for(Duration::from_secs(2));
+    assert!(updates_sent(&net, 0, 8, start).iter().any(|u| is_for(u, p)));
+}
+
+/// Requests that go to every neighbour leave it out as well, as its packets would be discarded.
+#[test]
+fn requests_to_every_neighbour_leave_out_those_in_startup() {
+    let p = prefix("fd00:9::/64");
+    let far = update(p, 42, 1, 500, 0x8000);
+    let near = update(p, 42, 1, 100, 0x8000);
+    let (mut net, mut n8, mut n9) = two_routes(&far, &near);
+    net.add_neighbour_unacknowledged(0, 7);
+
+    // Losing the route to P makes node 0 send a seqno request to every neighbour.
+    let start = net.now;
+    let retraction = update(p, 42, 1, METRIC_INFINITY, 0x8000);
+    exchange(&mut net, &mut n8, &mut n9, 4, &[], from_ref(&retraction));
+    assert_eq!(net.fib(0, p), Some(Fib::Unreachable));
+
+    assert!(!requests_sent(&net, 0, 9, start).is_empty());
+    assert_eq!(requests_sent(&net, 0, 7, start), []);
+}
+
+/// The first startup packets of both are lost, for example while there is no session yet, and they
+/// cross on the way, so that each is asked for an acknowledgement while waiting for one.
+#[test]
+fn nodes_starting_together_acquire_each_other() {
+    let p = prefix("fd00:1::/64");
+    let mut net = Net::new(2);
+    lose_first_two_startup_packets(&mut net);
+    net.originate(1, p);
+    net.connect(0, 1, Duration::from_millis(20));
+    net.run_for(Duration::from_secs(30));
+
+    assert!(net.neigh(0, 1).startup.is_none());
+    assert!(net.neigh(1, 0).startup.is_none());
+    assert_eq!(net.fib(0, p), Some(Fib::Via(1)));
+}
+
+/// Without the two Hellos, this relied on the new seqno happening to be far from the old one.
+#[test]
+fn startup_flushes_a_neighbour_whatever_hello_seqno_it_expects() {
+    for offset in [
+        0, 1, 2, 16, 17, 1000, 0x7ffe, 0x7fff, 0x8000, 0x8001, 0x8002, 0xffff,
+    ] {
+        let mut net = Net::new(2);
+        net.connect(0, 1, Duration::ZERO);
+        net.run_for(Duration::from_secs(31));
+        assert_eq!(net.costs(0, 1), UP);
+
+        // Node 1 restarts, with its Hello seqno exactly where node 0 expects it, and so on.
+        let expected = net.neigh(1, 0).hello_seqno;
+        net.restart(1, state(1, net.now));
+        net.add_neighbour_with_hello_seqno(1, 0, expected + offset);
+        net.run_for(Duration::from_millis(1));
+
+        let neigh = net.neigh(0, 1);
+        assert_eq!(neigh.hello_history.bits(), 0b1, "{offset}");
+        assert_eq!((neigh.txcost, neigh.rtt), (INF, None), "{offset}");
+        assert_eq!(net.costs(0, 1).2, INF, "{offset}");
+
+        net.run_for(Duration::from_secs(30));
+        assert_eq!(net.costs(0, 1), UP, "{offset}");
+        assert_eq!(net.costs(1, 0), UP, "{offset}");
+    }
+}
+
+/// The network of `State`'s docs on reboots. Node 1 reboots while node 0 is out of reach, its first
+/// startup packets are lost, and its Hello seqnos are close to the old ones, so nothing else would
+/// tell its neighbours. It would select node 3's route, and packets would go round nodes 1, 3 and
+/// 2, which `Net` panics at.
+#[test]
+fn no_loop_forms_when_a_reboot_goes_unnoticed_at_first() {
+    let p = prefix("fd00:1::/64");
+    let mut net = Net::new(4);
+    for (a, b, ms) in [(0, 1, 10), (1, 2, 10), (2, 3, 10), (1, 3, 200)] {
+        net.connect(a, b, Duration::from_millis(ms));
+    }
+    net.originate(0, p);
+    net.run_for(Duration::from_secs(200));
+    assert_eq!(net.path(3, p.addr()), [3, 2, 1, 0]);
+
+    let (near2, near3) = (
+        net.neigh(1, 2).hello_seqno + 1,
+        net.neigh(1, 3).hello_seqno + 1,
+    );
+    net.links.remove(&(0, 1));
+    net.links.remove(&(1, 0));
+    lose_first_two_startup_packets(&mut net);
+    net.restart(1, state(1, net.now));
+    net.add_neighbour_with_hello_seqno(1, 2, near2);
+    net.add_neighbour_with_hello_seqno(1, 3, near3);
+    net.run_for(Duration::from_secs(60));
+
+    assert_eq!(net.fib(1, p), None);
+    assert_eq!(net.fib(2, p), Some(Fib::Unreachable));
+    assert_eq!(net.fib(3, p), Some(Fib::Unreachable));
+}
+
+#[test]
+fn an_unscheduled_ihu_goes_out_as_soon_as_a_neighbour_is_heard() {
+    let mut net = Net::new(1);
+    net.add_neighbour(0, 9);
+    let mut n9 = Scripted::new(9);
+
+    let ihus = |net: &Net, start| {
+        let tlvs = tlvs_sent(net, 0, 9, start).into_iter();
+        tlvs.filter(|tlv| {
+            matches!(
+                tlv,
+                Tlv::Ihu {
+                    rxcost: NOMINAL_COST,
+                    ..
+                }
+            )
+        })
+        .count()
+    };
+
+    // Two out of the last three Hellos make the rxcost finite. It goes out at once, without any of
+    // the time for which TLVs are buffered, but only the once.
+    let start = net.now;
+    n9.send(&mut net, 0, &[]);
+    assert_eq!(ihus(&net, start), 0);
+    n9.send(&mut net, 0, &[]);
+    assert_eq!(ihus(&net, start), 1);
+    n9.send(&mut net, 0, &[]);
+    assert_eq!(ihus(&net, start), 1);
+}
+
+/// The neighbour gets an RTT sample along with hearing that it is heard, so that a route through it
+/// is not selected at a cost that leaves the RTT out, only to get worse at the next IHU.
+#[test]
+fn an_unscheduled_ihu_comes_with_timestamps_and_a_hello_for_them() {
+    const LATENCY: Duration = Duration::from_millis(30);
+    let mut net = Net::new(2);
+    net.connect(0, 1, LATENCY);
+    for _ in 0..3000 {
+        if net.costs(0, 1).2 != INF {
+            break;
+        }
+        net.run_for(Duration::from_millis(10));
+    }
+    assert_ne!(net.costs(0, 1).2, INF);
+    assert!(net.neigh(0, 1).rtt.is_some());
+    assert!((net.neigh(0, 1).rtt.unwrap() - 60_000.0).abs() < 1000.0);
+
+    let unscheduled: Vec<_> = (net.sent.iter())
+        .map(|sent| tlvs(&sent.buf))
+        .filter(|tlvs| {
+            let ihu = tlvs.iter().any(|tlv| matches!(tlv, Tlv::Ihu { .. }));
+            let hello = |tlv: &Tlv| {
+                matches!(
+                    tlv,
+                    Tlv::Hello {
+                        interval: None,
+                        transmit_timestamp: Some(_),
+                        ..
+                    }
+                )
+            };
+            ihu && tlvs.iter().any(hello)
+        })
+        .collect();
+    assert!(!unscheduled.is_empty());
+    for tlvs in unscheduled {
+        assert!(tlvs.iter().any(|tlv| matches!(
+            tlv,
+            Tlv::Ihu {
+                origin_receive_timestamps: Some(_),
+                ..
+            }
+        )));
+    }
 }
 
 #[test]
@@ -995,8 +1541,8 @@ fn shutdown_says_goodbye_and_removes_routes() {
     assert_eq!(net.fib(0, q), Some(Fib::Unreachable));
 
     // Node 0 shuts down. It sends each neighbour at once a packet of a wildcard retraction and
-    // a Hello with an interval of 0.1 s, dropping what was buffered for it, such as the urgent
-    // retraction of Q. P and Q are removed.
+    // a Hello with a far seqno and an interval of 10 ms, dropping what was buffered for it, such
+    // as the urgent retraction of Q. P and Q are removed.
     let sent_before = net.sent.len();
     let hello_seqnos = [8, 9].map(|j| (j, net.neigh(0, j).hello_seqno));
     net.shutdown(0);
@@ -1026,7 +1572,10 @@ fn shutdown_says_goodbye_and_removes_routes() {
         else {
             panic!("the last TLV should be an untimestamped Hello");
         };
-        assert_eq!((seqno, interval), (hello_seqno, Interval::new(10)));
+        assert_eq!(
+            (seqno, interval),
+            (hello_seqno + FAR_HELLO_SEQNO_OFFSET, Interval::new(1))
+        );
     }
     assert!(net.fibs[0].is_empty());
 }
@@ -1045,25 +1594,24 @@ fn neighbours_of_a_node_shut_down_switch_at_once_and_flush_it_soon() {
     net.run_for(Duration::from_secs(200));
     assert_eq!(net.path(0, p.addr()), [0, 1, 2]);
 
-    // Node 1 shuts down. Its wildcard retraction reaches node 0 10 ms later, and node 0
-    // switches to its route through node 2 at once, while the link is still up, rather than
-    // once the link fails.
+    // Node 1 shuts down. Its goodbye reaches node 0 10 ms later, and node 0 switches to its route
+    // through node 2 at once, rather than once the link fails. The far Hello seqno flushes its
+    // entry for node 1 there and then, echoes and RTT included.
     net.shutdown(1);
-    net.run_for(Duration::from_millis(20));
+    net.run_for(Duration::from_millis(11));
     assert_eq!(net.fib(0, p), Some(Fib::Via(2)));
-    assert_ne!(net.costs(0, 1).2, INF);
-
-    // With node 1's Hello interval of 0.1 s, node 0 counts a Hello as missed 0.15 s after
-    // it, and every 0.1 s after that. The link fails at the second, and node 0 flushes its
-    // entry for node 1 at the 16th, once the history is empty, 1.66 s after the shutdown.
-    net.run_for(Duration::from_millis(280));
-    assert_eq!(net.costs(0, 1).2, INF);
-    net.run_for(Duration::from_millis(1300));
-    assert_ne!(net.neigh(0, 1).hello_history.bits(), 0);
-    net.run_for(Duration::from_millis(100));
     let neigh = net.neigh(0, 1);
-    assert_eq!(neigh.hello_history.bits(), 0);
+    assert_eq!(neigh.hello_history.bits(), 0b1);
     assert_eq!((neigh.txcost, neigh.rtt), (INF, None));
+    assert_eq!(neigh.origin_receive_timestamps, None);
+    assert_eq!(net.costs(0, 1).2, INF);
+
+    // With node 1's Hello interval of 10 ms, node 0 counts a Hello as missed 15 ms after it, and
+    // every 10 ms after that, which empties the history at the 16th, 175 ms after the shutdown.
+    net.run_for(Duration::from_millis(150));
+    assert_ne!(net.neigh(0, 1).hello_history.bits(), 0);
+    net.run_for(Duration::from_millis(20));
+    assert_eq!(net.neigh(0, 1).hello_history.bits(), 0);
 }
 
 #[test]
@@ -1696,6 +2244,14 @@ fn unfeasible_routes_are_never_selected() {
         net.run_for(Duration::from_secs(4));
     }
     assert_eq!(net.fib(0, p), Some(Fib::Unreachable));
+
+    // A snapshot says so, while the metric alone gives no reason.
+    let via = net.key_maps[0].internal(&9).unwrap();
+    let snapshot = net.nodes[0].snapshot(net.now, |key| key);
+    let routes = &snapshot.prefixes[0].routes;
+    let route = routes.iter().find(|route| route.via == via).unwrap();
+    assert_ne!(route.metric, METRIC_INFINITY);
+    assert!(!route.feasible);
 }
 
 /// Runs node 0 for `secs` seconds, with neighbours 8 and 9 sending a Hello and an IHU
@@ -1714,6 +2270,34 @@ fn exchange(
         n8.send(net, 0, if first { updates8 } else { &[] });
         net.run_for(Duration::from_secs(4));
     }
+}
+
+#[test]
+fn snapshots_smooth_metrics_up_to_the_time_asked_for() {
+    let p = prefix("fd00:9::/64");
+    let far = update(p, 42, 1, 500, 0x8000);
+    let near = update(p, 42, 1, 100, 0x8000);
+    let (mut net, _n8, mut n9) = two_routes(&far, &near);
+    let via = net.key_maps[0].internal(&9).unwrap();
+
+    let route_at = |net: &Net, at: Instant| {
+        let snapshot = net.nodes[0].snapshot(at, |key| key);
+        let routes = &snapshot.prefixes[0].routes;
+        let route = routes.iter().find(|route| route.via == via).unwrap();
+        (route.metric, route.smoothed_metric, route.feasible)
+    };
+
+    assert_eq!(route_at(&net, net.now), (196, 196, true));
+
+    // Its metric rises, and smoothing takes its time to follow.
+    n9.send(&mut net, 0, from_ref(&update(p, 42, 2, 300, 0x8000)));
+    let (metric, smoothed, _) = route_at(&net, net.now);
+    assert_eq!((metric, smoothed), (396, 196));
+
+    let (_, smoothed, _) = route_at(&net, net.now + Duration::from_secs(12));
+    assert!((300..396).contains(&smoothed), "{smoothed}");
+    let (_, smoothed, _) = route_at(&net, net.now + Duration::from_secs(600));
+    assert_eq!(smoothed, 396);
 }
 
 /// Sets up node 0 with neighbours 8 and 9, which announce P once each, with an interval
@@ -2292,9 +2876,9 @@ fn originator_rebooted_with_seqno_smaller_by_up_to_99_is_reacquired_through_requ
     // send another request, as the route would be selected were it feasible (RFC 8966
     // §3.8.2.2), until the route is feasible. This takes one request per seqno that node 2's
     // falls short by, and up to 2 more where requests overlap. P is regained within seconds,
-    // rather than 3 minutes. The link is back up once node 2 reports in an IHU that it hears
-    // node 1. It sends one with every third Hello, 8 s after the reboot, and if it has not
-    // heard two of node 1's Hellos by then, 12 s later.
+    // rather than 3 minutes, and up to 3 more if the link is back up early enough that replies
+    // overlap with the resends of the request for the lost route. The link is back up once node
+    // 2 has heard two of node 1's Hellos and said so in an unscheduled IHU.
     for (gap, within) in [(10, 23), (99, 45)] {
         let (mut net, p, reboot) = rebooted_originator(gap);
 
@@ -2310,7 +2894,10 @@ fn originator_rebooted_with_seqno_smaller_by_up_to_99_is_reacquired_through_requ
         assert_eq!(regained.entry, Some(Fib::Via(1)));
         assert!(regained.time - held.time <= Duration::from_secs(within));
         let requests = requests_sent(&net, 1, 2, reboot).len();
-        assert!((usize::from(gap)..=usize::from(gap) + 2).contains(&requests));
+        assert!(
+            (usize::from(gap)..=usize::from(gap) + 3).contains(&requests),
+            "{gap}: {requests}"
+        );
     }
 }
 
@@ -2400,6 +2987,13 @@ fn requested_net() -> (Net, IpNet, IpNet) {
     assert_eq!(net.fib(0, learnt), Some(Fib::Via(1)));
 
     (net, learnt, local)
+}
+
+/// Returns the TLVs, other than updates, that node `from` sent to node `to` since `start`.
+fn tlvs_sent(net: &Net, from: usize, to: usize, start: Instant) -> Vec<Tlv> {
+    let sent = net.sent.iter();
+    let sent = sent.filter(|sent| (sent.from, sent.to) == (from, to) && sent.time >= start);
+    sent.flat_map(|sent| tlvs(&sent.buf)).collect()
 }
 
 /// Returns the updates that node `from` sent to node `to` since `start`.
@@ -2581,12 +3175,15 @@ fn routes_missing_one_full_dump_in_two_are_not_requested() {
 
     assert_eq!(net.fib(0, p), Some(Fib::Via(1)));
     assert!(DUMPS.get() > 180);
+    // Only the wildcard one that each sends once its startup is over.
     let requests = (net.sent.iter()).flat_map(|sent| tlvs(&sent.buf));
-    assert!(
-        !requests
-            .into_iter()
-            .any(|tlv| matches!(tlv, Tlv::RouteRequest { .. }))
-    );
+    let requests: Vec<_> = requests
+        .filter_map(|tlv| match tlv {
+            Tlv::RouteRequest { ae, .. } => Some(ae),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(requests, [Ae::Wildcard; 2]);
 }
 
 #[test]

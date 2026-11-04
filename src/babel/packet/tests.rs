@@ -650,6 +650,9 @@ put_tlvs_panics! {
         [router_id(1)] => "Router-Id and Update TLVs should be put with put_update",
     put_tlvs_panics_with_update:
         [update_tlv(Ipv6, 0, 0, 0, INF, &[])] => "Router-Id and Update TLVs should be put with put_update",
+    put_tlvs_panics_with_wildcard_update_with_flags:
+        [update_tlv(Wildcard, 0x80, 0, 0, INF, &[])]
+            => "Router-Id and Update TLVs should be put with put_update",
     put_tlvs_panics_with_two_hellos:
         [hello(None), hello(None)] => "TLVs put together should not include more than one Hello",
     put_tlvs_panics_with_timestamped_ihu_before_hello:
@@ -682,4 +685,69 @@ fn put_update_panics_with_unmasked_prefix() {
 #[should_panic(expected = "Update with finite metric should carry a router-id")]
 fn put_update_panics_without_router_id_for_finite_metric() {
     let _ = PacketEncoder::new(512).put_update(&update(Ipv6, 64, METRIC, "2001:db8::", None));
+}
+
+/// A wildcard retraction can go with other TLVs, all at once or not at all, and comes out as it
+/// does from `put_update`.
+#[test]
+fn put_tlvs_takes_a_wildcard_retraction() {
+    let tlv = update_tlv(Wildcard, 0, 0, 0, INF, &[]);
+
+    let mut from_tlv = PacketEncoder::new(512);
+    assert!(from_tlv.put_tlv(&tlv));
+    assert_eq!(
+        from_tlv.finalize().as_bytes(),
+        encode_updates(&[update(Wildcard, 0, INF, "::", None)])
+    );
+
+    // It leaves the parser state as it is, so what follows can still be compressed against what
+    // came before.
+    let announce = |e: &mut PacketEncoder, prefix| {
+        assert!(e.put_update(&update(Ipv6, 64, 1, prefix, Some(1))));
+    };
+    let mut encoder = PacketEncoder::new(1400);
+    announce(&mut encoder, "2001:db8::");
+    let before = encoder.remaining();
+    announce(&mut encoder, "2001:db8:0:1::");
+    let compressed = before - encoder.remaining();
+    assert!(encoder.put_tlv(&tlv));
+    let before = encoder.remaining();
+    announce(&mut encoder, "2001:db8:0:2::");
+    assert_eq!(before - encoder.remaining(), compressed);
+
+    // If it all doesn't fit, nothing goes in, though the retraction alone would have.
+    let mut encoder = PacketEncoder::new(512);
+    for length in [200, 200, 80] {
+        assert!(encoder.put_tlv(&Tlv::PadN { length }));
+    }
+    let remaining = encoder.remaining();
+    assert!(tlv.encoded_len() <= remaining);
+    assert!(remaining < tlv.encoded_len() + hello(Some(0)).encoded_len());
+    assert!(!encoder.put_tlvs(&[tlv, hello(Some(0))]));
+    assert_eq!(encoder.remaining(), remaining);
+}
+
+/// A Hello to move a neighbour's expected seqno doesn't count as the packet's Hello.
+#[test]
+fn unscheduled_hellos_with_no_timestamp_do_not_count_as_the_packets_hello() {
+    let far = Tlv::Hello {
+        seqno: Seqno::new(1),
+        interval: None,
+        transmit_timestamp: None,
+    };
+
+    let mut encoder = PacketEncoder::new(1400);
+    assert!(encoder.put_tlvs(&[far.clone(), hello(Some(0))]));
+    assert!(!encoder.put_tlv(&hello(Some(0))));
+    assert!(encoder.put_tlv(&far));
+    assert!(encoder.put_tlv(&ihu(Some((1, 2)))));
+
+    // One with a timestamp does.
+    let mut encoder = PacketEncoder::new(1400);
+    assert!(encoder.put_tlv(&Tlv::Hello {
+        seqno: Seqno::new(1),
+        interval: None,
+        transmit_timestamp: Some(0),
+    }));
+    assert!(!encoder.put_tlv(&hello(Some(0))));
 }
