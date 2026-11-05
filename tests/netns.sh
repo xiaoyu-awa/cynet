@@ -351,7 +351,7 @@ expect "shows a link cost" 'link cost: [0-9]+' "$output"
 expect "lists injected routes" '10\.42\.0\.1/32 +injected' "$output"
 expect "lists the selected route to D" '10\.42\.0\.4/32 +via .*, metric [0-9]+$' "$output"
 expect "shows how long it has been up" 'uptime: [0-9]+' "$output"
-expect_not "leaves Babel's details to -v" 'seqno|router-id| id [0-9a-f]|metric [0-9a-z]+ \(|rxcost|hello history|feasible' "$output"
+expect_not "leaves Babel's details to -v" 'seqno|router-id| rid [0-9a-f]|metric [0-9a-z]+ \(|rxcost|hello history|feasible' "$output"
 # Not at once: a node may have selected a longer route it heard first, and hysteresis keeps it there
 # for up to a minute or so, during which split horizon keeps it from advertising the route to A.
 has_unselected() { in_ns a "$CYNET" show cyn-a | grep -qE 'not via .*, metric [0-9]'; }
@@ -365,8 +365,8 @@ output=$(in_ns a "$CYNET" show -v cyn-a 2>&1)
 expect "-v adds this node's seqno" '^  router-id: [0-9a-f]{16}, seqno: [0-9]+$' "$output"
 expect "-v adds what makes up a link's cost" 'rxcost: [0-9]+, txcost: [0-9]+, rtt penalty: [0-9]+$' "$output"
 expect "-v adds the Hello history" 'hello history: [01]{16} ' "$output"
-expect "-v puts a route on its own line, with more details" '^    via .*, metric [0-9]+ \([0-9]+\), id [0-9a-f]{16}, seqno [0-9]+$' "$(grep -A1 '10\.42\.0\.4/32$' <<<"$output")"
-expect "-v adds details of the unselected route" '^    not via .*, metric [0-9]+ \([0-9]+\), id [0-9a-f]{16}, seqno [0-9]+, (un)?feasible$' "$output"
+expect "-v puts a route on its own line, with more details" '^    via .*, metric [0-9]+ \([0-9]+\), rid [0-9a-f]{16}, seqno [0-9]+$' "$(grep -A1 '10\.42\.0\.4/32$' <<<"$output")"
+expect "-v adds details of the unselected route" '^    not via .*, metric [0-9]+ \([0-9]+\), rid [0-9a-f]{16}, seqno [0-9]+, (un)?feasible$' "$output"
 # A pseudo-terminal, which is the one place for colors.
 output=$(in_ns a script -qec "'$CYNET' show cyn-a" /dev/null 2>&1)
 expect "has colors in a terminal" $'\x1b\\[32m\x1b\\[1minterface\x1b\\[0m: \x1b\\[32mcyn-a' "$output"

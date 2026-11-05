@@ -187,7 +187,7 @@ fn verbose_status_adds_what_route_choices_are_based_on() {
         true,
     ));
     let (key_a, key_b) = (short_key(&a), short_key(&b));
-    let source = "id 0000000000003c7e, seqno 812";
+    let source = "rid 0000000000003c7e, seqno 812";
 
     let expected = format!(
         "interface: cyn0\n\
@@ -219,11 +219,11 @@ fn verbose_route_lines_keep_their_colors() {
     let text = format_status("cyn0", &key(1), 51820, uptime, &[], &snapshot, true);
 
     let selected = "\x1b[1mmetric\x1b[0m 96 (98), \
-                    \x1b[1mid\x1b[0m 0000000000003c7e, \x1b[1mseqno\x1b[0m 812\n";
+                    \x1b[1mrid\x1b[0m 0000000000003c7e, \x1b[1mseqno\x1b[0m 812\n";
     assert!(text.contains(selected), "{text:?}");
 
     let unselected = format!(
-        "\x1b[2mnot via {}, metric 342 (344), id 0000000000003c7e, seqno 812, feasible\x1b[0m\n",
+        "\x1b[2mnot via {}, metric 342 (344), rid 0000000000003c7e, seqno 812, feasible\x1b[0m\n",
         short_key(&a)
     );
     assert!(text.contains(&unselected), "{text:?}");

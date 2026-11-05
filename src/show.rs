@@ -290,7 +290,7 @@ fn format_neighbour(out: &mut String, neighbour: &NeighbourSnapshot<PublicKey>, 
 /// text, which a reset would end early.
 fn route_details(route: &RouteSnapshot<PublicKey>, bold: &str, reset: &str) -> String {
     format!(
-        " ({}), {bold}id{reset} {:016x}, {bold}seqno{reset} {}",
+        " ({}), {bold}rid{reset} {:016x}, {bold}seqno{reset} {}",
         format_metric(route.smoothed_metric),
         route.router_id.get(),
         route.seqno.get()
