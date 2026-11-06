@@ -374,7 +374,11 @@ enum PrefixStatus {
     Injected,
     /// The route through this neighbour is selected for the prefix.
     /// Its metric is finite, and it is feasible.
-    Selected(NeighKey),
+    ///
+    /// With a timer, the neighbour may still hold a stale route through this node, with
+    /// another router-id, and every full dump to it retracts the prefix until the timer
+    /// expires (see [`State::select_route`]).
+    Selected(NeighKey, Option<TimerKey>),
     /// The prefix is held, with an unreachable route installed (RFC 8966 §3.5.4), after
     /// the selected route was lost with no other to select. It is retracted at once and
     /// in every periodic update, until a route is selected or this timer expires. When
@@ -392,7 +396,7 @@ impl PrefixStatus {
     /// Returns the selected next-hop neighbour, if any.
     fn selected(self) -> Option<NeighKey> {
         match self {
-            Self::Selected(key) => Some(key),
+            Self::Selected(key, _) => Some(key),
             _ => None,
         }
     }
@@ -581,6 +585,7 @@ enum Timer {
     RouteNearExpiry(IpNet, NeighKey),
     RouteExpiry(IpNet, NeighKey),
     RouteHold(IpNet),
+    StaleRouteRetraction(IpNet),
     SeqnoRequest(IpNet),
     BufferFlush(NeighKey),
 }
@@ -878,7 +883,7 @@ impl State {
         }
 
         for (&prefix, entry) in &self.route_table.prefix_entries {
-            if let PrefixStatus::Selected(_) | PrefixStatus::Held(_) = entry.status {
+            if let PrefixStatus::Selected(..) | PrefixStatus::Held(_) = entry.status {
                 self.outputs.push_back(Output::RouteRemove(prefix));
             }
         }
@@ -914,7 +919,7 @@ impl State {
                     prefix,
                     status: match entry.status {
                         PrefixStatus::Injected => snapshot::PrefixStatus::Injected,
-                        PrefixStatus::Selected(key) => {
+                        PrefixStatus::Selected(key, _) => {
                             snapshot::PrefixStatus::Selected(external(key))
                         }
                         PrefixStatus::Held(_) => snapshot::PrefixStatus::Held,
@@ -1132,6 +1137,15 @@ impl State {
                     entry.status = PrefixStatus::None;
                     entry.advert = None;
                 }
+            }
+            Timer::StaleRouteRetraction(prefix) => {
+                // The next hop of the selected route can no longer hold a stale route through
+                // this node, so full dumps to it leave the prefix out again, by split horizon.
+                let entry = self.route_table.prefix_entries.get_mut(&prefix).unwrap();
+                let PrefixStatus::Selected(_, ref mut timer_key @ Some(_)) = entry.status else {
+                    panic!("the prefix should be retracted from its next hop");
+                };
+                *timer_key = None;
             }
             Timer::SeqnoRequest(prefix) => {
                 let request = self.seqno_request_table.remove(&prefix).unwrap();
@@ -1694,7 +1708,7 @@ impl State {
             // last until the metric reaches infinity. An ignored update leaves such a
             // route to expire.
             let key = SourceKey { prefix, router_id };
-            if status == PrefixStatus::Selected(from)
+            if status.selected() == Some(from)
                 && route.router_id == router_id
                 && !update_feasible(&self.source_table, key, seqno, metric)
             {
@@ -1792,7 +1806,7 @@ impl State {
             // still finite, and it is still feasible: only advertising tightens
             // feasibility, and advertising the selected route keeps it feasible.
             // This includes a source table entry expiring, with no changed route.
-            PrefixStatus::Selected(key) if changed != Some(key) => {
+            PrefixStatus::Selected(key, _) if changed != Some(key) => {
                 let selected = &entry.routes[key];
                 debug_assert!(selected.is_usable(prefix, &self.source_table));
 
@@ -1813,7 +1827,7 @@ impl State {
             // if its router-id has changed, making it a route for another source, or if
             // an update added it anew after a retraction in the same packet. Either way,
             // it is unselected, as RFC 8966 requires (§3.5.3, §3.6).
-            PrefixStatus::Selected(_) => {
+            PrefixStatus::Selected(..) => {
                 let kept = candidate.filter(|_| candidate_feasible);
                 (kept.or_else(best_usable), candidate)
             }
@@ -1841,17 +1855,93 @@ impl State {
         // The router-id of the lost route, if any.
         let mut lost_router_id = None;
 
+        // Whether to retract the prefix from the next hop of the selected route, which may hold
+        // a stale route through this node.
+        let mut retract = false;
+
         if let Some((key, route)) = selection {
+            // The timer until which full dumps retract the prefix from the next hop, if any.
+            let mut retraction_timer_key = None;
+
             match entry.status {
                 PrefixStatus::Injected => unreachable!(),
                 // The prefix is still reachable, possibly with another router-id.
-                PrefixStatus::Selected(_) => {
+                PrefixStatus::Selected(old_key, timer_key) => {
                     trigger_update = route.router_id != entry.advert.unwrap().router_id;
+
+                    // A neighbour that the selected route now goes through, with another
+                    // router-id, is sent a retraction, and every full dump to it retracts the
+                    // prefix too for a while. Split horizon (RFC 8966 §3.7.4) leaves it out of
+                    // the update for the new route, so it would otherwise keep the route through
+                    // this node that it learnt before, which is now stale. Feasibility can't make
+                    // up for that, as it only holds for one router-id at a time. For example,
+                    // take the network of RFC 8966 §2.7, where nodes S and S' both originate P,
+                    // so that node A routes P through node S, and node B through node S', each
+                    // with a fallback route through the other:
+                    //
+                    //     S --- A --- B --- S'
+                    //
+                    // Should the link between nodes S and A fail, node A switches to its route
+                    // through node B, with the router-id of node S', and tells every neighbour
+                    // but node B. Node B keeps its route through node A, with the router-id of
+                    // node S, which is feasible, as node B has never advertised that router-id.
+                    // Should the link between nodes B and S' then fail too, node B switches to
+                    // that route, and packets for P go back and forth between nodes A and B.
+                    //
+                    // §2.7 expects such a loop, which it describes with both links failing at
+                    // once, to break as soon as an update has gone around it: node A's update
+                    // for its new route would replace the stale route through node A at node B
+                    // with one that is unfeasible there, as it goes through node B. By split
+                    // horizon, though, neither node advertises its new route to the other, so
+                    // the loop lasts until the stale routes expire.
+                    //
+                    // With the same router-id, the stale route can't make a loop: this node
+                    // selected the neighbour's route because it was feasible, which puts the
+                    // neighbour's own feasibility distance below the metric that this node had
+                    // advertised to it. Nor does a change of router-id through the same
+                    // neighbour as before need a retraction: whatever the neighbour learnt from
+                    // this node, it learnt before this node switched to it, a switch that one of
+                    // the cases here covers, so any retraction from it then goes on until its
+                    // timer expires.
+                    //
+                    // The retraction may be lost, so full dumps to the neighbour retract the
+                    // prefix too, until a timer expires, for as long as a held prefix is
+                    // retracted. By then, the neighbour will have expired the stale route anyway
+                    // (see `PrefixStatus::Held`). With both links failing at once, as in §2.7,
+                    // nodes A and B retract the prefix from each other, and both hold it.
+                    if old_key == key {
+                        retraction_timer_key = timer_key;
+                    } else {
+                        if let Some(timer_key) = timer_key {
+                            self.timers.remove(timer_key);
+                        }
+                        retract = trigger_update;
+                        if retract {
+                            retraction_timer_key = Some(self.timers.insert(
+                                Timer::StaleRouteRetraction(prefix),
+                                self.params.get(DurationKey::RouteHoldTime),
+                            ));
+                        }
+                    }
                 }
                 // The prefix is newly reachable after a retraction.
                 PrefixStatus::Held(timer_key) => {
-                    self.timers.remove(timer_key);
                     trigger_update = true;
+
+                    // The retraction of the lost route went to every neighbour, but it may have
+                    // been lost, and a new route through the neighbour, with another router-id,
+                    // stops full dumps to it from retracting the prefix, by split horizon. So it
+                    // is retracted again, as above, but only until the hold would have ended,
+                    // as the neighbour learnt any stale route before the hold began. The hold
+                    // timer becomes the retraction timer.
+                    retract = route.router_id != entry.advert.unwrap().router_id;
+                    if retract {
+                        self.timers
+                            .set(timer_key, Timer::StaleRouteRetraction(prefix));
+                        retraction_timer_key = Some(timer_key);
+                    } else {
+                        self.timers.remove(timer_key);
+                    }
                 }
                 // The prefix is newly reachable.
                 PrefixStatus::None => trigger_update = true,
@@ -1862,7 +1952,7 @@ impl State {
             // the lost route (RFC 8966 §3.8.2.1). The request is kept as long as if its
             // last send had been its last resend, to tell redundant requests and to
             // forward a reply (§3.8.1.2). Its timer was set at that send.
-            if !matches!(entry.status, PrefixStatus::Selected(_))
+            if !matches!(entry.status, PrefixStatus::Selected(..))
                 && let Some(request) = self.seqno_request_table.get_mut(&prefix)
             {
                 let new_deadline = self.timers.deadline(request.timer_key)
@@ -1872,11 +1962,11 @@ impl State {
                 self.timers.reset_at(&mut request.timer_key, new_deadline);
             }
 
-            if entry.status != PrefixStatus::Selected(key) {
+            if entry.status.selected() != Some(key) {
                 self.outputs.push_back(Output::RouteSelect(prefix, key));
             }
 
-            entry.status = PrefixStatus::Selected(key);
+            entry.status = PrefixStatus::Selected(key, retraction_timer_key);
 
             let advert = Advert {
                 router_id: route.router_id,
@@ -1902,9 +1992,15 @@ impl State {
             }
 
             entry.advert = Some(advert);
-        } else if let PrefixStatus::Selected(_) = entry.status {
+        } else if let PrefixStatus::Selected(_, timer_key) = entry.status {
             // The prefix is retracted and no longer reachable.
             trigger_update = true;
+
+            // The retraction goes to every neighbour, the next hop included, which ends any
+            // retraction from the next hop alone.
+            if let Some(timer_key) = timer_key {
+                self.timers.remove(timer_key);
+            }
 
             self.outputs.push_back(Output::RouteHold(prefix));
 
@@ -1920,6 +2016,13 @@ impl State {
 
         let triggered_update =
             trigger_update.then(|| (entry.status.selected(), entry.advert.unwrap()));
+        let retraction = retract.then(|| {
+            let retraction = Advert {
+                metric: METRIC_INFINITY,
+                ..entry.advert.unwrap()
+            };
+            (entry.status.selected().unwrap(), retraction)
+        });
 
         if entry.is_empty() {
             // Nothing is left to keep the entry for.
@@ -1928,6 +2031,10 @@ impl State {
 
         if let Some((not_to, advert)) = triggered_update {
             self.send_update(None, not_to, true, prefix, advert);
+        }
+
+        if let Some((key, retraction)) = retraction {
+            self.send_update(Some(key), None, true, prefix, retraction);
         }
 
         // A node that has lost all feasible routes to a given destination but still has
@@ -1958,12 +2065,22 @@ impl State {
     }
 
     /// Sends a neighbour a full dump of the routes that this node advertises, leaving out
-    /// those through it for split horizon (RFC 8966 §3.7.4).
+    /// those through it for split horizon (RFC 8966 §3.7.4), unless it may hold a stale route
+    /// through this node, which is retracted instead (see [`Self::select_route`]).
     fn dump_routes(&mut self, to: NeighKey) {
         let mut updates: Vec<_> = (self.route_table.prefix_entries.iter())
             .filter_map(|(&prefix, entry)| {
-                let advert = self.advert_for_prefix(entry)?;
-                Some((prefix, advert, entry.status.selected()))
+                let mut advert = self.advert_for_prefix(entry)?;
+                let mut not_to = entry.status.selected();
+                // The next hop, if it may hold a stale route through this node, is sent a
+                // retraction in place of the route (see `select_route`).
+                if let PrefixStatus::Selected(key, Some(_)) = entry.status
+                    && key == to
+                {
+                    advert.metric = METRIC_INFINITY;
+                    not_to = None;
+                }
+                Some((prefix, advert, not_to))
             })
             .collect();
 
@@ -1980,7 +2097,10 @@ impl State {
 
         // An update for a route through `to` is not sent, but still updates the source
         // table, since a seqno request for the route, once lost, takes its seqno from
-        // there (see `select_route`).
+        // there (see `select_route`). A retraction sent in its place doesn't need to: it
+        // only goes out for a while after a triggered update for the route, which updated
+        // the source table, and that while, with the wait for the next full dump after it,
+        // is well within the source GC time.
         for (prefix, advert, not_to) in updates {
             self.send_update(Some(to), not_to, false, prefix, advert);
         }

@@ -3864,3 +3864,133 @@ fn newly_reachable_prefixes_are_announced_urgently() {
         assert!(now - before <= Duration::from_millis(200));
     }
 }
+
+/// Sets up a chain in which nodes 0 and 3 both originate P, with router-ids 1 and 4, so that
+/// node 1 routes P through node 0, and node 2 through node 3, each with a fallback route through
+/// the other. Returns P.
+fn two_sources_net() -> (Net, IpNet) {
+    let p = prefix("fd00:9::/64");
+    let mut net = Net::new(4);
+    for i in 1..4 {
+        net.connect(i - 1, i, Duration::from_millis(10));
+    }
+    net.originate(0, p);
+    net.originate(3, p);
+    net.run_for(Duration::from_secs(60));
+    assert_eq!(net.fib(1, p), Some(Fib::Via(0)));
+    assert_eq!(net.fib(2, p), Some(Fib::Via(3)));
+    assert!(has_route(&net, 1, 2, p) && has_route(&net, 2, 1, p));
+    (net, p)
+}
+
+/// Returns whether node `i` has a route to `p` through node `j`.
+fn has_route(net: &Net, i: usize, j: usize, p: IpNet) -> bool {
+    let entry = net.nodes[i].route_table.prefix_entries.get(&p);
+    entry.is_some_and(|entry| entry.routes.contains_key(net.key(i, j)))
+}
+
+#[test]
+fn switching_to_another_router_id_through_another_neighbour_retracts_the_route_from_it() {
+    // Node 1 loses its route through node 0, and switches to the one through node 2, with
+    // another router-id. Split horizon leaves node 2 out of the update for it, so node 1
+    // retracts its old route from node 2 instead, which drops it.
+    let (mut net, p) = two_sources_net();
+    net.disconnect(0, 1);
+    assert_eq!(net.fib(1, p), Some(Fib::Via(2)));
+    net.run_for(Duration::from_secs(1));
+    assert!(!has_route(&net, 2, 1, p));
+
+    // So once node 2 loses its own route, it holds P, rather than routing it back through node
+    // 1 by the stale route, which would make a loop until that route expired.
+    net.disconnect(2, 3);
+    assert_eq!(net.fib(2, p), Some(Fib::Unreachable));
+    net.run_for(Duration::from_secs(1));
+    assert_eq!(net.fib(1, p), Some(Fib::Unreachable));
+}
+
+#[test]
+fn lost_retraction_of_a_stale_route_is_repeated_in_full_dumps() {
+    thread_local! {
+        static LOST: Cell<bool> = const { Cell::new(false) };
+    }
+
+    let (mut net, p) = two_sources_net();
+    // The first retraction from node 1 to node 2 is lost.
+    LOST.set(false);
+    net.filter = |from, to, packet| {
+        let retraction = (updates(packet.as_bytes()).iter())
+            .any(|update| update.ae != Ae::Wildcard && update.metric == METRIC_INFINITY);
+        let lost = (from, to) == (1, 2) && retraction && !LOST.replace(true);
+        (!lost).then_some(packet)
+    };
+    net.disconnect(0, 1);
+    let switch = net.now;
+    net.run_for(Duration::from_secs(1));
+    assert!(LOST.get());
+    assert!(has_route(&net, 2, 1, p));
+
+    // The next full dump from node 1 to node 2 retracts it again.
+    net.run_for(Duration::from_secs(16));
+    assert!(!has_route(&net, 2, 1, p));
+
+    // So does every full dump until node 2 must have expired the route anyway, as long after
+    // the switch as a prefix is held. After that, full dumps leave P out, by split horizon.
+    let hold_time = net.nodes[1].params.get(DurationKey::RouteHoldTime);
+    net.run_for(switch + hold_time + Duration::from_secs(20) - net.now);
+    let retractions: Vec<_> = (net.sent.iter())
+        .filter(|sent| (sent.from, sent.to) == (1, 2) && sent.time >= switch)
+        .filter(|sent| (updates(&sent.buf).iter()).any(|update| is_for(update, p)))
+        .map(|sent| sent.time - switch)
+        .collect();
+    // The urgent one, lost, then one per full dump, every 16 s.
+    assert_eq!(retractions.len(), 5, "{retractions:?}");
+    assert!(retractions.iter().all(|&after| after < hold_time));
+}
+
+#[test]
+fn switching_from_a_held_prefix_to_another_router_id_retracts_the_prefix_again() {
+    let p = prefix("fd00:9::/64");
+    let mut net = Net::new(1);
+    net.add_neighbour(0, 8);
+    net.add_neighbour(0, 9);
+    let (mut n8, mut n9) = (Scripted::new(8), Scripted::new(9));
+    let route = update(p, 42, 1, 100, 0x8000);
+    exchange(&mut net, &mut n8, &mut n9, 20, &[], from_ref(&route));
+    assert_eq!(net.fib(0, p), Some(Fib::Via(9)));
+
+    // Node 0 loses its route, holds P, and retracts it from neighbour 8, which had learnt it, at
+    // once and in its full dumps.
+    n9.send(&mut net, 0, &[update(p, 42, 1, METRIC_INFINITY, 0x8000)]);
+    assert_eq!(net.fib(0, p), Some(Fib::Unreachable));
+    let held = net.now;
+    exchange(&mut net, &mut n8, &mut n9, 28, &[], &[]);
+
+    // It then selects a route through neighbour 8, with another router-id. Should every
+    // retraction so far have been lost, neighbour 8 would keep the stale route, so node 0 goes on
+    // retracting P from it, at once and in its full dumps, rather than leaving it out of them.
+    let start = net.now;
+    n8.send(&mut net, 0, &[update(p, 43, 1, 100, 0x8000)]);
+    assert_eq!(net.fib(0, p), Some(Fib::Via(8)));
+    exchange(&mut net, &mut n8, &mut n9, 60, &[], &[]);
+    let retractions: Vec<_> = (net.sent.iter())
+        .filter(|sent| (sent.from, sent.to) == (0, 8) && sent.time >= start)
+        .filter(|sent| {
+            (updates(&sent.buf).iter())
+                .any(|update| is_for(update, p) && update.metric == METRIC_INFINITY)
+        })
+        .map(|sent| sent.time - held)
+        .collect();
+    assert!(retractions.len() >= 2, "{retractions:?}");
+
+    // It does so only until the hold would have ended, by when neighbour 8 would have expired
+    // any route through node 0 anyway, as it learnt it before the hold began. A dump is sent
+    // within a flush delay of when it is put together.
+    let hold_time = net.nodes[0].params.get(DurationKey::RouteHoldTime);
+    let flush_delay = Duration::from_secs(2);
+    assert!(
+        retractions
+            .iter()
+            .all(|&after| after < hold_time + flush_delay),
+        "{retractions:?}"
+    );
+}
