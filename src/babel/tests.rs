@@ -50,6 +50,16 @@ struct FibChange {
     entry: Option<Fib>,
 }
 
+/// A report of a conflict output by a node (see [`Output::ConflictAlert`]).
+#[derive(Clone, Copy, Debug)]
+struct Report {
+    time: Instant,
+    node: usize,
+    prefix: IpNet,
+    from: usize,
+    kind: ConflictAlertKind,
+}
+
 enum Event {
     Timeout(usize),
     Arrival(usize, usize, Box<[u8]>),
@@ -91,6 +101,7 @@ struct Net {
     locals: Vec<Vec<IpNet>>,
     fibs: Vec<HashMap<IpNet, Fib>>,
     fib_changes: Vec<FibChange>,
+    reports: Vec<Report>,
 }
 
 impl Net {
@@ -112,6 +123,7 @@ impl Net {
             locals: vec![Vec::new(); n],
             fibs: vec![HashMap::new(); n],
             fib_changes: Vec::new(),
+            reports: Vec::new(),
         }
     }
 
@@ -215,7 +227,16 @@ impl Net {
     }
 
     fn originate(&mut self, i: usize, prefix: IpNet) {
-        assert!(self.nodes[i].inject_route(prefix));
+        self.originate_as(i, prefix, false);
+    }
+
+    /// Makes node `i` originate `prefix` as nonexclusive, which other nodes may originate too.
+    fn originate_nonexclusive(&mut self, i: usize, prefix: IpNet) {
+        self.originate_as(i, prefix, true);
+    }
+
+    fn originate_as(&mut self, i: usize, prefix: IpNet, nonexclusive: bool) {
+        assert!(self.nodes[i].inject_route(prefix, nonexclusive));
         self.locals[i].push(prefix);
         self.process_outputs(i);
     }
@@ -294,17 +315,37 @@ impl Net {
             self.assert_loop_free();
         }
 
-        for (prefix, entry) in &self.nodes[from].route_table.prefix_entries {
+        let node = &self.nodes[from];
+        let table = &node.route_table;
+        for (prefix, entry) in &table.prefix_entries {
             let empty = entry.is_empty();
             assert!(
                 !empty,
                 "node {from} should not keep an empty entry for {prefix}"
             );
+            assert!(table.prefixes.contains(prefix), "node {from}: {prefix}");
+        }
+        assert_eq!(
+            table.prefixes.len(),
+            table.prefix_entries.len(),
+            "node {from}"
+        );
+
+        // No two sources in the table conflict, which spares most updates the search for what
+        // they conflict with (see `RouteTable::get_or_insert_with_known_source`).
+        let sources: Vec<_> = (table.prefix_entries.iter())
+            .flat_map(|(&prefix, entry)| entry.sources(prefix, node.router_id))
+            .map(|(_, source)| source)
+            .collect();
+        for (i, a) in sources.iter().enumerate() {
+            for b in &sources[i + 1..] {
+                assert!(!a.conflicts_with(b), "node {from}: {a:?} and {b:?}");
+            }
         }
     }
 
-    /// Sends a packet output by node `from` over the link, if it is up, or applies a route
-    /// output to its forwarding table, returning whether the table changed.
+    /// Sends a packet output by node `from` over the link, if it is up, applies a route output
+    /// to its forwarding table, or records a report, returning whether the table changed.
     fn process_output(&mut self, from: usize, output: Output) -> bool {
         let (prefix, entry) = match output {
             Output::Packet(dst, packet) => {
@@ -314,9 +355,20 @@ impl Net {
             Output::RouteSelect(prefix, neigh) => (prefix, Some(Fib::Via(self.index(from, neigh)))),
             Output::RouteHold(prefix) => (prefix, Some(Fib::Unreachable)),
             Output::RouteRemove(prefix) => (prefix, None),
-            // Other outputs concern neither the links nor the forwarding tables.
-            #[allow(unreachable_patterns)]
-            _ => return false,
+            Output::ConflictAlert {
+                prefix,
+                from: neigh,
+                kind,
+            } => {
+                self.reports.push(Report {
+                    time: self.now,
+                    node: from,
+                    prefix,
+                    from: self.index(from, neigh),
+                    kind,
+                });
+                return false;
+            }
         };
 
         let fib = &mut self.fibs[from];
@@ -507,6 +559,22 @@ fn update(prefix: IpNet, router_id: u64, seqno: u16, metric: u16, interval: u16)
         metric,
         prefix,
         router_id: RouterId::new(router_id),
+        nonexclusive: false,
+    }
+}
+
+/// Returns an update as [`update`] does, marked nonexclusive, so that updates for the prefix from
+/// other router-ids don't conflict with it, as in the tests that move between sources.
+fn nonexclusive_update(
+    prefix: IpNet,
+    router_id: u64,
+    seqno: u16,
+    metric: u16,
+    interval: u16,
+) -> Update {
+    Update {
+        nonexclusive: true,
+        ..update(prefix, router_id, seqno, metric, interval)
     }
 }
 
@@ -2037,11 +2105,12 @@ fn failed_link_retracts_routes_and_holds_prefix() {
 fn held_prefix_outlasts_routes_through_the_node() {
     let p = prefix("fd00:2::/64");
 
-    // Node 0 originates a default route, which covers P.
+    // Node 0 originates a default route, which covers P, nonexclusive so that node 2 may
+    // originate P.
     let mut net = Net::new(3);
     net.connect(0, 1, Duration::ZERO);
     net.connect(1, 2, Duration::ZERO);
-    net.originate(0, prefix("::/0"));
+    net.originate_nonexclusive(0, prefix("::/0"));
     net.originate(2, p);
     net.run_for(Duration::from_secs(60));
     assert_eq!(net.path(0, p.addr()), [0, 1, 2]);
@@ -2322,8 +2391,8 @@ fn two_routes(far: &Update, near: &Update) -> (Net, Scripted, Scripted) {
 #[test]
 fn unfeasible_update_with_an_unchanged_router_id_is_ignored() {
     let p = prefix("fd00:9::/64");
-    let far = update(p, 43, 1, 2000, 0x8000);
-    let near = update(p, 42, 1, 100, 0x8000);
+    let far = nonexclusive_update(p, 43, 1, 2000, 0x8000);
+    let near = nonexclusive_update(p, 42, 1, 100, 0x8000);
 
     // Node 0 selects the route through neighbour 9, with or without one through neighbour 8.
     for alternative in [true, false] {
@@ -2341,7 +2410,7 @@ fn unfeasible_update_with_an_unchanged_router_id_is_ignored() {
         // is still advertised with metric 196.
         let start = net.now;
         let changes = net.fib_changes.len();
-        n9.send(&mut net, 0, &[update(p, 42, 1, 300, 0x8000)]);
+        n9.send(&mut net, 0, &[nonexclusive_update(p, 42, 1, 300, 0x8000)]);
         assert_eq!(net.fib_changes.len(), changes);
         let advert = net.nodes[0].route_table.prefix_entries[&p].advert.unwrap();
         assert_eq!(advert.metric, 196);
@@ -2357,7 +2426,7 @@ fn unfeasible_update_with_an_unchanged_router_id_is_ignored() {
 #[test]
 fn unfeasible_update_with_another_router_id_unselects_the_route() {
     let p = prefix("fd00:9::/64");
-    let far = update(p, 44, 1, 2000, 0x8000);
+    let far = nonexclusive_update(p, 44, 1, 2000, 0x8000);
 
     for alternative in [true, false] {
         // Node 0 selects the route through neighbour 9, with router-id 43, and advertises it
@@ -2367,9 +2436,9 @@ fn unfeasible_update_with_another_router_id_unselects_the_route() {
         net.add_neighbour(0, 9);
         let (mut n8, mut n9) = (Scripted::new(8), Scripted::new(9));
         let updates8: &[Update] = if alternative { from_ref(&far) } else { &[] };
-        let updates9 = [update(p, 43, 1, 100, 0x8000)];
+        let updates9 = [nonexclusive_update(p, 43, 1, 100, 0x8000)];
         exchange(&mut net, &mut n8, &mut n9, 20, updates8, &updates9);
-        let updates9 = [update(p, 42, 1, 100, 0x8000)];
+        let updates9 = [nonexclusive_update(p, 42, 1, 100, 0x8000)];
         exchange(&mut net, &mut n8, &mut n9, 20, &[], &updates9);
         assert_eq!(net.fib(0, p), Some(Fib::Via(9)));
 
@@ -2377,7 +2446,7 @@ fn unfeasible_update_with_another_router_id_unselects_the_route() {
         // another router-id, this is another source, so node 0 MUST unselect the route (RFC
         // 8966 §3.5.3). It selects the route through neighbour 8 instead, if there is one.
         let start = net.now;
-        n9.send(&mut net, 0, &[update(p, 43, 1, 300, 0x8000)]);
+        n9.send(&mut net, 0, &[nonexclusive_update(p, 43, 1, 300, 0x8000)]);
         let fib = if alternative {
             Fib::Via(8)
         } else {
@@ -2477,8 +2546,8 @@ fn selected_routes_expire_unless_refreshed_by_feasible_updates() {
 #[test]
 fn worse_selected_route_is_replaced_at_the_next_update_of_a_better_one() {
     let p = prefix("fd00:9::/64");
-    let far = update(p, 43, 1, 500, 0x8000);
-    let near = update(p, 42, 1, 100, 0x8000);
+    let far = nonexclusive_update(p, 43, 1, 500, 0x8000);
+    let near = nonexclusive_update(p, 42, 1, 100, 0x8000);
     let (mut net, mut n8, mut n9) = two_routes(&far, &near);
     assert_eq!(net.fib(0, p), Some(Fib::Via(9)));
 
@@ -2506,8 +2575,8 @@ fn worse_selected_route_is_replaced_at_the_next_update_of_a_better_one() {
 #[test]
 fn router_id_change_by_hysteresis_is_advertised_urgently() {
     let p = prefix("fd00:9::/64");
-    let far = update(p, 43, 1, 500, 0x8000);
-    let near = update(p, 42, 1, 100, 0x8000);
+    let far = nonexclusive_update(p, 43, 1, 500, 0x8000);
+    let near = nonexclusive_update(p, 42, 1, 100, 0x8000);
 
     // As above, with node 1 receiving node 0's updates.
     let mut net = Net::new(2);
@@ -2563,8 +2632,8 @@ fn hysteresis_needs_a_lower_metric_as_well() {
     // Both links come up at 4 s, the one to neighbour 9 first, and its route, of metric
     // 596, is selected. The route through neighbour 8 has metric 196, but its smoothed
     // metric starts at infinity, and it is not updated again for a while.
-    let far = update(p, 42, 1, 500, 0x8000);
-    let near = update(p, 43, 1, 100, 0x8000);
+    let far = nonexclusive_update(p, 42, 1, 500, 0x8000);
+    let near = nonexclusive_update(p, 43, 1, 100, 0x8000);
     exchange(
         &mut net,
         &mut n8,
@@ -2578,7 +2647,7 @@ fn hysteresis_needs_a_lower_metric_as_well() {
     // By 72 s, its smoothed metric, 196 + 65339 exp(-68 s / 12 s) ≈ 422, is below 596.
     // It is then updated with metric 1096, above 596. Node 0 keeps its route, since it
     // switches only when both m(R') < m(R) and ms(R') < ms(R) (RFC 8966 Appendix A.3).
-    n8.send(&mut net, 0, &[update(p, 43, 1, 1000, 0x8000)]);
+    n8.send(&mut net, 0, &[nonexclusive_update(p, 43, 1, 1000, 0x8000)]);
     assert_eq!(net.fib(0, p), Some(Fib::Via(9)));
 }
 
@@ -2674,8 +2743,8 @@ fn source_expiry_keeps_hysteresis() {
         &mut n8,
         &mut n9,
         40,
-        &[update(p, 43, 1, 2000, 0x8000)],
-        &[update(p, 42, 1, 100, 0x8000)],
+        &[nonexclusive_update(p, 43, 1, 2000, 0x8000)],
+        &[nonexclusive_update(p, 42, 1, 100, 0x8000)],
     );
     exchange(
         &mut net,
@@ -2683,7 +2752,7 @@ fn source_expiry_keeps_hysteresis() {
         &mut n9,
         4,
         &[],
-        &[update(p, 44, 1, 100, 0x8000)],
+        &[nonexclusive_update(p, 44, 1, 100, 0x8000)],
     );
     assert_eq!(net.fib(0, p), Some(Fib::Via(9)));
     let node = &net.nodes[0];
@@ -2701,7 +2770,7 @@ fn source_expiry_keeps_hysteresis() {
     while net.now + Duration::from_secs(8) < expiry {
         exchange(&mut net, &mut n8, &mut n9, 4, &[], &[]);
     }
-    n8.send(&mut net, 0, &[update(p, 43, 1, 50, 0x8000)]);
+    n8.send(&mut net, 0, &[nonexclusive_update(p, 43, 1, 50, 0x8000)]);
     exchange(&mut net, &mut n8, &mut n9, 12, &[], &[]);
     assert!(!net.nodes[0].source_table.contains_key(&source));
     assert_eq!(net.fib(0, p), Some(Fib::Via(9)));
@@ -2710,8 +2779,8 @@ fn source_expiry_keeps_hysteresis() {
 #[test]
 fn smoothed_metrics_survive_timestamp_wraparound() {
     let p = prefix("fd00:9::/64");
-    let near = update(p, 42, 1, 100, 0x8000);
-    let far = update(p, 43, 1, 500, 0x8000);
+    let near = nonexclusive_update(p, 42, 1, 100, 0x8000);
+    let far = nonexclusive_update(p, 43, 1, 500, 0x8000);
 
     let mut net = Net::new(1);
     net.add_neighbour(0, 8);
@@ -2736,7 +2805,7 @@ fn smoothed_metrics_survive_timestamp_wraparound() {
     // Just after the wraparound, the route through neighbour 8 gets a metric of 146.
     // Both smoothed metrics have long converged, to 196 and 596, so node 0 keeps its
     // route (RFC 8966 Appendix A.3).
-    n8.send(&mut net, 0, &[update(p, 43, 1, 50, 0x8000)]);
+    n8.send(&mut net, 0, &[nonexclusive_update(p, 43, 1, 50, 0x8000)]);
     assert_eq!(net.fib(0, p), Some(Fib::Via(9)));
 }
 
@@ -2830,7 +2899,7 @@ fn rebooted_originator(gap: u16) -> (Net, IpNet, Instant) {
     let node = State::new(net.now, params(), net.nodes[2].router_id, Some(seqno));
     net.restart(2, node);
     net.add_neighbour_with_hello_seqno(2, 1, hello_seqno);
-    assert!(net.nodes[2].inject_route(p));
+    assert!(net.nodes[2].inject_route(p, false));
 
     let reboot = net.now;
     (net, p, reboot)
@@ -2939,12 +3008,13 @@ fn random_link_failures(jitter: Duration) {
     }
     let links = net.links.clone();
 
-    // Every node originates a prefix, and node 0 a default route covering them all.
+    // Every node originates a prefix, and node 0 a default route covering them all, nonexclusive
+    // so that they don't conflict with it.
     let prefixes: Vec<_> = (0..N).map(|i| prefix(&format!("fd00:{i}::/64"))).collect();
     for (i, &p) in prefixes.iter().enumerate() {
         net.originate(i, p);
     }
-    net.originate(0, prefix("::/0"));
+    net.originate_nonexclusive(0, prefix("::/0"));
 
     // Links fail and recover at random, while the harness checks for forwarding loops
     // whenever a forwarding table changes.
@@ -3644,9 +3714,9 @@ fn requested_routes_are_announced_urgently_and_end_resends() {
 #[test]
 fn requests_are_satisfied_by_another_router_id_after_the_hold() {
     let p = prefix("fd00:9::/64");
-    let near = update(p, 42, 1, 100, 0x8000);
-    let far = update(p, 42, 1, 500, 0x8000);
-    let other = update(p, 43, 1, 500, 0x8000);
+    let near = nonexclusive_update(p, 42, 1, 100, 0x8000);
+    let far = nonexclusive_update(p, 42, 1, 500, 0x8000);
+    let other = nonexclusive_update(p, 43, 1, 500, 0x8000);
 
     // With a Hello interval of 1 s, node 0 holds a lost prefix for only 16 s, while a request
     // for it is pending for 30 s: sent at 0, 2, 6 and 14 s, and kept for 16 s after the last.
@@ -3666,7 +3736,7 @@ fn requests_are_satisfied_by_another_router_id_after_the_hold() {
 
         // Neighbour 9 retracts P, and node 0 requests seqno 2 for router-id 42. 20 s later,
         // the hold has expired, but the request is still pending.
-        let retraction = update(p, 42, 1, METRIC_INFINITY, 0x8000);
+        let retraction = nonexclusive_update(p, 42, 1, METRIC_INFINITY, 0x8000);
         exchange(&mut net, &mut n8, &mut n9, 4, &[], from_ref(&retraction));
         exchange(&mut net, &mut n8, &mut n9, 16, &[], &[]);
         assert_eq!(net.fib(0, p), None);
@@ -3865,17 +3935,18 @@ fn newly_reachable_prefixes_are_announced_urgently() {
     }
 }
 
-/// Sets up a chain in which nodes 0 and 3 both originate P, with router-ids 1 and 4, so that
-/// node 1 routes P through node 0, and node 2 through node 3, each with a fallback route through
-/// the other. Returns P.
+/// Sets up a chain in which nodes 0 and 3 both originate P as nonexclusive, with router-ids 1 and
+/// 4, so that node 1 routes P through node 0, and node 2 through node 3, each with a fallback route
+/// through the other, which an exclusive P would rule out (see
+/// [Duplicate addresses](State#duplicate-addresses)). Returns P.
 fn two_sources_net() -> (Net, IpNet) {
     let p = prefix("fd00:9::/64");
     let mut net = Net::new(4);
     for i in 1..4 {
         net.connect(i - 1, i, Duration::from_millis(10));
     }
-    net.originate(0, p);
-    net.originate(3, p);
+    net.originate_nonexclusive(0, p);
+    net.originate_nonexclusive(3, p);
     net.run_for(Duration::from_secs(60));
     assert_eq!(net.fib(1, p), Some(Fib::Via(0)));
     assert_eq!(net.fib(2, p), Some(Fib::Via(3)));
@@ -3993,4 +4064,508 @@ fn switching_from_a_held_prefix_to_another_router_id_retracts_the_prefix_again()
             .all(|&after| after < hold_time + flush_delay),
         "{retractions:?}"
     );
+}
+
+/// Returns what node `node` reported of conflicts over `p` since `start`, as the neighbour each
+/// report names and its kind, each pair once, in order.
+fn reported(net: &Net, node: usize, p: IpNet, start: Instant) -> Vec<(usize, ConflictAlertKind)> {
+    let mut seen: Vec<_> = (net.reports.iter())
+        .filter(|r| r.node == node && r.prefix == p && r.time >= start)
+        .map(|r| (r.from, r.kind))
+        .collect();
+    seen.sort_unstable();
+    seen.dedup();
+    seen
+}
+
+/// Returns the Conflict Alerts that node `from` sent to node `to` since `start`, as their
+/// prefixes and Hops Away.
+fn conflict_alerts_sent(net: &Net, from: usize, to: usize, start: Instant) -> Vec<(IpNet, u8)> {
+    (tlvs_sent(net, from, to, start).into_iter())
+        .filter_map(|tlv| match tlv {
+            Tlv::ConflictAlert {
+                ae,
+                plen,
+                hops_away,
+                prefix,
+            } => Some((decode_prefix(ae, plen, prefix).unwrap(), hops_away.get())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Returns a Conflict Alert TLV for `p`, which says that the node that rejected an update is
+/// `hops_away`.
+fn conflict_alert(p: IpNet, hops_away: u8) -> Tlv {
+    let (ae, plen, prefix) = encode_prefix(p, Ae::Ipv4);
+    Tlv::ConflictAlert {
+        ae,
+        plen,
+        hops_away: NonZeroU8::new(hops_away).unwrap(),
+        prefix,
+    }
+}
+
+/// Returns the kind of a report of a Conflict Alert that says the routes meet `hops` away.
+fn alerted(hops: usize) -> ConflictAlertKind {
+    ConflictAlertKind::Alerted {
+        hops: NonZeroU8::new(hops as u8).unwrap(),
+    }
+}
+
+#[test]
+fn conflicting_origins_keep_their_sides_and_are_both_told() {
+    use ConflictAlertKind::Rejected;
+
+    const N: usize = 6;
+    let p = prefix("fd00:9::/64");
+    let mut net = Net::new(N);
+    for i in 1..N {
+        net.connect(i - 1, i, Duration::from_millis(10));
+    }
+    net.originate(0, p);
+    net.originate(N - 1, p);
+    net.run_for(Duration::from_secs(60));
+
+    // Each node keeps the route to the originator it heard of first, so the chain splits into
+    // two sides, which meet between nodes k and k + 1.
+    let sides: Vec<_> = (0..N).map(|i| net.delivered_to(i, p.addr())).collect();
+    let k = sides.iter().rposition(|&o| o == Some(0)).unwrap();
+    assert!(k < N - 1, "{sides:?}");
+    assert!(
+        sides[k + 1..].iter().all(|&o| o == Some(N - 1)),
+        "{sides:?}"
+    );
+
+    // Nothing changes over the next minutes, while every node reports what it sees, again and
+    // again: those where the sides meet reject each other's updates, and send alerts towards
+    // their own originators, which the nodes on the way forward, each knowing how far away the
+    // rejecting node on its side is.
+    let start = net.now;
+    let changes = net.fib_changes.len();
+    net.run_for(Duration::from_secs(180));
+    assert_eq!(net.fib_changes.len(), changes, "routes should stay put");
+
+    for i in 0..N {
+        let expected = if i == k {
+            vec![(k + 1, Rejected)]
+        } else if i == k + 1 {
+            vec![(k, Rejected)]
+        } else if i < k {
+            vec![(i + 1, alerted(k - i))]
+        } else {
+            vec![(i - 1, alerted(i - (k + 1)))]
+        };
+        assert_eq!(
+            reported(&net, i, p, start),
+            expected,
+            "node {i}, meeting at {k}"
+        );
+
+        let count = (net.reports.iter())
+            .filter(|r| r.node == i && r.time >= start)
+            .count();
+        assert!(count >= 9, "node {i} reported only {count} times");
+    }
+
+    // From either originator, following the neighbours that the reports name leads to where
+    // the sides meet, and from there, the selected routes lead to the other originator.
+    let trace = |origin: usize| {
+        let mut path = vec![origin];
+        loop {
+            let [(from, kind)] = reported(&net, *path.last().unwrap(), p, start)[..] else {
+                panic!("each node should report one thing");
+            };
+            path.push(from);
+            if kind == Rejected {
+                return (path, net.delivered_to(from, p.addr()));
+            }
+        }
+    };
+    let (path, other) = trace(0);
+    assert_eq!((path, other), ((0..=k + 1).collect(), Some(N - 1)));
+    let (path, other) = trace(N - 1);
+    assert_eq!((path, other), ((k..N).rev().collect(), Some(0)));
+}
+
+#[test]
+fn conflicting_update_removes_the_route_through_its_sender() {
+    let p = prefix("fd00:9::/64");
+    // Node 0 learns P with one router-id from neighbours 8 and 9, and selects the route through
+    // neighbour 9. The one through neighbour 8 has a newer seqno, so that it is feasible.
+    let far = update(p, 42, 2, 500, 0x8000);
+    let near = update(p, 42, 1, 100, 0x8000);
+    let (mut net, _n8, mut n9) = two_routes(&far, &near);
+    assert_eq!(net.fib(0, p), Some(Fib::Via(9)));
+
+    // Neighbour 9 switches to another router-id, which conflicts with the route through
+    // neighbour 8. Its update is rejected, and its old route removed, so node 0 switches to the
+    // route through neighbour 8, and sends an alert along it.
+    let start = net.now;
+    n9.send(&mut net, 0, &[update(p, 43, 1, 100, 0x8000)]);
+    assert_eq!(net.fib(0, p), Some(Fib::Via(8)));
+    assert!(!has_route(&net, 0, 9, p));
+    assert_eq!(
+        reported(&net, 0, p, start),
+        [(9, ConflictAlertKind::Rejected)]
+    );
+    net.run_for(Duration::from_secs(2));
+    assert_eq!(conflict_alerts_sent(&net, 0, 8, start), [(p, 1)]);
+    assert_eq!(conflict_alerts_sent(&net, 0, 9, start), []);
+}
+
+#[test]
+fn unfeasible_routes_block_conflicting_updates() {
+    let p = prefix("fd00:9::/64");
+    // The route through neighbour 8 is unfeasible, as its metric exceeds that of the route
+    // through neighbour 9, which node 0 advertises.
+    let far = update(p, 42, 1, 2000, 0x8000);
+    let near = update(p, 42, 1, 100, 0x8000);
+    let (mut net, _n8, mut n9) = two_routes(&far, &near);
+    assert_eq!(net.fib(0, p), Some(Fib::Via(9)));
+
+    // Neighbour 9 loses its route, and node 0 holds P, asking for a new seqno, which could make
+    // the route through neighbour 8 feasible. Meanwhile, a route with another router-id doesn't
+    // take over.
+    n9.send(&mut net, 0, &[update(p, 42, 1, METRIC_INFINITY, 0x8000)]);
+    assert_eq!(net.fib(0, p), Some(Fib::Unreachable));
+    let start = net.now;
+    n9.send(&mut net, 0, &[update(p, 43, 1, 100, 0x8000)]);
+    assert_eq!(net.fib(0, p), Some(Fib::Unreachable));
+    assert_eq!(
+        reported(&net, 0, p, start),
+        [(9, ConflictAlertKind::Rejected)]
+    );
+}
+
+/// Node 0 learns `old` through neighbour 8, whose link then fails, and then `new` from another
+/// router-id through neighbour 9, which would conflict with the route over the failed link.
+fn route_over_a_failed_link_gives_way(old: IpNet, new: IpNet) {
+    let mut net = Net::new(1);
+    net.add_neighbour(0, 8);
+    net.add_neighbour(0, 9);
+    let (mut n8, mut n9) = (Scripted::new(8), Scripted::new(9));
+    exchange(
+        &mut net,
+        &mut n8,
+        &mut n9,
+        20,
+        &[update(old, 42, 1, 100, 0x8000)],
+        &[],
+    );
+    assert_eq!(net.fib(0, old), Some(Fib::Via(8)));
+
+    // The link to neighbour 8 fails, which makes the metric of the route through it infinite,
+    // and node 0 holds the prefix. The route stays, until it expires.
+    n8.rxcost = Some(INF);
+    n8.send(&mut net, 0, &[]);
+    assert_eq!(net.fib(0, old), Some(Fib::Unreachable));
+    assert!(has_route(&net, 0, 8, old));
+
+    // The route through neighbour 9 doesn't conflict with it, and takes its place, so that the
+    // old one can't come back beside it with the link.
+    let start = net.now;
+    n9.send(&mut net, 0, &[update(new, 43, 1, 100, 0x8000)]);
+    assert_eq!(net.fib(0, new), Some(Fib::Via(9)));
+    assert!(!has_route(&net, 0, 8, old) && has_route(&net, 0, 9, new));
+
+    // Once the link is back, the old router-id conflicts with the new route, and is rejected.
+    n8.rxcost = Some(NOMINAL_COST);
+    n8.send(&mut net, 0, &[update(old, 42, 1, 100, 0x8000)]);
+    assert_eq!(net.fib(0, new), Some(Fib::Via(9)));
+    assert!(!has_route(&net, 0, 8, old));
+    assert_eq!(
+        reported(&net, 0, new, start),
+        [(8, ConflictAlertKind::Rejected)]
+    );
+}
+
+#[test]
+fn routes_over_failed_links_give_way_to_another_router_id() {
+    let p = prefix("fd00:9::/64");
+    route_over_a_failed_link_gives_way(p, p);
+}
+
+#[test]
+fn losing_the_route_lets_another_originator_in_within_a_round_trip() {
+    let p = prefix("fd00:9::/64");
+    // Node 1 learns P from node 0, before node 2 comes along with it.
+    let mut net = Net::new(3);
+    net.connect(0, 1, Duration::from_millis(10));
+    net.originate(0, p);
+    net.originate(2, p);
+    net.run_for(Duration::from_secs(30));
+    net.connect(1, 2, Duration::from_millis(10));
+    net.run_for(Duration::from_secs(60));
+    assert_eq!(net.delivered_to(1, p.addr()), Some(0));
+
+    // Node 0 shuts down, retracting its routes. Node 1 asks for a new seqno for the lost route,
+    // and node 2 answers with its own route, which no longer conflicts.
+    net.shutdown(0);
+    net.run_for(Duration::from_millis(500));
+    assert_eq!(net.delivered_to(1, p.addr()), Some(2));
+}
+
+#[test]
+fn nonexclusive_origins_are_routed_to_as_before_unless_one_is_exclusive() {
+    let p = prefix("fd00:9::/64");
+    for exclusive in [false, true] {
+        let mut net = Net::new(4);
+        for i in 1..4 {
+            net.connect(i - 1, i, Duration::from_millis(10));
+        }
+        net.originate_nonexclusive(0, p);
+        if exclusive {
+            net.originate(3, p);
+        } else {
+            net.originate_nonexclusive(3, p);
+        }
+        net.run_for(Duration::from_secs(60));
+
+        let sides: Vec<_> = (0..4).map(|i| net.delivered_to(i, p.addr())).collect();
+        let routes = |i: usize| &net.nodes[i].route_table.prefix_entries[&p].routes;
+        if exclusive {
+            // The chain splits into two sides, meeting between nodes k and k + 1, which depend
+            // on which route each node learnt first: one heard over a link not yet up, with an
+            // infinite metric, gives way.
+            let k = sides.iter().rposition(|&o| o == Some(0)).unwrap();
+            assert!(sides[..=k].iter().all(|&o| o == Some(0)), "{sides:?}");
+            assert!(sides[k + 1..].iter().all(|&o| o == Some(3)), "{sides:?}");
+
+            // There, each node rejects the other's update, in both directions, an originator
+            // included.
+            assert!(!net.reports.is_empty());
+            assert!(
+                !has_route(&net, k, k + 1, p) && !has_route(&net, k + 1, k, p),
+                "{sides:?}"
+            );
+        } else {
+            // Each node routes to the nearer originator, and nodes 1 and 2 keep a route to
+            // each, both nonexclusive, as the nodes that advertise them on keep the flag.
+            assert_eq!(sides, [Some(0), Some(0), Some(3), Some(3)]);
+            assert!(net.reports.is_empty());
+            for (i, j) in [(1, 0), (1, 2), (2, 1), (2, 3)] {
+                assert!(routes(i)[net.key(i, j)].nonexclusive, "{i} via {j}");
+            }
+        }
+    }
+}
+
+#[test]
+fn conflict_alerts_follow_selected_routes() {
+    let p = prefix("fd00:9::/64");
+    let mut net = Net::new(3);
+    net.connect(0, 1, Duration::from_millis(10));
+    net.connect(1, 2, Duration::from_millis(10));
+    net.add_neighbour(2, 9);
+    net.originate(0, p);
+    net.run_for(Duration::from_secs(30));
+
+    // An alert from neighbour 9, as it rejected an update, goes along the selected routes, to the
+    // originator, each node reporting how far away the rejecting node is by it, and sending it on
+    // one hop further.
+    let start = net.now;
+    net.inject_tlv(9, 2, &conflict_alert(p, 1));
+    net.run_for(Duration::from_secs(3));
+    assert_eq!(conflict_alerts_sent(&net, 2, 1, start), [(p, 2)]);
+    assert_eq!(conflict_alerts_sent(&net, 1, 0, start), [(p, 3)]);
+    assert_eq!(reported(&net, 2, p, start), [(9, alerted(1))]);
+    assert_eq!(reported(&net, 1, p, start), [(2, alerted(2))]);
+    assert_eq!(reported(&net, 0, p, start), [(1, alerted(3))]);
+
+    // Within the Conflict Alert interval, more alerts are reported, but not sent on.
+    let start = net.now;
+    for _ in 0..3 {
+        net.inject_tlv(9, 2, &conflict_alert(p, 1));
+    }
+    net.run_for(Duration::from_secs(3));
+    assert_eq!(conflict_alerts_sent(&net, 2, 1, start), []);
+    let reports = (net.reports.iter()).filter(|r| r.node == 2 && r.time >= start);
+    assert_eq!(reports.count(), 3);
+
+    // After it, one that has come 254 hops is sent on once more. The next node still reports it,
+    // with its rejecting node 255 hops away, but sends it no further.
+    net.run_for(Duration::from_secs(8));
+    let start = net.now;
+    net.inject_tlv(9, 2, &conflict_alert(p, 254));
+    net.run_for(Duration::from_secs(3));
+    assert_eq!(reported(&net, 2, p, start), [(9, alerted(254))]);
+    assert_eq!(conflict_alerts_sent(&net, 2, 1, start), [(p, 255)]);
+    assert_eq!(reported(&net, 1, p, start), [(2, alerted(255))]);
+    assert_eq!(conflict_alerts_sent(&net, 1, 0, start), []);
+    assert_eq!(reported(&net, 0, p, start), []);
+
+    // An alert from the next hop has nowhere to go, nor one for an unknown prefix.
+    net.run_for(Duration::from_secs(8));
+    let start = net.now;
+    net.inject_tlv(1, 2, &conflict_alert(p, 1));
+    net.inject_tlv(9, 2, &conflict_alert(prefix("fd00:8::/64"), 1));
+    net.run_for(Duration::from_secs(3));
+    assert_eq!(conflict_alerts_sent(&net, 2, 1, start), []);
+    assert_eq!(reported(&net, 2, p, start), []);
+
+    // Nor is one taken in from a neighbour still starting up.
+    net.add_neighbour_unacknowledged(2, 8);
+    net.inject_tlv(8, 2, &conflict_alert(p, 1));
+    net.run_for(Duration::from_secs(3));
+    assert_eq!(conflict_alerts_sent(&net, 2, 1, start), []);
+}
+
+#[test]
+fn originator_restarting_with_a_new_router_id_is_reacquired() {
+    let p = prefix("fd00:9::/64");
+    let mut net = Net::new(4);
+    for (a, b, ms) in [(0, 1, 10), (0, 2, 30), (1, 3, 10), (2, 3, 10)] {
+        net.connect(a, b, Duration::from_millis(ms));
+    }
+    net.originate(0, p);
+    net.run_for(Duration::from_secs(60));
+
+    // Node 0 crashes, and comes back with a new router-id, as the daemon picks on every start.
+    let node = State::new(net.now, params(), RouterId::new(100).unwrap(), None);
+    net.restart(0, node);
+    let restart = net.now;
+    net.add_neighbour(0, 1);
+    net.add_neighbour(0, 2);
+    assert!(net.nodes[0].inject_route(p, false));
+
+    net.run_for(Duration::from_secs(5));
+    for i in 1..4 {
+        assert_eq!(net.delivered_to(i, p.addr()), Some(0), "from {i}");
+        let routes = &net.nodes[i].route_table.prefix_entries[&p].routes;
+        assert!(routes.values().all(|route| route.router_id.get() == 100));
+    }
+    net.run_for(Duration::from_secs(60));
+    let reports: Vec<_> = (net.reports.iter()).filter(|r| r.time >= restart).collect();
+    assert!(reports.is_empty(), "{reports:?}");
+}
+
+#[test]
+fn addresses_inside_an_exclusive_prefix_are_kept_from_other_origins() {
+    // Node 0 originates P, and node 3 Q, inside it.
+    let p = prefix("fd00:9::/48");
+    let q = prefix("fd00:9:0:5::/64");
+    let in_q: IpAddr = "fd00:9:0:5::1".parse().unwrap();
+    let elsewhere_in_p: IpAddr = "fd00:9:0:6::1".parse().unwrap();
+
+    for (p_nonexclusive, q_nonexclusive) in
+        [(false, false), (false, true), (true, false), (true, true)]
+    {
+        let case = format!("P nonexclusive: {p_nonexclusive}, Q nonexclusive: {q_nonexclusive}");
+        let mut net = Net::new(4);
+        net.originate_as(0, p, p_nonexclusive);
+        net.originate_as(3, q, q_nonexclusive);
+        for i in 1..4 {
+            net.connect(i - 1, i, Duration::from_millis(10));
+        }
+        net.run_for(Duration::from_secs(60));
+
+        if p_nonexclusive {
+            // Q may come from another origin than P, and takes its addresses by the longest
+            // match, whether it is exclusive or not.
+            for i in 0..4 {
+                assert_eq!(net.delivered_to(i, in_q), Some(3), "{case}, node {i}");
+                assert_eq!(
+                    net.delivered_to(i, elsewhere_in_p),
+                    Some(0),
+                    "{case}, node {i}"
+                );
+            }
+            assert!(net.reports.is_empty(), "{case}");
+            continue;
+        }
+
+        // P is exclusive, so Q conflicts with it. Each node keeps the prefix it learnt first,
+        // and rejects the other: one on node 0's side reaches all of P's addresses there, Q's
+        // included, and one on node 3's side only Q's, at node 3. No node routes Q's addresses
+        // to node 3 and the rest of P's to node 0.
+        let sides: Vec<_> = (0..4)
+            .map(|i| net.delivered_to(i, elsewhere_in_p))
+            .collect();
+        for (i, &side) in sides.iter().enumerate() {
+            if side == Some(0) {
+                assert_eq!(net.delivered_to(i, in_q), Some(0), "{case}, node {i}");
+            } else {
+                assert_eq!(side, None, "{case}, node {i}");
+                assert_eq!(net.delivered_to(i, in_q), Some(3), "{case}, node {i}");
+            }
+        }
+        assert_eq!(sides[0], Some(0), "{case}");
+        assert_eq!(sides[3], None, "{case}");
+
+        // Each origin is told of the conflict over its own prefix, and only over that.
+        for (node, own) in [(0, p), (3, q)] {
+            let reports = net.reports.iter().filter(|r| r.node == node);
+            let prefixes: HashSet<_> = reports.map(|r| r.prefix).collect();
+            assert_eq!(prefixes, HashSet::from([own]), "{case}, node {node}");
+        }
+    }
+}
+
+#[test]
+fn an_origin_may_have_prefixes_inside_its_own_exclusive_ones() {
+    let p = prefix("fd00:9::/48");
+    let q = prefix("fd00:9:0:5::/64");
+    let mut net = Net::new(3);
+    net.originate(0, p);
+    net.originate(0, q);
+    net.connect(0, 1, Duration::from_millis(10));
+    net.connect(1, 2, Duration::from_millis(10));
+    net.run_for(Duration::from_secs(60));
+
+    for i in 1..3 {
+        assert_eq!(net.fib(i, p), Some(Fib::Via(i - 1)), "node {i}");
+        assert_eq!(net.fib(i, q), Some(Fib::Via(i - 1)), "node {i}");
+    }
+    assert!(net.reports.is_empty());
+}
+
+#[test]
+fn injected_prefixes_keep_out_what_conflicts_with_them() {
+    let p = prefix("fd00:9::/48");
+    let q = prefix("fd00:9:0:5::/64");
+    let entry = |net: &Net, prefix| {
+        net.nodes[0]
+            .route_table
+            .prefix_entries
+            .contains_key(&prefix)
+    };
+
+    // Node 0 originates P, exclusive. A route from another origin to Q, inside it, is rejected,
+    // and the conflict reported over P. No alert goes out, as node 0 is P's origin.
+    let mut net = Net::new(1);
+    net.originate(0, p);
+    net.add_neighbour(0, 9);
+    let mut n9 = Scripted::new(9);
+    let start = net.now;
+    n9.send(&mut net, 0, &[update(q, 42, 1, 100, 0x8000)]);
+    net.run_for(Duration::from_secs(3));
+    assert!(!entry(&net, q));
+    assert_eq!(
+        reported(&net, 0, p, start),
+        [(9, ConflictAlertKind::Rejected)]
+    );
+    assert_eq!(conflict_alerts_sent(&net, 0, 9, start), []);
+
+    // Node 0 originates Q instead. An exclusive P from another origin would take its addresses,
+    // and is rejected too, while a nonexclusive one is taken in.
+    let mut net = Net::new(1);
+    net.originate(0, q);
+    net.add_neighbour(0, 9);
+    let mut n9 = Scripted::new(9);
+    let start = net.now;
+    n9.send(&mut net, 0, &[update(p, 42, 1, 100, 0x8000)]);
+    assert!(!entry(&net, p));
+    assert_eq!(
+        reported(&net, 0, q, start),
+        [(9, ConflictAlertKind::Rejected)]
+    );
+    n9.send(&mut net, 0, &[nonexclusive_update(p, 42, 1, 100, 0x8000)]);
+    assert_eq!(net.fib(0, p), Some(Fib::Via(9)));
+}
+
+#[test]
+fn routes_over_failed_links_give_way_to_a_prefix_containing_them() {
+    // A route gives way to an exclusive prefix containing it, as it does to the same prefix.
+    route_over_a_failed_link_gives_way(prefix("fd00:9:0:5::/64"), prefix("fd00:9::/48"));
 }

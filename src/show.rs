@@ -1,5 +1,5 @@
-//! `cynet show`: the daemon's status, as text, over a Unix socket. All that a client can ask for is
-//! the verbose form, so the socket can't change anything.
+//! `cynet show`: the daemon's status, as text, over a Unix socket. A client can't ask for anything
+//! but the status, so the socket can't change anything.
 //!
 //! The text has the colors of `wg show`. Only the client knows whether it writes to a terminal, so
 //! the daemon always includes them, and the client removes them otherwise, as `wg` does.
@@ -8,6 +8,7 @@
 mod tests;
 
 use std::{
+    collections::HashSet,
     fmt::Write as _,
     fs,
     io::{self, ErrorKind, IsTerminal},
@@ -22,6 +23,8 @@ use gotatun::{
     device::{Device, DeviceTransports, configure::PeerStats},
     x25519::PublicKey,
 };
+use ipnet::IpNet;
+use parking_lot::Mutex;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{UnixListener, UnixStream},
@@ -32,11 +35,12 @@ use tokio::{
 
 use crate::{
     babel::{
-        COST_INFINITY, METRIC_INFINITY,
+        COST_INFINITY,
         driver::{self, Input},
         snapshot::{NeighbourSnapshot, PrefixStatus, RouteSnapshot, Snapshot},
     },
     config::encode_key,
+    conflicts::{ConflictLog, Ongoing},
 };
 
 /// The directory of the sockets, one per interface.
@@ -45,8 +49,9 @@ const SOCKET_DIR: &str = "/run/cynet";
 /// How long to wait for a daemon to reply, and for a client to ask.
 const REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// What a client sends to ask for the verbose status. It asks for the plain one by sending nothing.
-const VERBOSE_REQUEST: &[u8] = b"verbose\n";
+/// The most that is read of what a client sends, which is ignored, as there is only one status to
+/// give. Older clients send `verbose\n`, to ask for what that status now is.
+const MAX_REQUEST: u64 = 64;
 
 const RESET: &str = "\x1b[0m";
 const BOLD: &str = "\x1b[1m";
@@ -62,7 +67,7 @@ fn socket_path(name: &str) -> PathBuf {
 }
 
 /// Returns the first few characters of a public key, enough to tell peers apart.
-fn short_key(key: &PublicKey) -> String {
+pub fn short_key(key: &PublicKey) -> String {
     let mut key = encode_key(key.as_bytes());
     key.truncate(5);
     key.push('…');
@@ -75,11 +80,12 @@ pub struct Status<T: DeviceTransports> {
     pub(crate) inputs: mpsc::Sender<Input<PublicKey>>,
     pub(crate) public_key: PublicKey,
     pub(crate) started: Instant,
+    pub(crate) conflicts: Arc<Mutex<ConflictLog>>,
 }
 
 impl<T: DeviceTransports> Status<T> {
     /// Returns the status as text, with colors.
-    pub async fn text(&self, name: &str, verbose: bool) -> eyre::Result<String> {
+    pub async fn text(&self, name: &str) -> eyre::Result<String> {
         let snapshot = driver::snapshot(&self.inputs)
             .await
             .wrap_err("the Babel driver has stopped")?;
@@ -87,20 +93,26 @@ impl<T: DeviceTransports> Status<T> {
         let listen_port = self.device.read(async |device| device.listen_port()).await;
         let peers = self.device.peers().await;
 
-        Ok(format_status(
+        let now = driver::now();
+        let conflicts = self.conflicts.lock().ongoing(now);
+        let conflicted: HashSet<_> = conflicts.iter().map(|ongoing| ongoing.key.prefix).collect();
+
+        let mut text = format_status(
             name,
             &self.public_key,
             listen_port,
             self.started.elapsed(),
             &peers,
             &snapshot,
-            verbose,
-        ))
+            &conflicted,
+        );
+        text.push_str(&format_conflicts(&conflicts, now));
+        Ok(text)
     }
 }
 
-/// Formats a node's peers and routes. With `verbose`, this includes what Babel bases its choice of
-/// routes on.
+/// Formats a node's peers and routes, with what Babel bases its choice of routes on, marking the
+/// prefixes in `conflicted`, which have conflicts that go on (see [`format_conflicts`]).
 fn format_status(
     name: &str,
     public_key: &PublicKey,
@@ -108,7 +120,7 @@ fn format_status(
     uptime: Duration,
     peers: &[PeerStats],
     snapshot: &Snapshot<PublicKey>,
-    verbose: bool,
+    conflicted: &HashSet<IpNet>,
 ) -> String {
     let mut out = String::new();
 
@@ -119,14 +131,12 @@ fn format_status(
         encode_key(public_key.as_bytes())
     );
     let _ = writeln!(out, "  {BOLD}listening port{RESET}: {listen_port}");
-    if verbose {
-        let _ = writeln!(
-            out,
-            "  {BOLD}router-id{RESET}: {:016x}, {BOLD}seqno{RESET}: {}",
-            snapshot.router_id.get(),
-            snapshot.seqno.get()
-        );
-    }
+    let _ = writeln!(
+        out,
+        "  {BOLD}router-id{RESET}: {:016x}, {BOLD}seqno{RESET}: {}",
+        snapshot.router_id.get(),
+        snapshot.seqno.get()
+    );
     let _ = writeln!(out, "  {BOLD}uptime{RESET}: {}", format_age(uptime));
 
     let mut peers: Vec<_> = peers.iter().collect();
@@ -161,95 +171,131 @@ fn format_status(
             format_bytes(peer.stats.tx_bytes)
         );
         if let Some(neighbour) = snapshot.neighbours.iter().find(|n| n.key == *key) {
-            format_neighbour(&mut out, neighbour, verbose);
+            format_neighbour(&mut out, neighbour);
         }
     }
 
-    let _ = writeln!(out, "\n{MAGENTA}{BOLD}routes{RESET}:");
+    let _ = writeln!(out, "\n{CYAN}{BOLD}routes{RESET}:");
     let width = (snapshot.prefixes.iter())
         .map(|entry| entry.prefix.to_string().len())
         .max()
         .unwrap_or(0);
     for entry in &snapshot.prefixes {
-        let (addr, prefix_len) = (entry.prefix.addr(), entry.prefix.prefix_len());
-        let prefix = format!("{addr}{CYAN}/{RESET}{prefix_len}");
+        let prefix = format_prefix(entry.prefix);
         // Colors take up no space, so they can't count towards the width of the column.
         let prefix_padding = width - entry.prefix.to_string().len();
-        // A line goes in the column beside the prefix, or `below` it, indented from it.
-        let mut first = true;
-        let mut line = |out: &mut String, below: bool, text: String| {
-            if below {
-                if first {
-                    let _ = writeln!(out, "  {prefix}");
-                }
-                let _ = writeln!(out, "    {text}");
-            } else {
-                let (label, padding) = if first {
-                    (prefix.as_str(), prefix_padding)
-                } else {
-                    ("", width)
-                };
-                let _ = writeln!(out, "  {label}{:padding$}  {text}", "");
-            }
-            first = false;
-        };
-
+        // Beside the prefix go its status, if it has one other than a selected route, whether it is
+        // nonexclusive, which a prefix that this node originates as nonexclusive, or whose routes
+        // are all nonexclusive, says, and whether it has conflicts that go on, last.
+        let mut beside = Vec::new();
         let selected = match entry.status {
-            PrefixStatus::Injected => {
-                line(&mut out, false, format!("{GREEN}injected{RESET}"));
+            PrefixStatus::Injected { .. } => {
+                beside.push(format!("{GREEN}injected{RESET}"));
                 None
             }
             PrefixStatus::Selected(key) => Some(key),
             PrefixStatus::Held => {
-                line(&mut out, false, format!("{RED}unreachable (held){RESET}"));
+                beside.push(format!("{RED}unreachable (held){RESET}"));
                 None
             }
             PrefixStatus::None => {
-                line(&mut out, false, format!("{RED}no route selected{RESET}"));
+                beside.push(format!("{RED}no route selected{RESET}"));
                 None
             }
         };
+        let nonexclusive = match entry.status {
+            PrefixStatus::Injected { nonexclusive } => nonexclusive,
+            _ => !entry.routes.is_empty() && entry.routes.iter().all(|route| route.nonexclusive),
+        };
+        if nonexclusive {
+            beside.push(format!("{MAGENTA}nonexclusive{RESET}"));
+        }
+        if conflicted.contains(&entry.prefix) {
+            beside.push(format!("{RED}conflicted{RESET}"));
+        }
+
+        // That goes in a column beside the prefix, and the routes below it, each on a line of its
+        // own, two spaces further in.
+        if beside.is_empty() {
+            let _ = writeln!(out, "  {prefix}");
+        } else {
+            let beside = beside.join(", ");
+            let _ = writeln!(out, "  {prefix}{:prefix_padding$}  {beside}", "");
+        }
 
         // The selected route first, then the others.
         for route in entry.routes.iter().filter(|r| Some(r.via) == selected) {
-            let mut text = format!(
-                "{BOLD}via{RESET} {YELLOW}{}{RESET}, {BOLD}metric{RESET} {}",
+            let _ = writeln!(
+                out,
+                "    {BOLD}via{RESET} {YELLOW}{}{RESET}, {BOLD}metric{RESET} {}{}",
                 short_key(&route.via),
-                format_metric(route.metric),
+                format_cost_metric(route.metric),
+                route_details(route, BOLD, RESET),
             );
-            if verbose {
-                text.push_str(&route_details(route, BOLD, RESET));
-            }
-            line(&mut out, verbose, text);
         }
         for route in entry.routes.iter().filter(|r| Some(r.via) != selected) {
-            let mut text = format!(
-                "{DIM}not via {}, metric {}",
+            let feasibility = if route.feasible {
+                ", feasible"
+            } else {
+                ", unfeasible"
+            };
+            let _ = writeln!(
+                out,
+                "    {DIM}not via {}, metric {}{}{feasibility}{RESET}",
                 short_key(&route.via),
-                format_metric(route.metric),
+                format_cost_metric(route.metric),
+                route_details(route, "", ""),
             );
-            if verbose {
-                text.push_str(&route_details(route, "", ""));
-                if route.metric != METRIC_INFINITY {
-                    text.push_str(if route.feasible {
-                        ", feasible"
-                    } else {
-                        ", unfeasible"
-                    });
-                }
-            }
-            text.push_str(RESET);
-            line(&mut out, verbose, text);
         }
     }
 
     out
 }
 
+/// Formats the conflicts over prefixes that go on, each with how many hops away the routes meet
+/// and how long it has gone on, for the end of the status. With none, there is nothing to show. A
+/// line for each prefix heads its conflicts, which go on lines of their own, two spaces further in,
+/// as routes do.
+///
+/// Each names the neighbour that the rejected updates or the alerts come from, which is the next
+/// node to look at when tracing a conflict (see
+/// [Duplicate addresses](crate::babel::State#duplicate-addresses)).
+fn format_conflicts(conflicts: &[Ongoing], now: std::time::Instant) -> String {
+    let mut out = String::new();
+    if conflicts.is_empty() {
+        return out;
+    }
+
+    let _ = writeln!(out, "\n{RED}{BOLD}conflicts{RESET}:");
+    let mut last = None;
+    for Ongoing { key, hops, since } in conflicts {
+        // Conflicts come in order of prefix, which is shown once for those that share it.
+        if last != Some(key.prefix) {
+            let _ = writeln!(out, "  {}", format_prefix(key.prefix));
+            last = Some(key.prefix);
+        }
+
+        let from = format!("{YELLOW}{}{RESET}", short_key(&key.from));
+        let age = now.saturating_duration_since(*since);
+        let _ = writeln!(
+            out,
+            "    {}, for {}",
+            key.describe(*hops, &from),
+            format_age(age)
+        );
+    }
+    out
+}
+
+/// Formats a prefix, with its slash in color.
+fn format_prefix(prefix: IpNet) -> String {
+    format!("{}{CYAN}/{RESET}{}", prefix.addr(), prefix.prefix_len())
+}
+
 /// Writes what Babel knows of a peer's link.
-fn format_neighbour(out: &mut String, neighbour: &NeighbourSnapshot<PublicKey>, verbose: bool) {
+fn format_neighbour(out: &mut String, neighbour: &NeighbourSnapshot<PublicKey>) {
     let cost = if neighbour.cost == COST_INFINITY {
-        format!("{RED}infinite{RESET}")
+        format!("{RED}infinity{RESET}")
     } else {
         neighbour.cost.to_string()
     };
@@ -263,45 +309,42 @@ fn format_neighbour(out: &mut String, neighbour: &NeighbourSnapshot<PublicKey>, 
     }
     let _ = writeln!(out);
 
-    if verbose {
+    let _ = writeln!(
+        out,
+        "  {BOLD}rxcost{RESET}: {}, {BOLD}txcost{RESET}: {}, {BOLD}rtt penalty{RESET}: {}",
+        format_cost_metric(neighbour.rxcost),
+        format_cost_metric(neighbour.txcost),
+        neighbour.rtt_penalty
+    );
+    let _ = writeln!(
+        out,
+        "  {BOLD}hello history{RESET}: {:016b} (latest last)",
+        neighbour.hello_history
+    );
+    if neighbour.in_startup {
         let _ = writeln!(
             out,
-            "  {BOLD}rxcost{RESET}: {}, {BOLD}txcost{RESET}: {}, {BOLD}rtt penalty{RESET}: {}",
-            format_metric(neighbour.rxcost),
-            format_metric(neighbour.txcost),
-            neighbour.rtt_penalty
+            "  {BOLD}startup{RESET}: waiting for an acknowledgement"
         );
-        let _ = writeln!(
-            out,
-            "  {BOLD}hello history{RESET}: {:016b} (latest last)",
-            neighbour.hello_history
-        );
-        if neighbour.in_startup {
-            let _ = writeln!(
-                out,
-                "  {BOLD}startup{RESET}: waiting for an acknowledgement"
-            );
-        }
     }
 }
 
-/// Returns the part of a route's line, after its metric, that only the verbose status has: the
-/// smoothed metric and the source. `bold` and `reset` set off its labels, and are empty in dimmed
-/// text, which a reset would end early.
+/// Returns the part of a route's line after its metric: the smoothed metric and the source. `bold`
+/// and `reset` set off its labels, and are empty in dimmed text, which a reset would end early.
 fn route_details(route: &RouteSnapshot<PublicKey>, bold: &str, reset: &str) -> String {
     format!(
         " ({}), {bold}rid{reset} {:016x}, {bold}seqno{reset} {}",
-        format_metric(route.smoothed_metric),
+        route.smoothed_metric,
         route.router_id.get(),
         route.seqno.get()
     )
 }
 
-fn format_metric(metric: u16) -> String {
-    if metric == METRIC_INFINITY {
-        "infinite".to_owned()
+fn format_cost_metric(value: u16) -> String {
+    if value == u16::MAX {
+        "infinity".to_owned()
     } else {
-        metric.to_string()
+        value.to_string()
     }
 }
 
@@ -386,8 +429,8 @@ impl ShowServer {
         let name = name.to_owned();
         let task = tokio::spawn(async move {
             while let Ok((mut stream, _)) = listener.accept().await {
-                let verbose = read_request(&mut stream).await;
-                let text = match status.text(&name, verbose).await {
+                read_request(&mut stream).await;
+                let text = match status.text(&name).await {
                     Ok(text) => text,
                     Err(error) => format!("error: {error:#}\n"),
                 };
@@ -411,18 +454,19 @@ impl Drop for ShowServer {
     }
 }
 
-/// Reads whether a client asks for the verbose status. One that says anything else, or nothing for
-/// too long, gets the plain one.
-async fn read_request(stream: &mut UnixStream) -> bool {
+/// Waits for a client to close its side, which it does once it has asked, or to say too much, or
+/// for too long, and ignores what it says (see [`MAX_REQUEST`]). Reading it first saves an older
+/// client from losing the status: closing a socket with what the peer sent still unread can make
+/// the peer's next read fail with a reset.
+async fn read_request(stream: &mut UnixStream) {
     let mut request = Vec::new();
-    let mut stream = stream.take(VERBOSE_REQUEST.len() as u64);
-    let read = stream.read_to_end(&mut request);
-    matches!(timeout(REPLY_TIMEOUT, read).await, Ok(Ok(_))) && request == VERBOSE_REQUEST
+    let mut stream = stream.take(MAX_REQUEST);
+    let _ = timeout(REPLY_TIMEOUT, stream.read_to_end(&mut request)).await;
 }
 
 /// Reads one daemon's status, or returns `None` if it is not running: nothing is listening on a
 /// socket that a crash left behind, and a socket can be gone by the time it is read.
-async fn read_status(path: &Path, verbose: bool) -> eyre::Result<Option<String>> {
+async fn read_status(path: &Path) -> eyre::Result<Option<String>> {
     let exchange = async {
         let mut stream = match UnixStream::connect(path).await {
             Ok(stream) => stream,
@@ -436,9 +480,6 @@ async fn read_status(path: &Path, verbose: bool) -> eyre::Result<Option<String>>
             }
             Err(error) => return Err(error),
         };
-        if verbose {
-            stream.write_all(VERBOSE_REQUEST).await?;
-        }
         // This tells the daemon that there is nothing more to wait for.
         stream.shutdown().await?;
 
@@ -469,9 +510,8 @@ fn socket_paths() -> eyre::Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
-/// Prints the status of the named interface, or of every running one, with `verbose` adding what
-/// Babel bases its choice of routes on.
-pub async fn show(name: Option<&str>, verbose: bool) -> eyre::Result<()> {
+/// Prints the status of the named interface, or of every running one.
+pub async fn show(name: Option<&str>) -> eyre::Result<()> {
     let paths = match name {
         Some(name) => vec![socket_path(name)],
         None => socket_paths()?,
@@ -480,7 +520,7 @@ pub async fn show(name: Option<&str>, verbose: bool) -> eyre::Result<()> {
     let colors = io::stdout().is_terminal();
     let mut first = true;
     for path in paths {
-        let Some(text) = read_status(&path, verbose).await? else {
+        let Some(text) = read_status(&path).await? else {
             if let Some(name) = name {
                 bail!("{name} is not running");
             }

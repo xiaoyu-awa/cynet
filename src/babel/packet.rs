@@ -45,6 +45,8 @@ pub struct Update {
     ///
     /// For a retraction, the router-id is optional and not used by the protocol. Giving a retraction the router-id of the route it retracts lets it be sorted among that router's other updates, next to related prefixes, which may make it more compact. On decoding, a retraction carries whichever router-id is in effect, if any.
     pub router_id: Option<RouterId>,
+    /// Whether the update carries a Nonexclusive sub-TLV (see [`Tlv::Update`]).
+    pub nonexclusive: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -267,6 +269,7 @@ impl PacketEncoder {
             metric,
             prefix,
             router_id,
+            nonexclusive,
         } = *update;
 
         assert_ne!(ae, Ae::LinkLocalIpv6, "Update should not carry AE 3");
@@ -340,6 +343,7 @@ impl PacketEncoder {
             seqno,
             metric,
             prefix: tlv_prefix,
+            nonexclusive,
         };
 
         let fits = match tlv_router_id {
@@ -558,6 +562,7 @@ impl Iterator for PacketDecoder<'_> {
                 seqno,
                 metric,
                 prefix,
+                nonexclusive,
             } => {
                 let Some(prefix) = self.update_state(ae, flags, plen, omitted, prefix) else {
                     return Some(Err(PacketDecodeError::Stateful(tlv)));
@@ -577,6 +582,7 @@ impl Iterator for PacketDecoder<'_> {
                     metric,
                     prefix,
                     router_id: self.router_id,
+                    nonexclusive,
                 })
             }
             _ => PacketItem::Tlv(tlv),

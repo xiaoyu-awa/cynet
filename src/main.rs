@@ -28,9 +28,6 @@ enum Command {
     Show {
         /// The interface
         name: Option<String>,
-        /// Also shows what Babel bases its choice of routes on
-        #[arg(short, long)]
-        verbose: bool,
     },
     /// Generates a private key and prints it in base64, as `wg genkey` does
     Genkey,
@@ -58,7 +55,7 @@ async fn main() -> eyre::Result<()> {
 
     match Cli::parse().command {
         Command::Run { config } => daemon::run(Config::load(&config)?).await,
-        Command::Show { name, verbose } => show::show(name.as_deref(), verbose).await,
+        Command::Show { name } => show::show(name.as_deref()).await,
         Command::Genkey => {
             let mut key = random_key()?;
             // Clamped as Curve25519 expects, as `wg genkey` does.

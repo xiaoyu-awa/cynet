@@ -81,6 +81,17 @@ impl Params {
         key.get(self)
     }
 
+    /// Returns how long after the last report of a conflict over a prefix it no longer seems to go
+    /// on (see [Duplicate addresses](crate::babel::State#duplicate-addresses)): 3.5 Update
+    /// intervals, as for the expiry of a route. A conflict is reported about once per Update
+    /// interval, at each full dump that brings an update to reject, so this outlasts the gap that
+    /// one or two lost packets leave.
+    pub fn get_conflict_expiry(&self) -> Duration {
+        self.update_interval
+            .to_duration()
+            .mul_f64(F64Key::RouteExpiryTimeMultiplier.get(self))
+    }
+
     /// Returns the time constant for route hysteresis, in microseconds.
     /// Defaults to 3 times the Hello interval.
     pub(crate) fn get_tau(&self) -> u32 {
@@ -144,6 +155,10 @@ pub enum DurationKey {
     SourceGcTime,
     /// Route hold time. Defaults to 4 times the Update interval.
     RouteHoldTime,
+    /// How long after sending a Conflict Alert for a prefix to a neighbour no other is sent for
+    /// it to that neighbour. Defaults to half the Update interval, so that the alerts of
+    /// rejections recurring at the period of full dumps all get through.
+    ConflictAlertInterval,
 }
 
 impl Key for DurationKey {
@@ -158,6 +173,7 @@ impl Key for DurationKey {
             DurationKey::StartupTimeout => Duration::from_millis(250),
             DurationKey::SourceGcTime => Duration::from_mins(3),
             DurationKey::RouteHoldTime => params.update_interval.to_duration() * 4,
+            DurationKey::ConflictAlertInterval => params.update_interval.to_duration() / 2,
         }
     }
 }

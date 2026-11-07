@@ -49,6 +49,7 @@ impl Driver {
     fn start_originating(n: u64, prefixes: Vec<IpNet>) -> Self {
         let (inputs_tx, inputs_rx) = mpsc::channel(64);
         let (events_tx, events_rx) = mpsc::channel(64);
+        let prefixes = prefixes.into_iter().map(|prefix| (prefix, false)).collect();
         tokio::task::spawn_local(run(params(), router_id(n), prefixes, inputs_rx, events_tx));
         Self {
             inputs: inputs_tx,
@@ -249,12 +250,13 @@ async fn two_drivers_acquire_each_other_and_exchange_routes() {
 
         let snapshot = a.snapshot().await;
         assert_eq!(snapshot.router_id, router_id(1));
-        assert!(
-            snapshot
-                .prefixes
-                .iter()
-                .any(|entry| { entry.prefix == p && entry.status == PrefixStatus::Injected })
-        );
+        assert!(snapshot.prefixes.iter().any(|entry| {
+            entry.prefix == p
+                && entry.status
+                    == PrefixStatus::Injected {
+                        nonexclusive: false,
+                    }
+        }));
 
         let snapshot = b.snapshot().await;
         let entry = snapshot.prefixes.iter().find(|e| e.prefix == p).unwrap();

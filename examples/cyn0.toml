@@ -11,7 +11,8 @@ name = "cyn0"
 mtu = 1400
 # This node's addresses, with no prefix length: each is assigned as a /32 or /128, and advertised
 # as a host route. Link-local addresses are not allowed. A node with none still forwards, and
-# sources its ICMP errors from a dummy address.
+# sources its ICMP errors from a dummy address. An address is exclusive to this node unless marked
+# "nonexclusive,", for example "nonexclusive,10.42.0.9" for a service that several nodes answer on.
 addresses = ["10.42.0.1", "fd42::1"]
 
 # The WireGuard tunnels, as `wg` would show them.
@@ -35,7 +36,11 @@ reresolve_secs = 60
 mesh = ["10.42.0.0/16", "fd42::/48", "192.168.0.0/16"]
 # Directly attached networks, which are advertised. Reaching them takes kernel forwarding on this
 # node, as cynet has no socket on them. A packet from a peer claiming a source in one of them is
-# dropped.
+# dropped. As with addresses, a network is exclusive to this node unless marked "nonexclusive,":
+# another node advertising it too, or any prefix inside it, is a conflict. Each node keeps the route
+# it learnt first, and the conflict is reported in the logs and in `cynet show` along the way. So a
+# default route at an exit node must be marked, as in "nonexclusive,0.0.0.0/0", or it would conflict
+# with every other node's prefix of its family.
 attached = ["192.168.7.0/24"]
 # Whether to add a kernel route to the main table for each entry of mesh. Defaults to true, which
 # doesn't allow a /0 in mesh for now. An entry only gets a route if this node has an address or an

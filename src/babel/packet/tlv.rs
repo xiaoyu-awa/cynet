@@ -119,6 +119,12 @@ pub enum Tlv {
         ///
         /// This field's value starts from index 0 of the array.
         prefix: [u8; 16],
+        /// Whether the TLV carries a Nonexclusive sub-TLV, an experimental extension of this
+        /// implementation: other routers may originate the prefix too, and prefixes inside it.
+        /// Without it, the prefix is exclusive to its router-id, and an update from another
+        /// router-id for it, or for a prefix inside it, conflicts with it (see
+        /// [Duplicate addresses](crate::babel::State#duplicate-addresses)).
+        nonexclusive: bool,
     } = 8,
     RouteRequest {
         /// The encoding of the Prefix field. The value 0 specifies that this is a request for a full route table dump (a wildcard request).
@@ -146,6 +152,25 @@ pub enum Tlv {
         /// This field's value starts from index 0 of the array. Any bits beyond Plen must be cleared, and are cleared on decoding.
         prefix: [u8; 16],
     } = 10,
+    /// A Conflict Alert TLV, an experimental extension of this implementation, of a type
+    /// reserved for Experimental Use (RFC 8966 §5). It tells the originator of a prefix that
+    /// a node rejected an update for it from another router-id, and is forwarded to the next
+    /// hop of the selected route at each node on the way (see
+    /// [Duplicate addresses](crate::babel::State#duplicate-addresses)).
+    ConflictAlert {
+        /// The encoding of the Prefix field. This MUST NOT be 0.
+        ae: Ae,
+        /// The length in bits of the prefix.
+        plen: u8,
+        /// How many hops the receiver is from the node that rejected an update: 1 as that node
+        /// sends it, and one more each time it is forwarded, which it isn't past 255. This MUST
+        /// NOT be 0.
+        hops_away: NonZeroU8,
+        /// The prefix in conflict. This field's size is Plen/8 rounded upwards.
+        ///
+        /// This field's value starts from index 0 of the array. Any bits beyond Plen must be cleared, and are cleared on decoding.
+        prefix: [u8; 16],
+    } = 224,
 }
 
 /// Returns the smallest number of octets that are enough to hold a prefix of length `plen`.
@@ -180,11 +205,18 @@ impl Tlv {
                 ..
             } => 8 + origin_receive_timestamps.map_or(0, |_| 10),
             Self::RouterId { .. } => 12,
-            Self::Update { plen, omitted, .. } => {
+            Self::Update {
+                plen,
+                omitted,
+                nonexclusive,
+                ..
+            } => {
                 12 + octets(plen).saturating_sub(omitted as usize)
+                    + if nonexclusive { 2 } else { 0 }
             }
             Self::RouteRequest { plen, .. } => 4 + octets(plen),
             Self::SeqnoRequest { plen, .. } => 16 + octets(plen),
+            Self::ConflictAlert { plen, .. } => 6 + octets(plen),
         }
     }
 
@@ -270,6 +302,7 @@ fn encode_payload(tlv: &Tlv, mut buf: &mut [u8]) -> usize {
             seqno,
             metric,
             prefix,
+            nonexclusive,
         } => {
             match ae {
                 Ae::Wildcard => {
@@ -302,6 +335,11 @@ fn encode_payload(tlv: &Tlv, mut buf: &mut [u8]) -> usize {
             buf.put_u16(seqno.get());
             buf.put_u16(metric);
             buf.put_slice(&prefix[..octets(plen) - omitted as usize]);
+
+            if nonexclusive {
+                buf.put_u8(SubTlvKind::Nonexclusive as u8); // Type
+                buf.put_u8(0); // Length
+            }
         }
         Tlv::RouteRequest { ae, plen, prefix } => {
             assert!(
@@ -309,15 +347,7 @@ fn encode_payload(tlv: &Tlv, mut buf: &mut [u8]) -> usize {
                 "Route Request should not carry AE 3 or 4"
             );
 
-            assert!(
-                plen <= ae.max_plen(),
-                "Route Request should not carry overlarge Plen"
-            );
-
-            assert!(
-                prefix == mask_prefix(prefix, plen),
-                "Route Request should not carry a prefix with bits set beyond Plen"
-            );
+            assert_prefix_fits("Route Request", ae, plen, prefix);
 
             buf.put_u8(ae as u8);
             buf.put_u8(plen);
@@ -336,15 +366,7 @@ fn encode_payload(tlv: &Tlv, mut buf: &mut [u8]) -> usize {
                 "Seqno Request should not carry AE 0, 3, or 4"
             );
 
-            assert!(
-                plen <= ae.max_plen(),
-                "Seqno Request should not carry overlarge Plen"
-            );
-
-            assert!(
-                prefix == mask_prefix(prefix, plen),
-                "Seqno Request should not carry a prefix with bits set beyond Plen"
-            );
+            assert_prefix_fits("Seqno Request", ae, plen, prefix);
 
             buf.put_u8(ae as u8);
             buf.put_u8(plen);
@@ -352,6 +374,25 @@ fn encode_payload(tlv: &Tlv, mut buf: &mut [u8]) -> usize {
             buf.put_u8(hop_count.get());
             buf.put_u8(0); // Reserved
             buf.put_u64(router_id.get());
+            buf.put_slice(&prefix[..octets(plen)]);
+        }
+        Tlv::ConflictAlert {
+            ae,
+            plen,
+            hops_away,
+            prefix,
+        } => {
+            assert!(
+                ae != Ae::Wildcard && ae != Ae::LinkLocalIpv6 && ae != Ae::V4ViaV6,
+                "Conflict Alert should not carry AE 0, 3, or 4"
+            );
+
+            assert_prefix_fits("Conflict Alert", ae, plen, prefix);
+
+            buf.put_u8(ae as u8);
+            buf.put_u8(plen);
+            buf.put_u8(hops_away.get());
+            buf.put_u8(0); // Reserved
             buf.put_slice(&prefix[..octets(plen)]);
         }
     }
@@ -509,6 +550,7 @@ fn decode_update_body(buf: &mut &[u8]) -> Result<Tlv, StateModifier> {
                 seqno: Seqno::new(seqno),
                 metric,
                 prefix,
+                nonexclusive: false,
             })
         } else {
             Err(StateModifier::Update {
@@ -608,18 +650,9 @@ fn decode_state_irrelevant_body(kind: TlvKind, buf: &mut &[u8]) -> Option<Tlv> {
                 return None;
             }
 
-            if plen > ae.max_plen() {
-                return None;
-            }
+            let prefix = get_prefix(buf, ae, plen)?;
 
-            let mut prefix = [0; 16];
-            buf.try_copy_to_slice(&mut prefix[..octets(plen)]).ok()?;
-
-            Tlv::RouteRequest {
-                ae,
-                plen,
-                prefix: mask_prefix(prefix, plen),
-            }
+            Tlv::RouteRequest { ae, plen, prefix }
         }
         TlvKind::SeqnoRequest => {
             let ae = buf.try_get_u8().ok()?;
@@ -635,12 +668,7 @@ fn decode_state_irrelevant_body(kind: TlvKind, buf: &mut &[u8]) -> Option<Tlv> {
                 return None;
             }
 
-            if plen > ae.max_plen() {
-                return None;
-            }
-
-            let mut prefix = [0; 16];
-            buf.try_copy_to_slice(&mut prefix[..octets(plen)]).ok()?;
+            let prefix = get_prefix(buf, ae, plen)?;
 
             Tlv::SeqnoRequest {
                 ae,
@@ -648,10 +676,55 @@ fn decode_state_irrelevant_body(kind: TlvKind, buf: &mut &[u8]) -> Option<Tlv> {
                 seqno: Seqno::new(seqno),
                 hop_count: NonZeroU8::new(hop_count)?,
                 router_id: RouterId::new(router_id)?,
-                prefix: mask_prefix(prefix, plen),
+                prefix,
+            }
+        }
+        TlvKind::ConflictAlert => {
+            let ae = buf.try_get_u8().ok()?;
+            let plen = buf.try_get_u8().ok()?;
+            let hops_away = buf.try_get_u8().ok()?;
+            let _reserved = buf.try_get_u8().ok()?;
+
+            let ae = Ae::new(ae)?;
+
+            if ae == Ae::Wildcard || ae == Ae::LinkLocalIpv6 {
+                return None;
+            }
+
+            let prefix = get_prefix(buf, ae, plen)?;
+
+            Tlv::ConflictAlert {
+                ae,
+                plen,
+                hops_away: NonZeroU8::new(hops_away)?,
+                prefix,
             }
         }
     })
+}
+
+/// Asserts that a TLV called `name` carries a Plen no larger than its AE allows, and a prefix with
+/// no bits set beyond it.
+fn assert_prefix_fits(name: &str, ae: Ae, plen: u8, prefix: [u8; 16]) {
+    assert!(
+        plen <= ae.max_plen(),
+        "{name} should not carry overlarge Plen"
+    );
+    assert!(
+        prefix == mask_prefix(prefix, plen),
+        "{name} should not carry a prefix with bits set beyond Plen"
+    );
+}
+
+/// Reads a prefix of `plen` bits in AE `ae`, with any bits beyond it cleared, or returns `None` if
+/// Plen is larger than the AE allows, or the TLV ends first.
+fn get_prefix(buf: &mut &[u8], ae: Ae, plen: u8) -> Option<[u8; 16]> {
+    if plen > ae.max_plen() {
+        return None;
+    }
+    let mut prefix = [0; 16];
+    buf.try_copy_to_slice(&mut prefix[..octets(plen)]).ok()?;
+    Some(mask_prefix(prefix, plen))
 }
 
 /// Specifies a way to modify the parser state.
@@ -721,11 +794,28 @@ fn decode_sub_tlv(tlv: &mut Tlv, buf: &mut &[u8]) -> Result<(), SubTlvDecodeErro
         });
     };
 
-    if kind == SubTlvKind::Timestamp {
-        decode_timestamp_body(tlv, &mut buf).ok_or(SubTlvDecodeError::Malformed)?;
+    match kind {
+        SubTlvKind::Timestamp => {
+            decode_timestamp_body(tlv, &mut buf).ok_or(SubTlvDecodeError::Malformed)?;
+        }
+        SubTlvKind::Nonexclusive => {
+            decode_nonexclusive_body(tlv).ok_or(SubTlvDecodeError::Malformed)?;
+        }
+        SubTlvKind::Pad1 | SubTlvKind::PadN => {}
     }
 
     Ok(())
+}
+
+/// Marks an Update as nonexclusive. Any body is ignored, so that one can be given to the sub-TLV
+/// later, as Timestamp sub-TLVs longer than expected are accepted (RFC 9616 §6.1).
+fn decode_nonexclusive_body(tlv: &mut Tlv) -> Option<()> {
+    match tlv {
+        Tlv::Update { nonexclusive, .. } => *nonexclusive = true,
+        _ => return None,
+    }
+
+    Some(())
 }
 
 fn decode_timestamp_body(tlv: &mut Tlv, buf: &mut &[u8]) -> Option<()> {
@@ -756,6 +846,10 @@ enum SubTlvKind {
     Pad1 = 0,
     PadN = 1,
     Timestamp = 3,
+    /// Marks an Update as nonexclusive (see [`Tlv::Update`]). This implementation's own, of a
+    /// non-mandatory type reserved for Experimental Use (RFC 8966 §5): an implementation that
+    /// ignores it still uses the route as it is.
+    Nonexclusive = 112,
 }
 
 /// An error occurred when decoding a sub-TLV.

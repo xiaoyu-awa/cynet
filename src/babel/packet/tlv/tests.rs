@@ -56,6 +56,7 @@ fn update(ae: Ae, flags: u8, plen: u8, omitted: u8, metric: u16, bytes: &[u8]) -
         seqno: Seqno::new(7),
         metric,
         prefix: prefix(bytes),
+        nonexclusive: false,
     }
 }
 
@@ -69,6 +70,25 @@ fn seqno_request(ae: Ae, plen: u8, bytes: &[u8]) -> Tlv {
         router_id: router_id(RID),
         prefix: prefix(bytes),
     }
+}
+
+/// Returns a Conflict Alert TLV with Hops Away 3.
+fn conflict_alert(ae: Ae, plen: u8, bytes: &[u8]) -> Tlv {
+    Tlv::ConflictAlert {
+        ae,
+        plen,
+        hops_away: NonZeroU8::new(3).unwrap(),
+        prefix: prefix(bytes),
+    }
+}
+
+/// Returns `tlv`, an Update TLV, marked nonexclusive.
+fn nonexclusive(mut tlv: Tlv) -> Tlv {
+    let Tlv::Update { nonexclusive, .. } = &mut tlv else {
+        unreachable!()
+    };
+    *nonexclusive = true;
+    tlv
 }
 
 /// Encodes a TLV into a buffer of exactly its encoded length.
@@ -176,6 +196,11 @@ fn wire_format() {
             update(V4ViaV6, 0, 32, 4, METRIC_INFINITY, &[]),
             &[8, 10, 4, 0, 32, 4, 1, 0x90, 0, 7, 0xff, 0xff],
         ),
+        // A nonexclusive update carries a Nonexclusive sub-TLV, with no body.
+        (
+            nonexclusive(update(Ipv4, P, 24, 0, 96, &[10, 1, 2])),
+            &[8, 15, 1, 0x80, 24, 0, 1, 0x90, 0, 7, 0, 96, 10, 1, 2, 112, 0],
+        ),
         (Tlv::RouteRequest { ae: Wildcard, plen: 0, prefix: [0; 16] }, &[9, 2, 0, 0]),
         (
             Tlv::RouteRequest { ae: Ipv6, plen: 48, prefix: prefix(&[0x20, 0x01, 0x0d, 0xb8, 0, 1]) },
@@ -196,6 +221,11 @@ fn wire_format() {
                 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef,
                 0x20, 0x01, 0x0d, 0xb8, 0, 1, 0, 2,
             ],
+        ),
+        (conflict_alert(Ipv4, 32, &[10, 0, 0, 1]), &[224, 8, 1, 32, 3, 0, 10, 0, 0, 1]),
+        (
+            conflict_alert(Ipv6, 64, &[0x20, 0x01, 0x0d, 0xb8, 0, 1, 0, 2]),
+            &[224, 12, 2, 64, 3, 0, 0x20, 0x01, 0x0d, 0xb8, 0, 1, 0, 2],
         ),
     ];
 
@@ -266,6 +296,18 @@ fn decode_tolerates_what_it_may_ignore() {
             ],
             seqno_request(Ipv6, 12, &[0x20, 0x10]),
         ),
+        (&[224, 6, 2, 12, 3, 0, 0x20, 0x1f], conflict_alert(Ipv6, 12, &[0x20, 0x10])),
+        // The Reserved field of a Conflict Alert is ignored.
+        (&[224, 8, 1, 32, 3, 0xff, 10, 0, 0, 1], conflict_alert(Ipv4, 32, &[10, 0, 0, 1])),
+        // Conflict Alerts with AE 4 are accepted too, though never sent.
+        (&[224, 7, 4, 24, 3, 0, 10, 1, 2], conflict_alert(V4ViaV6, 24, &[10, 1, 2])),
+        // Nonexclusive sub-TLVs with a body are accepted, leaving room for one later.
+        (
+            &[8, 17, 1, 0x80, 24, 0, 1, 0x90, 0, 7, 0, 96, 10, 1, 2, 112, 2, 0, 0],
+            nonexclusive(update(Ipv4, P, 24, 0, 96, &[10, 1, 2])),
+        ),
+        // Those on other TLVs are ignored.
+        (&[4, 8, 0, 0, 1, 2, 1, 0x90, 112, 0], hello(Some(400), None)),
     ];
 
     for (bytes, tlv) in cases {
@@ -316,11 +358,18 @@ fn decode_errors() {
         (vec![10, 18, 1, 32, 1, 2, 64, 0, 0, 0, 0, 0, 0, 0, 0, 0, 10, 0, 0, 1], Malformed),
         (vec![10, 18, 1, 32, 1, 2, 64, 0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 10, 0, 0, 1], Malformed),
         (vec![10, 16, 2, 128, 1, 2, 64, 0, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x20, 0x01], Malformed),
+        (vec![224, 3, 1, 32, 3], Malformed),
+        (vec![224, 4, 0, 0, 3, 0], Malformed),
+        (vec![224, 12, 3, 64, 3, 0, 0, 0, 0, 0, 0, 0, 0, 1], Malformed),
+        (vec![224, 8, 1, 32, 0, 0, 10, 0, 0, 1], Malformed),
+        (vec![224, 9, 1, 33, 3, 0, 10, 0, 0, 1, 0], Malformed),
+        (vec![224, 6, 2, 48, 3, 0, 0x20, 0x01], Malformed),
 
         // Unknown mandatory or overrunning sub-TLVs.
         (encode_tlv_with_sub_tlv(&hello(Some(400), None), &[0x80, 0]), Ignored),
         (encode_tlv_with_sub_tlv(&hello(Some(400), None), &[1, 1]), Ignored),
         (encode_tlv_with_sub_tlv(&hello(Some(400), None), &[1]), Ignored),
+        (encode_tlv_with_sub_tlv(&conflict_alert(Ipv4, 32, &[10, 0, 0, 1]), &[0x80, 0]), Ignored),
 
         // Ignored Router-Id TLVs still establish the router-id...
         (
@@ -395,4 +444,11 @@ encode_panics! {
     encode_seqno_request_with_unmasked_prefix:
         seqno_request(Ipv6, 12, &[0x20, 0x1f])
             => "Seqno Request should not carry a prefix with bits set beyond Plen",
+    encode_conflict_alert_with_ae_4:
+        conflict_alert(V4ViaV6, 24, &[10, 1, 2]) => "Conflict Alert should not carry AE 0, 3, or 4",
+    encode_conflict_alert_with_overlarge_plen:
+        conflict_alert(Ipv4, 33, &[]) => "Conflict Alert should not carry overlarge Plen",
+    encode_conflict_alert_with_unmasked_prefix:
+        conflict_alert(Ipv6, 12, &[0x20, 0x1f])
+            => "Conflict Alert should not carry a prefix with bits set beyond Plen",
 }

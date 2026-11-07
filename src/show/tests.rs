@@ -1,14 +1,21 @@
-use std::{fs, os::unix::net, path::PathBuf, time::Duration};
+use std::{
+    collections::HashSet,
+    fs,
+    os::unix::net,
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 
 use gotatun::x25519::{PublicKey, StaticSecret};
+use ipnet::IpNet;
 use tokio::{
-    io::AsyncWriteExt,
+    io::{AsyncReadExt, AsyncWriteExt},
     net::{UnixListener, UnixStream},
 };
 
 use super::{
-    format_age, format_bytes, format_neighbour, format_status, read_request, read_status,
-    short_key, strip_colors,
+    format_age, format_bytes, format_conflicts, format_neighbour, format_status, read_request,
+    read_status, short_key, strip_colors,
 };
 use crate::{
     babel::{
@@ -16,10 +23,18 @@ use crate::{
         snapshot::{NeighbourSnapshot, PrefixSnapshot, PrefixStatus, RouteSnapshot, Snapshot},
     },
     config::encode_key,
+    conflicts::{ConflictKey, Ongoing, Seen},
 };
 
 fn key(n: u8) -> PublicKey {
     PublicKey::from(&StaticSecret::from([n; 32]))
+}
+
+/// Formats the status of an interface up for 61 seconds, with no peers, marking the prefixes in
+/// `conflicted`.
+fn status(snapshot: &Snapshot<PublicKey>, conflicted: &HashSet<IpNet>) -> String {
+    let uptime = Duration::from_secs(61);
+    format_status("cyn0", &key(1), 51820, uptime, &[], snapshot, conflicted)
 }
 
 #[test]
@@ -60,12 +75,13 @@ fn status_has_the_colors_of_wg_show() {
         neighbours: vec![],
         prefixes: vec![PrefixSnapshot {
             prefix: "10.42.0.1/32".parse().unwrap(),
-            status: PrefixStatus::Injected,
+            status: PrefixStatus::Injected {
+                nonexclusive: false,
+            },
             routes: vec![],
         }],
     };
-    let uptime = Duration::from_secs(61);
-    let text = format_status("cyn0", &key(1), 51820, uptime, &[], &snapshot, false);
+    let text = status(&snapshot, &HashSet::new());
 
     assert!(
         text.starts_with("\x1b[32m\x1b[1minterface\x1b[0m: \x1b[32mcyn0\x1b[0m\n"),
@@ -107,6 +123,7 @@ fn snapshot_with_routes(a: PublicKey, b: PublicKey) -> Snapshot<PublicKey> {
         metric,
         smoothed_metric: metric.saturating_add(2),
         feasible,
+        nonexclusive: false,
     };
     Snapshot {
         router_id: RouterId::new(0x8f3a_21c0_7d19_e4b6).unwrap(),
@@ -115,7 +132,9 @@ fn snapshot_with_routes(a: PublicKey, b: PublicKey) -> Snapshot<PublicKey> {
         prefixes: vec![
             PrefixSnapshot {
                 prefix: "10.42.0.1/32".parse().unwrap(),
-                status: PrefixStatus::Injected,
+                status: PrefixStatus::Injected {
+                    nonexclusive: false,
+                },
                 routes: vec![],
             },
             PrefixSnapshot {
@@ -138,57 +157,14 @@ fn snapshot_with_routes(a: PublicKey, b: PublicKey) -> Snapshot<PublicKey> {
 }
 
 #[test]
-fn routes_are_listed_with_the_selected_one_first() {
+fn routes_are_listed_with_what_their_choice_is_based_on() {
     let (a, b) = (key(2), key(3));
     let snapshot = snapshot_with_routes(a, b);
-    let uptime = Duration::from_secs(61);
-    let text = strip_colors(&format_status(
-        "cyn0",
-        &key(1),
-        51820,
-        uptime,
-        &[],
-        &snapshot,
-        false,
-    ));
-    let (key_a, key_b) = (short_key(&a), short_key(&b));
-
-    let expected = format!(
-        "interface: cyn0\n\
-         \x20 public key: {}\n\
-         \x20 listening port: 51820\n\
-         \x20 uptime: 1 minute, 1 second\n\
-         \n\
-         routes:\n\
-         \x20 10.42.0.1/32  injected\n\
-         \x20 10.42.0.2/32  via {key_b}, metric 96\n\
-         \x20               not via {key_a}, metric 342\n\
-         \x20 10.42.0.9/32  unreachable (held)\n\
-         \x20               not via {key_a}, metric infinite\n\
-         \x20 fd42::7/128   no route selected\n\
-         \x20               not via {key_a}, metric 500\n",
-        encode_key(key(1).as_bytes())
-    );
-    assert_eq!(text, expected);
-}
-
-#[test]
-fn verbose_status_adds_what_route_choices_are_based_on() {
-    let (a, b) = (key(2), key(3));
-    let snapshot = snapshot_with_routes(a, b);
-    let uptime = Duration::from_secs(61);
-    let text = strip_colors(&format_status(
-        "cyn0",
-        &key(1),
-        51820,
-        uptime,
-        &[],
-        &snapshot,
-        true,
-    ));
+    let text = strip_colors(&status(&snapshot, &HashSet::new()));
     let (key_a, key_b) = (short_key(&a), short_key(&b));
     let source = "rid 0000000000003c7e, seqno 812";
 
+    // A prefix's status goes beside it, and its routes below it, the selected one first.
     let expected = format!(
         "interface: cyn0\n\
          \x20 public key: {}\n\
@@ -202,7 +178,7 @@ fn verbose_status_adds_what_route_choices_are_based_on() {
          \x20   via {key_b}, metric 96 (98), {source}\n\
          \x20   not via {key_a}, metric 342 (344), {source}, feasible\n\
          \x20 10.42.0.9/32  unreachable (held)\n\
-         \x20   not via {key_a}, metric infinite (infinite), {source}\n\
+         \x20   not via {key_a}, metric infinity (65535), {source}, unfeasible\n\
          \x20 fd42::7/128   no route selected\n\
          \x20   not via {key_a}, metric 500 (502), {source}, unfeasible\n",
         encode_key(key(1).as_bytes())
@@ -210,13 +186,99 @@ fn verbose_status_adds_what_route_choices_are_based_on() {
     assert_eq!(text, expected);
 }
 
+#[test]
+fn nonexclusive_prefixes_say_so_with_their_routes_below_them() {
+    let (a, b) = (key(2), key(3));
+    let route = |via, metric| RouteSnapshot {
+        via,
+        router_id: RouterId::new(0x3c7e).unwrap(),
+        seqno: Seqno::new(812),
+        metric,
+        smoothed_metric: metric,
+        feasible: true,
+        nonexclusive: true,
+    };
+    let snapshot = Snapshot {
+        router_id: RouterId::new(1).unwrap(),
+        seqno: Seqno::new(7),
+        neighbours: vec![],
+        prefixes: vec![
+            // Another origin's route, beside the one this node injects.
+            PrefixSnapshot {
+                prefix: "0.0.0.0/0".parse().unwrap(),
+                status: PrefixStatus::Injected { nonexclusive: true },
+                routes: vec![route(a, 200)],
+            },
+            PrefixSnapshot {
+                prefix: "10.42.0.9/32".parse().unwrap(),
+                status: PrefixStatus::Selected(b),
+                routes: vec![route(a, 342), route(b, 96)],
+            },
+            PrefixSnapshot {
+                prefix: "10.42.0.10/32".parse().unwrap(),
+                status: PrefixStatus::Held,
+                routes: vec![route(a, u16::MAX)],
+            },
+        ],
+    };
+    let colored = status(&snapshot, &HashSet::new());
+    let text = strip_colors(&colored);
+    let routes = &text[text.find("routes:\n").unwrap()..];
+
+    let (key_a, key_b) = (short_key(&a), short_key(&b));
+
+    let source = "rid 0000000000003c7e, seqno 812";
+    assert_eq!(
+        routes,
+        format!(
+            "routes:\n\
+             \x20 0.0.0.0/0      injected, nonexclusive\n\
+             \x20   not via {key_a}, metric 200 (200), {source}, feasible\n\
+             \x20 10.42.0.9/32   nonexclusive\n\
+             \x20   via {key_b}, metric 96 (96), {source}\n\
+             \x20   not via {key_a}, metric 342 (342), {source}, feasible\n\
+             \x20 10.42.0.10/32  unreachable (held), nonexclusive\n\
+             \x20   not via {key_a}, metric infinity (65535), {source}, feasible\n"
+        )
+    );
+}
+
+#[test]
+fn prefixes_with_conflicts_that_go_on_say_so_last() {
+    let (a, b) = (key(2), key(3));
+    let mut snapshot = snapshot_with_routes(a, b);
+    for route in &mut snapshot.prefixes[1].routes {
+        route.nonexclusive = true;
+    }
+    let conflicted = snapshot.prefixes.iter().map(|entry| entry.prefix).collect();
+    let colored = status(&snapshot, &conflicted);
+    let text = strip_colors(&colored);
+    let prefixes: Vec<_> = (text.lines())
+        .filter(|line| line.starts_with("  ") && !line.starts_with("    "))
+        .skip_while(|line| !line.starts_with("  10.42.0.1/32"))
+        .collect();
+
+    assert_eq!(
+        prefixes,
+        [
+            "  10.42.0.1/32  injected, conflicted",
+            "  10.42.0.2/32  nonexclusive, conflicted",
+            "  10.42.0.9/32  unreachable (held), conflicted",
+            "  fd42::7/128   no route selected, conflicted",
+        ]
+    );
+    assert!(
+        colored.contains("  10.42.0.2\x1b[36m/\x1b[0m32  \x1b[35mnonexclusive\x1b[0m, \x1b[31mconflicted\x1b[0m\n"),
+        "{colored:?}"
+    );
+}
+
 /// The labels of a selected route are bold, and an unselected route stays dimmed to the end.
 #[test]
-fn verbose_route_lines_keep_their_colors() {
+fn route_lines_keep_their_colors() {
     let (a, b) = (key(2), key(3));
     let snapshot = snapshot_with_routes(a, b);
-    let uptime = Duration::from_secs(61);
-    let text = format_status("cyn0", &key(1), 51820, uptime, &[], &snapshot, true);
+    let text = status(&snapshot, &HashSet::new());
 
     let selected = "\x1b[1mmetric\x1b[0m 96 (98), \
                     \x1b[1mrid\x1b[0m 0000000000003c7e, \x1b[1mseqno\x1b[0m 812\n";
@@ -230,7 +292,45 @@ fn verbose_route_lines_keep_their_colors() {
 }
 
 #[test]
-fn links_are_shown_with_more_detail_when_verbose() {
+fn ongoing_conflicts_are_listed_last() {
+    let p = "fd42::/64".parse().unwrap();
+    let q = "10.42.0.9/32".parse().unwrap();
+    let now = Instant::now() + Duration::from_secs(125);
+    let conflict = |prefix, seen, hops, n, secs| Ongoing {
+        key: ConflictKey {
+            prefix,
+            seen,
+            from: key(n),
+        },
+        hops,
+        since: now - Duration::from_secs(secs),
+    };
+    let conflicts = [
+        conflict(q, Seen::Learnt, 1, 2, 5),
+        conflict(p, Seen::Directly, 0, 2, 125),
+        conflict(p, Seen::Learnt, 3, 3, 61),
+    ];
+
+    let text = strip_colors(&format_conflicts(&conflicts, now));
+    let (k2, k3) = (short_key(&key(2)), short_key(&key(3)));
+    assert_eq!(
+        text,
+        format!(
+            "\nconflicts:\n\
+             \x20 10.42.0.9/32\n\
+             \x20   1 hop away via {k2}, for 5 seconds\n\
+             \x20 fd42::/64\n\
+             \x20   directly with {k2}, for 2 minutes, 5 seconds\n\
+             \x20   3 hops away via {k3}, for 1 minute, 1 second\n"
+        )
+    );
+
+    // With none, there is no section at all.
+    assert_eq!(format_conflicts(&[], now), "");
+}
+
+#[test]
+fn links_are_shown_with_what_makes_up_their_cost() {
     let neighbour = NeighbourSnapshot {
         key: key(2),
         cost: 99,
@@ -241,24 +341,20 @@ fn links_are_shown_with_more_detail_when_verbose() {
         hello_history: 0b1011,
         in_startup: false,
     };
-    let format = |neighbour: &NeighbourSnapshot<PublicKey>, verbose| {
+    let format = |neighbour: &NeighbourSnapshot<PublicKey>| {
         let mut out = String::new();
-        format_neighbour(&mut out, neighbour, verbose);
+        format_neighbour(&mut out, neighbour);
         out
     };
 
     assert_eq!(
-        strip_colors(&format(&neighbour, false)),
-        "  link cost: 99, rtt: 12.3 ms\n"
-    );
-    assert_eq!(
-        strip_colors(&format(&neighbour, true)),
+        strip_colors(&format(&neighbour)),
         "  link cost: 99, rtt: 12.3 ms\n\
          \x20 rxcost: 96, txcost: 96, rtt penalty: 3\n\
          \x20 hello history: 0000000000001011 (latest last)\n"
     );
 
-    // A link that doesn't work stands out, and a peer that has yet to answer says so when asked.
+    // A link that doesn't work stands out, and a peer that has yet to answer says so.
     let starting = NeighbourSnapshot {
         cost: u16::MAX,
         rtt: None,
@@ -269,14 +365,15 @@ fn links_are_shown_with_more_detail_when_verbose() {
         in_startup: true,
         ..neighbour
     };
-    assert_eq!(
-        format(&starting, false),
-        "  \x1b[1mlink cost\x1b[0m: \x1b[31minfinite\x1b[0m\n"
+    assert!(
+        format(&starting).starts_with("  \x1b[1mlink cost\x1b[0m: \x1b[31minfinity\x1b[0m\n"),
+        "{:?}",
+        format(&starting)
     );
     assert_eq!(
-        strip_colors(&format(&starting, true)),
-        "  link cost: infinite\n\
-         \x20 rxcost: infinite, txcost: infinite, rtt penalty: 0\n\
+        strip_colors(&format(&starting)),
+        "  link cost: infinity\n\
+         \x20 rxcost: infinity, txcost: infinity, rtt penalty: 0\n\
          \x20 hello history: 0000000000000000 (latest last)\n\
          \x20 startup: waiting for an acknowledgement\n"
     );
@@ -290,48 +387,45 @@ fn socket_path(label: &str) -> PathBuf {
 }
 
 #[tokio::test]
-async fn status_comes_from_a_running_daemon_as_asked_for() {
-    for verbose in [false, true] {
-        let path = socket_path(&format!("running-{verbose}"));
-        let listener = UnixListener::bind(&path).unwrap();
-        let daemon = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let verbose = read_request(&mut stream).await;
-            let text = format!("verbose: {verbose}\n");
-            stream.write_all(text.as_bytes()).await.unwrap();
-        });
+async fn status_comes_from_a_running_daemon() {
+    let path = socket_path("running");
+    let listener = UnixListener::bind(&path).unwrap();
+    let daemon = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        read_request(&mut stream).await;
+        stream.write_all(b"status\n").await.unwrap();
+    });
 
-        let text = read_status(&path, verbose).await;
-        daemon.await.unwrap();
-        fs::remove_file(&path).unwrap();
+    let text = read_status(&path).await;
+    daemon.await.unwrap();
+    fs::remove_file(&path).unwrap();
 
-        assert_eq!(text.unwrap().unwrap(), format!("verbose: {verbose}\n"));
-    }
+    assert_eq!(text.unwrap().unwrap(), "status\n");
 }
 
-/// Anything else that a client says is no reason to stop it getting a status.
+/// Whatever a client says, it gets the status, including an older one asking for the verbose one.
 #[tokio::test]
-async fn other_requests_get_the_plain_status() {
-    for request in [
-        &b"verbos\n"[..],
-        b"verbose",
-        b"nonsense\n",
-        b"verbose\nmore",
-    ] {
+async fn every_request_gets_the_status() {
+    for request in [&b"verbose\n"[..], b"nonsense\n", &[b'x'; 64]] {
         let (mut daemon, mut client) = UnixStream::pair().unwrap();
         client.write_all(request).await.unwrap();
         client.shutdown().await.unwrap();
 
-        let verbose = read_request(&mut daemon).await;
-        assert_eq!(verbose, request.starts_with(b"verbose\n"), "{request:?}");
+        read_request(&mut daemon).await;
+        daemon.write_all(b"status\n").await.unwrap();
+        drop(daemon);
+
+        let mut text = String::new();
+        client.read_to_string(&mut text).await.unwrap();
+        assert_eq!(text, "status\n", "{request:?}");
     }
 }
 
 /// So does a client that keeps quiet without closing its side, such as `socat`, in the end.
 #[tokio::test(start_paused = true)]
-async fn silent_clients_get_the_plain_status() {
+async fn silent_clients_get_the_status_in_the_end() {
     let (mut daemon, _client) = UnixStream::pair().unwrap();
-    assert!(!read_request(&mut daemon).await);
+    read_request(&mut daemon).await;
 }
 
 /// A crash leaves the socket behind, with nothing listening on it.
@@ -341,7 +435,7 @@ async fn socket_left_by_a_crash_means_not_running() {
     drop(net::UnixListener::bind(&path).unwrap());
     assert!(path.exists());
 
-    let text = read_status(&path, false).await;
+    let text = read_status(&path).await;
     fs::remove_file(&path).unwrap();
 
     assert_eq!(text.unwrap(), None);
@@ -349,7 +443,7 @@ async fn socket_left_by_a_crash_means_not_running() {
 
 #[tokio::test]
 async fn missing_socket_means_not_running() {
-    let text = read_status(&socket_path("missing"), false).await;
+    let text = read_status(&socket_path("missing")).await;
     assert_eq!(text.unwrap(), None);
 }
 
@@ -359,7 +453,7 @@ async fn silent_daemon_is_an_error() {
     let path = socket_path("silent");
     let listener = UnixListener::bind(&path).unwrap();
 
-    let text = read_status(&path, false).await;
+    let text = read_status(&path).await;
     drop(listener);
     fs::remove_file(&path).unwrap();
 
@@ -372,7 +466,7 @@ async fn unusable_path_is_an_error() {
     let file = socket_path("file");
     fs::write(&file, "").unwrap();
 
-    let text = read_status(&file.join("cyn0.sock"), false).await;
+    let text = read_status(&file.join("cyn0.sock")).await;
     fs::remove_file(&file).unwrap();
 
     assert!(format!("{:#}", text.unwrap_err()).contains("failed to read"));

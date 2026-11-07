@@ -57,8 +57,12 @@ pub struct PrefixSnapshot<K> {
 /// How a node treats a prefix.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PrefixStatus<K> {
-    /// The node originates a route for the prefix.
-    Injected,
+    /// The node originates a route for the prefix, as nonexclusive or not (see
+    /// [Duplicate addresses](crate::babel::State#duplicate-addresses)).
+    Injected {
+        /// Whether other nodes may originate the prefix too.
+        nonexclusive: bool,
+    },
     /// The route through this neighbour is selected.
     Selected(K),
     /// The prefix is held, unreachable, after its selected route was lost.
@@ -83,4 +87,8 @@ pub struct RouteSnapshot<K> {
     /// Whether the route is feasible (RFC 8966 §3.5.1). This says nothing with an infinite metric,
     /// when the route can't be selected anyway.
     pub feasible: bool,
+    /// Whether the route is nonexclusive: other routers may originate its prefix too, and prefixes
+    /// inside it (see
+    /// [Duplicate addresses](crate::babel::State#duplicate-addresses)).
+    pub nonexclusive: bool,
 }

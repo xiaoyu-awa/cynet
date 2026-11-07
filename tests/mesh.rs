@@ -8,11 +8,14 @@ use std::{
 };
 
 use cynet::{
-    babel::{Interval, Params, snapshot::PrefixStatus},
+    babel::{
+        Interval, Params,
+        snapshot::{PrefixSnapshot, PrefixStatus},
+    },
     config::{Config, encode_key},
     daemon::Node,
     router::link_local_address,
-    show::strip_colors,
+    show::{short_key, strip_colors},
 };
 use gotatun::{
     device::DeviceBuilder,
@@ -212,25 +215,35 @@ impl TestNode {
         }
     }
 
-    async fn status_of(&self, prefix: &str) -> Option<PrefixStatus<PublicKey>> {
+    /// Returns what the node knows of a prefix, if anything.
+    async fn entry_of(&self, prefix: &str) -> Option<PrefixSnapshot<PublicKey>> {
         let prefix: IpNet = prefix.parse().unwrap();
         let snapshot = self.node.snapshot().await?;
-        (snapshot.prefixes.iter())
-            .find(|entry| entry.prefix == prefix)
-            .map(|entry| entry.status)
+        (snapshot.prefixes.into_iter()).find(|entry| entry.prefix == prefix)
+    }
+
+    async fn status_of(&self, prefix: &str) -> Option<PrefixStatus<PublicKey>> {
+        Some(self.entry_of(prefix).await?.status)
     }
 
     /// Waits until the node has selected a route to a prefix, through a certain peer.
     async fn wait_for_route(&self, prefix: &str, via: u8) {
-        let done = async {
-            while self.status_of(prefix).await != Some(PrefixStatus::Selected(public(via))) {
-                sleep(Duration::from_millis(20)).await;
-            }
-        };
-        timeout(PATIENCE, done)
-            .await
-            .unwrap_or_else(|_| panic!("the route to {prefix} should be selected"));
+        let selected = Some(PrefixStatus::Selected(public(via)));
+        let what = format!("the route to {prefix} should be selected");
+        wait_until(&what, async || self.status_of(prefix).await == selected).await;
     }
+}
+
+/// Waits until `done` holds, checking it every 20 ms, or panics with `what` should have happened.
+async fn wait_until(what: &str, mut done: impl AsyncFnMut() -> bool) {
+    let poll = async {
+        while !done().await {
+            sleep(Duration::from_millis(20)).await;
+        }
+    };
+    timeout(PATIENCE, poll)
+        .await
+        .unwrap_or_else(|_| panic!("{what}"));
 }
 
 /// The Internet checksum, written apart from the code under test.
@@ -418,8 +431,8 @@ async fn chain_forwards_and_answers_with_icmp() {
     a.send(&ipv4("10.42.0.1", "10.42.0.3", 64, 1380)).await;
     assert_eq!(c.recv().await.len(), 1400);
 
-    // The status lists every peer and route.
-    let text = strip_colors(&chain.b.node.status().text("cyn0", false).await.unwrap());
+    // The status lists every peer and route, with what Babel bases its choice of routes on.
+    let text = status_text(&chain.b).await;
     for needle in [
         "interface: cyn0",
         "10.42.0.1/32",
@@ -429,20 +442,15 @@ async fn chain_forwards_and_answers_with_icmp() {
         "injected",
         "via",
         "latest handshake",
+        "seqno",
+        "rxcost",
+        "hello history",
     ] {
         assert!(text.contains(needle), "{needle} should be in:\n{text}");
     }
     for peer in [1, 3] {
         let key = encode_key(public(peer).as_bytes());
         assert!(text.contains(&format!("peer: {key}")), "{text}");
-    }
-    for needle in ["seqno", "rxcost", "hello history"] {
-        assert!(!text.contains(needle), "{needle} should not be in:\n{text}");
-    }
-
-    let text = strip_colors(&chain.b.node.status().text("cyn0", true).await.unwrap());
-    for needle in ["seqno", "rxcost", "hello history"] {
-        assert!(text.contains(needle), "{needle} should be in:\n{text}");
     }
 }
 
@@ -638,4 +646,182 @@ async fn hostname_endpoints_are_resolved() {
 
     a.send(&ipv4("10.42.0.1", "10.42.0.2", 64, 100)).await;
     assert_eq!(b.recv().await.len(), 120);
+}
+
+/// Starts a chain of three nodes, A - B - C, on the IPv4 mesh, where node A is attached to
+/// `network`, and node C has `c_addresses` beside its own and is attached to `c_attached`, and
+/// waits until each end reaches the other.
+async fn conflict_chain(
+    network: &'static str,
+    c_addresses: &[&'static str],
+    c_attached: &[&'static str],
+) -> (TestNode, TestNode, TestNode) {
+    let (port_a, port_b, port_c) = (free_port(), free_port(), free_port());
+    let endpoint = |port| Some(format!("127.0.0.1:{port}"));
+
+    let b = TestNode::start(&NodeSpec::new(
+        2,
+        port_b,
+        vec!["10.42.0.2"],
+        vec![(1, endpoint(port_a)), (3, endpoint(port_c))],
+    ))
+    .await;
+    let a = TestNode::start(&NodeSpec {
+        attached: vec![network],
+        ..NodeSpec::new(1, port_a, vec!["10.42.0.1"], vec![(2, endpoint(port_b))])
+    })
+    .await;
+    let c_addresses = iter::once("10.42.0.3").chain(c_addresses.iter().copied());
+    let c = TestNode::start(&NodeSpec {
+        attached: c_attached.to_vec(),
+        ..NodeSpec::new(
+            3,
+            port_c,
+            c_addresses.collect(),
+            vec![(2, endpoint(port_b))],
+        )
+    })
+    .await;
+
+    a.wait_for_route("10.42.0.3/32", 2).await;
+    c.wait_for_route("10.42.0.1/32", 2).await;
+    (a, b, c)
+}
+
+/// Waits until every one of `nodes` lists a conflict.
+async fn wait_for_conflicts(nodes: &[&TestNode]) {
+    wait_until("every node should report the conflict", async || {
+        for node in nodes {
+            if !status_text(node).await.contains("\nconflicts:\n") {
+                return false;
+            }
+        }
+        true
+    })
+    .await;
+}
+
+/// Returns the router-ids of the routes that a node has learnt for a prefix.
+async fn router_ids(node: &TestNode, prefix: &str) -> Vec<u64> {
+    node.entry_of(prefix).await.map_or(vec![], |entry| {
+        let routes = entry.routes.iter();
+        routes.map(|route| route.router_id.get()).collect()
+    })
+}
+
+/// Returns a node's plain status, without colors.
+async fn status_text(node: &TestNode) -> String {
+    strip_colors(&node.node.status().text("cyn0").await.unwrap())
+}
+
+/// A network attached at two nodes, unmarked, is exclusive to each, so they conflict over it. Node
+/// B keeps the route it learnt first and rejects the other, and the conflict shows in the status of
+/// every node, the originators included, which can be traced from one to the other.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_network_attached_at_two_nodes_is_reported_as_a_conflict() {
+    let shared = "10.42.9.0/24";
+    let (a, b, c) = conflict_chain(shared, &[], &[shared]).await;
+    wait_for_conflicts(&[&a, &b, &c]).await;
+    let texts = [
+        status_text(&a).await,
+        status_text(&b).await,
+        status_text(&c).await,
+    ];
+
+    // Node B has a route through one of the others only.
+    assert_eq!(router_ids(&b, "10.42.9.0/24").await.len(), 1);
+
+    // Node B rejects updates from one end, and alerts the other, which it routes through. That
+    // one learns of the conflict 1 hop away, and the end whose route node B rejects rejects node
+    // B's.
+    let [text_a, text_b, text_c] = &texts;
+    let (learnt, direct, rejected) = if text_a.contains("away via") {
+        (text_a, text_c, 3)
+    } else {
+        (text_c, text_a, 1)
+    };
+    // Each conflict goes on a line of its own, under a line for its prefix.
+    let conflict = |line: String| format!("\nconflicts:\n  10.42.9.0/24\n    {line}, for ");
+    let learnt_line = conflict(format!("1 hop away via {}", short(2)));
+    assert!(learnt.contains(&learnt_line), "{learnt}");
+    let direct_line = conflict(format!("directly with {}", short(2)));
+    assert!(direct.contains(&direct_line), "{direct}");
+    let b_line = conflict(format!("directly with {}", short(rejected)));
+    assert!(text_b.contains(&b_line), "{text_b}");
+
+    // Among each node's routes, the prefix says so too, last.
+    for (text, beside) in [
+        (text_a, "injected, conflicted"),
+        (text_b, "conflicted"),
+        (text_c, "injected, conflicted"),
+    ] {
+        let line = format!("\n  10.42.9.0/24  {beside}\n");
+        assert!(text.contains(&line), "{text}");
+    }
+}
+
+/// Returns the first characters of a node's key, as `cynet show` names a neighbour.
+fn short(n: u8) -> String {
+    short_key(&public(n))
+}
+
+/// A network attached at two nodes and marked nonexclusive at both is routed to both, as before
+/// conflicts were detected, with none listed, and listed as nonexclusive among the routes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_network_attached_at_two_nodes_as_nonexclusive_is_routed_to_both() {
+    let shared = "nonexclusive,10.42.9.0/24";
+    let (a, b, c) = conflict_chain(shared, &[], &[shared]).await;
+    wait_until("node B should keep a route through each end", async || {
+        let mut ids = router_ids(&b, "10.42.9.0/24").await;
+        ids.sort_unstable();
+        ids.dedup();
+        ids.len() == 2
+    })
+    .await;
+
+    for node in [&a, &b, &c] {
+        let text = status_text(node).await;
+        assert!(!text.contains("\nconflicts:\n"), "{text}");
+    }
+
+    // The ends say they originate it as nonexclusive. Node B says its routes are nonexclusive, and
+    // puts them below the prefix.
+    for node in [&a, &c] {
+        let text = status_text(node).await;
+        assert!(
+            text.contains("\n  10.42.9.0/24  injected, nonexclusive\n"),
+            "{text}"
+        );
+    }
+    let text = status_text(&b).await;
+    let routes = "\n  10.42.9.0/24  nonexclusive\n    via ";
+    assert!(text.contains(routes), "{text}");
+    assert!(text.contains("\n    not via "), "{text}");
+}
+
+/// An address inside a network that another node is attached to, unmarked, would take an address
+/// of that network, so the two conflict, and node B keeps one of them only.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_address_inside_another_nodes_exclusive_network_conflicts() {
+    let (a, b, c) = conflict_chain("10.42.9.0/24", &["10.42.9.3"], &[]).await;
+    wait_for_conflicts(&[&a, &b, &c]).await;
+
+    let network = router_ids(&b, "10.42.9.0/24").await;
+    let address = router_ids(&b, "10.42.9.3/32").await;
+    assert_eq!(network.len() + address.len(), 1, "{network:?}, {address:?}");
+}
+
+/// The same address is routed beside the network once the network is marked nonexclusive, as the
+/// longest match takes it to node C.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_address_inside_another_nodes_nonexclusive_network_is_routed_beside_it() {
+    let (a, b, c) = conflict_chain("nonexclusive,10.42.9.0/24", &["10.42.9.3"], &[]).await;
+
+    b.wait_for_route("10.42.9.0/24", 1).await;
+    b.wait_for_route("10.42.9.3/32", 3).await;
+    a.wait_for_route("10.42.9.3/32", 2).await;
+    for node in [&a, &b, &c] {
+        let text = status_text(node).await;
+        assert!(!text.contains("\nconflicts:\n"), "{text}");
+    }
 }

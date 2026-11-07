@@ -13,6 +13,7 @@ use gotatun::{
     udp::UdpTransportFactory,
     x25519::PublicKey,
 };
+use parking_lot::Mutex;
 use tokio::{
     net::lookup_host,
     signal::unix::{SignalKind, signal},
@@ -28,6 +29,7 @@ use crate::{
         snapshot::Snapshot,
     },
     config::{Config, Endpoint, encode_key},
+    conflicts::ConflictLog,
     netconf,
     router::{Router, RouterConfig, local_prefixes},
     show::{ShowServer, Status},
@@ -47,6 +49,10 @@ const INITIAL_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How long to wait for the driver to say goodbye to every neighbour.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How often to look for conflicts over prefixes that have ended, to log their end. `cynet show`
+/// leaves them out as soon as they end, whenever it looks.
+const CONFLICT_EXPIRY_CHECK: Duration = Duration::from_secs(5);
 
 /// Generates a random router-id, new on every start: the feasibility distances that other nodes
 /// keep for this node's earlier router-ids can't get in the way.
@@ -74,6 +80,7 @@ pub struct Node<T: DeviceTransports> {
     router_id: RouterId,
     public_key: PublicKey,
     started: Instant,
+    conflicts: Arc<Mutex<ConflictLog>>,
     driver: thread::JoinHandle<()>,
     outputs_task: JoinHandle<()>,
     endpoints_task: Option<JoinHandle<()>>,
@@ -96,6 +103,7 @@ where
         let router_id = random_router_id();
 
         params.set_mtu(config.mtu);
+        let conflicts = Arc::new(Mutex::new(ConflictLog::new(params.get_conflict_expiry())));
 
         let (inputs, inputs_rx) = mpsc::channel(INPUT_CAPACITY);
         let (outputs_tx, outputs) = mpsc::channel(OUTPUT_CAPACITY);
@@ -139,11 +147,18 @@ where
             .wrap_err("failed to start the WireGuard device")?;
         let device = Arc::new(device);
 
-        let prefixes = local_prefixes(&config.addresses, &config.attached).collect();
+        let prefixes = local_prefixes(&config.addresses, &config.attached)
+            .map(|prefix| (prefix, config.nonexclusive.contains(&prefix)))
+            .collect();
         let driver = driver::spawn(params, router_id, prefixes, inputs_rx, outputs_tx)
             .wrap_err("failed to start the Babel driver")?;
 
-        let outputs_task = tokio::spawn(handle_outputs(outputs, device.clone(), router));
+        let outputs_task = tokio::spawn(handle_outputs(
+            outputs,
+            device.clone(),
+            router,
+            conflicts.clone(),
+        ));
 
         // Endpoints are looked up before saying hello to their peers. The first startup packet to
         // a peer starts a handshake, and is lost as it has no session yet, and the next one goes
@@ -185,6 +200,7 @@ where
             router_id,
             public_key,
             started: Instant::now(),
+            conflicts,
             driver,
             outputs_task,
             endpoints_task,
@@ -200,6 +216,7 @@ impl<T: DeviceTransports> Node<T> {
             inputs: self.inputs.clone(),
             public_key: self.public_key,
             started: self.started,
+            conflicts: self.conflicts.clone(),
         }
     }
 
@@ -255,13 +272,31 @@ impl<T: DeviceTransports> Node<T> {
     }
 }
 
-/// Carries out what the driver asks for, until it stops.
+/// Carries out what the driver asks for, until it stops, and logs its reports of conflicts.
 async fn handle_outputs<T: DeviceTransports>(
     mut outputs: mpsc::Receiver<Output<PublicKey>>,
     device: Arc<Device<T>>,
     router: Arc<Router>,
+    conflicts: Arc<Mutex<ConflictLog>>,
 ) {
-    while let Some(output) = outputs.recv().await {
+    let mut expiry_checks = interval(CONFLICT_EXPIRY_CHECK);
+    expiry_checks.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+    loop {
+        let output = tokio::select! {
+            output = outputs.recv() => match output {
+                Some(output) => output,
+                None => break,
+            },
+            _ = expiry_checks.tick() => {
+                let ended = conflicts.lock().expire(driver::now());
+                for line in ended {
+                    line.log();
+                }
+                continue;
+            }
+        };
+
         match output {
             Output::Packet(peer, mut packet) => {
                 let packet = router.babel_packet_to(&peer, packet.timestamp(driver::now()));
@@ -280,6 +315,12 @@ async fn handle_outputs<T: DeviceTransports>(
             Output::RouteRemove(prefix) => {
                 tracing::debug!("route to {prefix} removed");
                 router.remove_route(prefix);
+            }
+            Output::ConflictAlert { prefix, from, kind } => {
+                let line = conflicts.lock().record(prefix, kind, from, driver::now());
+                if let Some(line) = line {
+                    line.log();
+                }
             }
         }
     }

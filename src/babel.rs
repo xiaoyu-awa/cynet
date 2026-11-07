@@ -20,6 +20,7 @@ use std::{
 };
 
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
+use prefix_trie::joint::JointPrefixSet;
 use slotmap::{SecondaryMap, SlotMap, SparseSecondaryMap, sparse_secondary};
 
 use crate::babel::{
@@ -268,6 +269,9 @@ struct RouteEntry {
     last_update_interval: Interval,
     /// The route's timer key: first for near-expiry, then for expiry.
     timer_key: TimerKey,
+    /// Whether the last update applied was nonexclusive (see
+    /// [Duplicate addresses](State#duplicate-addresses)).
+    nonexclusive: bool,
 }
 
 impl RouteEntry {
@@ -370,8 +374,9 @@ fn encode_prefix(prefix: IpNet, ipv4_ae: Ae) -> (Ae, u8, [u8; 16]) {
 /// The status of a prefix.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum PrefixStatus {
-    /// A route for the prefix is injected into the Babel domain by the local node.
-    Injected,
+    /// A route for the prefix is injected into the Babel domain by the local node, as nonexclusive
+    /// or not (see [Duplicate addresses](State#duplicate-addresses)).
+    Injected { nonexclusive: bool },
     /// The route through this neighbour is selected for the prefix.
     /// Its metric is finite, and it is feasible.
     ///
@@ -407,6 +412,8 @@ struct Advert {
     router_id: RouterId,
     seqno: Seqno,
     metric: u16,
+    /// Whether the route is nonexclusive, which a retraction leaves out.
+    nonexclusive: bool,
 }
 
 #[derive(Default)]
@@ -426,26 +433,147 @@ impl PrefixEntry {
     fn is_empty(&self) -> bool {
         self.status == PrefixStatus::None && self.routes.is_empty()
     }
+
+    /// Returns the sources in the entry for `prefix` (see
+    /// [Duplicate addresses](State#duplicate-addresses)): that of each route, with its neighbour,
+    /// and if this node injects the prefix, its own, with `own_router_id` and no route.
+    fn sources(
+        &self,
+        prefix: IpNet,
+        own_router_id: RouterId,
+    ) -> impl Iterator<Item = (Option<(NeighKey, &RouteEntry)>, Source)> {
+        let injected = match self.status {
+            PrefixStatus::Injected { nonexclusive } => {
+                let source = Source {
+                    prefix,
+                    router_id: own_router_id,
+                    nonexclusive,
+                };
+                Some((None, source))
+            }
+            _ => None,
+        };
+        let routes = self.routes.iter().map(move |(key, route)| {
+            let source = Source {
+                prefix,
+                router_id: route.router_id,
+                nonexclusive: route.nonexclusive,
+            };
+            (Some((key, route)), source)
+        });
+        injected.into_iter().chain(routes)
+    }
+}
+
+/// The source of a route or of an injected prefix, as far as duplicate addresses go (see
+/// [Duplicate addresses](State#duplicate-addresses)).
+#[derive(Clone, Copy, Debug)]
+struct Source {
+    prefix: IpNet,
+    router_id: RouterId,
+    nonexclusive: bool,
+}
+
+impl Source {
+    /// Checks whether two sources conflict: their router-ids differ, and the prefix of one
+    /// contains the other's, or is the same, and is exclusive.
+    fn conflicts_with(&self, other: &Source) -> bool {
+        let covers = |a: &Source, b: &Source| !a.nonexclusive && a.prefix.contains(&b.prefix);
+        self.router_id != other.router_id && (covers(self, other) || covers(other, self))
+    }
+}
+
+/// A source that an update conflicts with: the prefix of a route, through `via`, or of a prefix
+/// that this node injects, with no `via`.
+struct Conflicting {
+    prefix: IpNet,
+    via: Option<NeighKey>,
+    /// Whether it keeps the update from being taken in. A route with an infinite metric gives way
+    /// to it instead (see [`State::reject_conflicting_update`]).
+    blocks: bool,
 }
 
 #[derive(Default)]
 struct RouteTable {
     prefix_entries: HashMap<IpNet, PrefixEntry>,
+    /// The prefixes of `prefix_entries`, in a trie, for finding those that contain a prefix or that
+    /// a prefix contains (see [`Self::conflicting`]). Looking up and walking a trie cost far more
+    /// than they do in a hash map, so it serves that alone, and is kept up to date as entries come
+    /// and go.
+    prefixes: JointPrefixSet<IpNet>,
     neigh_prefixes: SecondaryMap<NeighKey, HashSet<IpNet>>,
 }
 
 impl RouteTable {
-    fn inject(&mut self, prefix: IpNet) -> bool {
+    fn inject(&mut self, prefix: IpNet, nonexclusive: bool) -> bool {
         match self.prefix_entries.entry(prefix) {
             hash_map::Entry::Occupied(_) => false,
             hash_map::Entry::Vacant(e) => {
                 e.insert(PrefixEntry {
-                    status: PrefixStatus::Injected,
+                    status: PrefixStatus::Injected { nonexclusive },
                     ..Default::default()
                 });
+                self.prefixes.insert(prefix);
                 true
             }
         }
+    }
+
+    /// Removes the entry for a prefix.
+    fn remove_entry(&mut self, prefix: &IpNet) {
+        assert!(self.prefix_entries.remove(prefix).is_some());
+        self.prefixes.remove(prefix);
+    }
+
+    /// Returns the sources that an update for `update.prefix` from neighbour `from` conflicts
+    /// with: routes and prefixes injected with `own_router_id`, for prefixes that contain the
+    /// update's prefix or that it contains, but for the route through `from` for its prefix,
+    /// which it replaces (see [Duplicate addresses](State#duplicate-addresses)).
+    fn conflicting(
+        &self,
+        from: NeighKey,
+        update: Source,
+        own_router_id: RouterId,
+    ) -> Vec<Conflicting> {
+        let mut found = Vec::new();
+        let mut look_at = |prefix: IpNet| {
+            let entry = &self.prefix_entries[&prefix];
+            for (route, source) in entry.sources(prefix, own_router_id) {
+                let via = route.map(|(key, _)| key);
+                let replaced = prefix == update.prefix && via == Some(from);
+                if replaced || !source.conflicts_with(&update) {
+                    continue;
+                }
+                // A prefix injected here blocks the update, and so does a route with a finite
+                // metric, even if it is unfeasible: a seqno request may still make it feasible,
+                // and another source shouldn't take over meanwhile. The selected route always has
+                // one. A route with an infinite metric goes over a link that has failed, and only
+                // waits to expire. Were it to block, a node that restarted with a new router-id
+                // could wait that long for its routes, and so could another node taking over its
+                // prefixes.
+                let blocks = route.is_none_or(|(_, r)| r.metric.get() != METRIC_INFINITY);
+                found.push(Conflicting {
+                    prefix,
+                    via,
+                    blocks,
+                });
+            }
+        };
+
+        // The prefixes that contain the update's, its own included, which conflict with it if
+        // they are exclusive, or it is and they are the same.
+        for prefix in self.prefixes.cover(&update.prefix) {
+            look_at(prefix);
+        }
+        // And those that it contains, which conflict with it if it is exclusive.
+        if !update.nonexclusive {
+            for prefix in self.prefixes.children(&update.prefix) {
+                if prefix != update.prefix {
+                    look_at(prefix);
+                }
+            }
+        }
+        found
     }
 
     /// Returns the status of the prefix, and the route entry for the prefix
@@ -457,22 +585,67 @@ impl RouteTable {
         key: NeighKey,
         f: impl FnOnce() -> RouteEntry,
     ) -> (PrefixStatus, Option<&mut RouteEntry>) {
-        let entry = self.prefix_entries.entry(prefix).or_default();
-        let route = match entry.routes.entry(key).unwrap() {
-            sparse_secondary::Entry::Occupied(e) => Some(e.into_mut()),
-            sparse_secondary::Entry::Vacant(e) => {
-                assert!(self.neigh_prefixes[key].insert(prefix));
-                e.insert(f());
-                None
+        let entry = match self.prefix_entries.entry(prefix) {
+            hash_map::Entry::Occupied(e) => e.into_mut(),
+            hash_map::Entry::Vacant(e) => {
+                self.prefixes.insert(prefix);
+                e.insert(PrefixEntry::default())
             }
         };
+        let route =
+            get_or_insert_route(&mut self.neigh_prefixes, &mut entry.routes, prefix, key, f);
         (entry.status, route)
+    }
+
+    /// Does what [`Self::get_or_insert_with`] does if the prefix already has a route from
+    /// `router_id`, as nonexclusive or not, through any neighbour, and otherwise returns `None`,
+    /// changing nothing. An update from such a source conflicts with nothing, as no two sources in
+    /// the table conflict, so this takes it in with no check (see
+    /// [Duplicate addresses](State#duplicate-addresses)). That covers the refreshes that make up
+    /// nearly all updates, and looks their prefix up once.
+    fn get_or_insert_with_known_source(
+        &mut self,
+        prefix: IpNet,
+        key: NeighKey,
+        router_id: RouterId,
+        nonexclusive: bool,
+        f: impl FnOnce() -> RouteEntry,
+    ) -> Option<(PrefixStatus, Option<&mut RouteEntry>)> {
+        let entry = self.prefix_entries.get_mut(&prefix)?;
+        let known = (entry.routes.values())
+            .any(|route| route.router_id == router_id && route.nonexclusive == nonexclusive);
+        if !known {
+            return None;
+        }
+        let route =
+            get_or_insert_route(&mut self.neigh_prefixes, &mut entry.routes, prefix, key, f);
+        Some((entry.status, route))
     }
 
     fn remove(&mut self, prefix: &IpNet, key: NeighKey) -> Option<RouteEntry> {
         let route = self.prefix_entries.get_mut(prefix)?.routes.remove(key)?;
         assert!(self.neigh_prefixes[key].remove(prefix));
         Some(route)
+    }
+}
+
+/// Returns the route through neighbour `key` among the `routes` to a prefix, or `None` if it is
+/// not present, in which case a new route returned by `f` is inserted, and recorded in
+/// `neigh_prefixes`.
+fn get_or_insert_route<'a>(
+    neigh_prefixes: &mut SecondaryMap<NeighKey, HashSet<IpNet>>,
+    routes: &'a mut SparseSecondaryMap<NeighKey, RouteEntry>,
+    prefix: IpNet,
+    key: NeighKey,
+    f: impl FnOnce() -> RouteEntry,
+) -> Option<&'a mut RouteEntry> {
+    match routes.entry(key).unwrap() {
+        sparse_secondary::Entry::Occupied(e) => Some(e.into_mut()),
+        sparse_secondary::Entry::Vacant(e) => {
+            assert!(neigh_prefixes[key].insert(prefix));
+            e.insert(f());
+            None
+        }
     }
 }
 
@@ -587,6 +760,7 @@ enum Timer {
     RouteHold(IpNet),
     StaleRouteRetraction(IpNet),
     SeqnoRequest(IpNet),
+    ConflictAlert((IpNet, NeighKey)),
     BufferFlush(NeighKey),
 }
 
@@ -601,6 +775,31 @@ pub enum Output<K = NeighKey> {
     RouteHold(IpNet),
     /// Removes the route to a prefix.
     RouteRemove(IpNet),
+    /// Reports a sign of a conflict over a prefix, which came from a neighbour, for tracing the
+    /// conflict by hand (see [Duplicate addresses](State#duplicate-addresses)).
+    ConflictAlert {
+        /// The prefix in conflict.
+        prefix: IpNet,
+        /// The neighbour that the rejected update or the Conflict Alert came from.
+        from: K,
+        /// What this node saw.
+        kind: ConflictAlertKind,
+    },
+}
+
+/// What a node saw of a conflict over a prefix (see
+/// [Duplicate addresses](State#duplicate-addresses)).
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum ConflictAlertKind {
+    /// This node rejected an update from the neighbour, whose route leads to another origin: the
+    /// routes from the two origins meet here.
+    Rejected,
+    /// A Conflict Alert came from the neighbour, which routes the prefix through this node: the
+    /// routes meet `hops` hops away, through the neighbour.
+    Alerted {
+        /// How many hops away the node that rejected an update is, as the alert says.
+        hops: NonZeroU8,
+    },
 }
 
 impl Output {
@@ -611,6 +810,11 @@ impl Output {
             Self::RouteSelect(prefix, key) => Output::RouteSelect(prefix, f(key)),
             Self::RouteHold(prefix) => Output::RouteHold(prefix),
             Self::RouteRemove(prefix) => Output::RouteRemove(prefix),
+            Self::ConflictAlert { prefix, from, kind } => Output::ConflictAlert {
+                prefix,
+                from: f(from),
+                kind,
+            },
         }
     }
 }
@@ -674,6 +878,53 @@ const FAR_HELLO_SEQNO_OFFSET: u16 = 0x8000;
 /// through it. That takes the packets to that neighbour being lost for the few seconds it takes
 /// the first to become usable, while those from it get through. It ends with the first startup
 /// packet to arrive, or when the neighbour counts two of this node's Hellos as missed.
+///
+/// # Duplicate addresses
+///
+/// A prefix that a node originates is exclusive to its router-id, unless it is injected as
+/// nonexclusive (see [`State::inject_route`]): no other router may originate it, nor any prefix
+/// inside it, which would take some of its addresses by the longest match. A nonexclusive prefix's
+/// updates carry a Nonexclusive sub-TLV, an experimental extension, which the nodes that advertise
+/// the route on keep.
+///
+/// Two sources conflict if their router-ids differ, and the prefix of one contains the other's,
+/// or is the same, and is exclusive. So an exclusive prefix conflicts with the same prefix, and any
+/// prefix inside it, from another router, while a nonexclusive one, such as a default route at each
+/// of several exit nodes, conflicts with nothing inside it. An update conflicts with what a node
+/// has if it conflicts with a route injected by the node, or with a route through a neighbour with
+/// a finite metric, feasible or not, as the selected route has. A route with an infinite metric,
+/// over a link that has failed, doesn't count, and gives way to the update. Nor does the route
+/// through the sender of the update for the same prefix, which the update replaces.
+///
+/// A conflicting update is rejected. It still removes the route through its sender, which no
+/// longer advertises it, as a retraction would. For each prefix whose sources block it, the node
+/// sends a Conflict Alert, another experimental extension, to the next hop of the prefix's selected
+/// route, and each node on the way sends it on along its own, until it reaches the prefix's
+/// originator. The alert counts the hops it has come, so that each node can tell how far away the
+/// rejecting node is. Of two nodes originating prefixes that conflict, each hears of the
+/// other, over its own prefix, from the nodes where their routes meet, which reject each other's
+/// updates. At most one alert per prefix and next hop goes out per Conflict Alert interval.
+///
+/// Each node reports what it sees as an [`Output::ConflictAlert`], naming the neighbour that the
+/// update or alert came from, and for an alert, how many hops away the routes meet, so that the
+/// conflict can be traced by hand from either side. Following those neighbours from an originator
+/// leads to where the routes meet, and from there, the selected routes lead to the other
+/// originator. Router-ids are left out: they are random on every start, so they would tell no one
+/// which node to look at.
+///
+/// Nothing else is done about a conflict: each node keeps what it learnt first until it loses it,
+/// and then the seqno request that it sends for the lost route is answered with a route from
+/// another router, if a neighbour has one. Where an exclusive prefix was learnt first, that keeps
+/// the addresses of a prefix inside it from being taken over. Where the prefix inside it was, the
+/// exclusive one is rejected, and the rest of its addresses can't be reached from there until the
+/// conflict is resolved. A node that restarts with a new router-id can briefly conflict with its
+/// own old routes, until the retractions of those have reached every node (see
+/// [Reboots](State#reboots)).
+///
+/// No two sources in a node's table conflict, as every update that is taken in removes those that
+/// it would conflict with, or is rejected. So an update from a source that the prefix already has
+/// a route from conflicts with nothing, and only the others are checked, which keeps the cost of
+/// the check out of the refreshes that make up nearly all updates.
 pub struct State {
     params: Params,
     router_id: RouterId,
@@ -682,6 +933,9 @@ pub struct State {
     source_table: HashMap<SourceKey, SourceEntry>,
     route_table: RouteTable,
     seqno_request_table: HashMap<IpNet, SeqnoRequestEntry>,
+    /// The prefixes and next hops that this node has sent a Conflict Alert for within the
+    /// Conflict Alert interval, which it sends no other for until then.
+    conflict_alerts_sent: HashSet<(IpNet, NeighKey)>,
     outputs: VecDeque<Output>,
     timers: TimerQueue<Timer>,
     /// The current time, as a timestamp (see [`timestamp`]).
@@ -692,6 +946,10 @@ pub struct State {
     updated_prefixes: Vec<IpNet>,
     /// The route and seqno requests received, to be handled after route selection.
     requests: Vec<Tlv>,
+    /// The prefixes of the Conflict Alerts to send on after route selection: those received,
+    /// with how many hops away they say the node that rejected an update is, and those of the
+    /// updates rejected, with none.
+    conflict_alerts: Vec<(IpNet, Option<NonZeroU8>)>,
     /// The receive timestamp of the packet (RFC 9616 §3.1).
     receive_timestamp: u32,
     hello_timestamp: Option<u32>,
@@ -710,11 +968,13 @@ impl State {
             source_table: HashMap::new(),
             route_table: RouteTable::default(),
             seqno_request_table: HashMap::new(),
+            conflict_alerts_sent: HashSet::new(),
             outputs: VecDeque::new(),
             timers: TimerQueue::new(now),
             now: timestamp(now),
             updated_prefixes: Vec::new(),
             requests: Vec::new(),
+            conflict_alerts: Vec::new(),
             receive_timestamp: 0,
             hello_timestamp: None,
             ihu_timestamps: None,
@@ -830,6 +1090,7 @@ impl State {
         self.outputs.retain(|output| match output {
             Output::Packet(to, _) => *to != key,
             Output::RouteSelect(_, via) => *via != key,
+            Output::ConflictAlert { from, .. } => *from != key,
             Output::RouteHold(_) | Output::RouteRemove(_) => true,
         });
 
@@ -840,16 +1101,18 @@ impl State {
         }
     }
 
-    /// Injects a route for a prefix that this node originates, returning `false` if the
-    /// route table already has an entry for it, whether injected or learned.
+    /// Injects a route for a prefix that this node originates, as nonexclusive or not (see
+    /// [Duplicate addresses](State#duplicate-addresses)), returning `false` if the route table
+    /// already has an entry for it, whether injected or learned.
     ///
     /// No update is sent for it at once: neighbours first learn of it from the next
     /// periodic update. Injected routes are meant to be added when the node starts,
-    /// before any neighbour is added, which this does not delay.
+    /// before any neighbour is added, which this does not delay. One added later isn't checked
+    /// against the routes already learnt, which it could conflict with.
     ///
     /// The prefix should not be martian (see [`martian_prefix`]), as neighbours would ignore it.
-    pub fn inject_route(&mut self, prefix: IpNet) -> bool {
-        self.route_table.inject(prefix.trunc())
+    pub fn inject_route(&mut self, prefix: IpNet, nonexclusive: bool) -> bool {
+        self.route_table.inject(prefix.trunc(), nonexclusive)
     }
 
     /// Shuts the node down, saying goodbye to every neighbour, and removing every route
@@ -918,7 +1181,9 @@ impl State {
                 PrefixSnapshot {
                     prefix,
                     status: match entry.status {
-                        PrefixStatus::Injected => snapshot::PrefixStatus::Injected,
+                        PrefixStatus::Injected { nonexclusive } => {
+                            snapshot::PrefixStatus::Injected { nonexclusive }
+                        }
                         PrefixStatus::Selected(key, _) => {
                             snapshot::PrefixStatus::Selected(external(key))
                         }
@@ -933,6 +1198,7 @@ impl State {
                             metric: route.metric.get(),
                             smoothed_metric: route.ms_at(now, tau).round() as u16,
                             feasible: route.is_feasible(prefix, &self.source_table),
+                            nonexclusive: route.nonexclusive,
                         })
                         .collect(),
                 }
@@ -963,6 +1229,7 @@ impl State {
             seqno: self.seqno,
             metric: METRIC_INFINITY,
             prefix: [0; 16],
+            nonexclusive: false,
         }
     }
 
@@ -1132,7 +1399,7 @@ impl State {
 
                 if entry.routes.is_empty() {
                     // Nothing is left to keep the entry for.
-                    self.route_table.prefix_entries.remove(&prefix);
+                    self.route_table.remove_entry(&prefix);
                 } else {
                     entry.status = PrefixStatus::None;
                     entry.advert = None;
@@ -1160,6 +1427,9 @@ impl State {
                     self.record_seqno_request(key, request.seqno, resends_left);
                     self.send_seqno_request(None, key, request.seqno, None);
                 }
+            }
+            Timer::ConflictAlert(key) => {
+                assert!(self.conflict_alerts_sent.remove(&key));
             }
             Timer::BufferFlush(key) => {
                 let buf = &mut self.neigh_table[key].packet_buf;
@@ -1256,6 +1526,14 @@ impl State {
         }
         self.requests = requests;
 
+        // Conflict Alerts follow the selected routes as the packet leaves them too, so that one
+        // queued on rejecting an update goes along the route that the rejection kept.
+        let mut alerts = mem::take(&mut self.conflict_alerts);
+        for (prefix, hops) in alerts.drain(..) {
+            self.handle_conflict_alert(from, prefix, hops);
+        }
+        self.conflict_alerts = alerts;
+
         self.hello_timestamp = None;
         self.ihu_timestamps = None;
     }
@@ -1322,9 +1600,7 @@ impl State {
                         .copied()
                         .collect();
                     for prefix in stale {
-                        let route = self.route_table.remove(&prefix, from).unwrap();
-                        self.timers.remove(route.timer_key);
-                        self.updated_prefixes.push(prefix);
+                        assert!(self.remove_route(prefix, from));
                     }
                 }
             }
@@ -1356,6 +1632,16 @@ impl State {
             }
             Tlv::RouteRequest { .. } | Tlv::SeqnoRequest { .. } => {
                 self.requests.push(tlv.clone());
+            }
+            Tlv::ConflictAlert {
+                ae,
+                plen,
+                hops_away,
+                prefix,
+            } => {
+                // A Conflict Alert with AE 0 already fails to decode as a TLV.
+                let prefix = decode_prefix(ae, plen, prefix).unwrap();
+                self.conflict_alerts.push((prefix, Some(hops_away)));
             }
         }
     }
@@ -1400,6 +1686,7 @@ impl State {
                 router_id: self.router_id,
                 seqno: self.seqno,
                 metric: METRIC_INFINITY,
+                nonexclusive: false,
             });
 
         self.send_update(Some(from), None, false, prefix, advert);
@@ -1644,6 +1931,7 @@ impl State {
             metric,
             prefix,
             router_id,
+            nonexclusive,
         } = *update;
 
         let Some(prefix) = decode_prefix(ae, plen, prefix) else {
@@ -1662,10 +1950,7 @@ impl State {
         }
 
         if metric == METRIC_INFINITY {
-            if let Some(route) = self.route_table.remove(&prefix, from) {
-                self.timers.remove(route.timer_key);
-                self.updated_prefixes.push(prefix);
-            }
+            self.remove_route(prefix, from);
             return;
         }
 
@@ -1679,21 +1964,35 @@ impl State {
         let near_expiry_time = interval
             .to_duration()
             .mul_f64(self.params.get(F64Key::RouteNearExpiryTimeMultiplier));
+        let now = self.now;
+        let new_route = move |timers: &mut TimerQueue<Timer>| RouteEntry {
+            router_id,
+            advertised_metric: metric,
+            metric: Cell::new(METRIC_INFINITY),
+            metric_smoothed: Cell::new(METRIC_INFINITY as f32),
+            metric_smoothed_at: Cell::new(now),
+            seqno,
+            last_update_interval: interval,
+            timer_key: timers.insert(Timer::RouteNearExpiry(prefix, from), near_expiry_time),
+            nonexclusive,
+        };
 
-        let (status, route) = self
-            .route_table
-            .get_or_insert_with(prefix, from, || RouteEntry {
-                router_id,
-                advertised_metric: metric,
-                metric: Cell::new(METRIC_INFINITY),
-                metric_smoothed: Cell::new(METRIC_INFINITY as f32),
-                metric_smoothed_at: Cell::new(self.now),
-                seqno,
-                last_update_interval: interval,
-                timer_key: self
-                    .timers
-                    .insert(Timer::RouteNearExpiry(prefix, from), near_expiry_time),
-            });
+        let known = self.route_table.get_or_insert_with_known_source(
+            prefix,
+            from,
+            router_id,
+            nonexclusive,
+            || new_route(&mut self.timers),
+        );
+        let (status, route) = match known {
+            Some(found) => found,
+            None => {
+                if self.reject_conflicting_update(from, prefix, router_id, nonexclusive) {
+                    return;
+                }
+                (self.route_table).get_or_insert_with(prefix, from, || new_route(&mut self.timers))
+            }
+        };
 
         if let Some(route) = route {
             // An unfeasible update for the selected route, with an unchanged router-id,
@@ -1720,6 +2019,7 @@ impl State {
             route.advertised_metric = metric;
             route.seqno = seqno;
             route.last_update_interval = interval;
+            route.nonexclusive = nonexclusive;
 
             // Reset the timer to `RouteNearExpiry` as it can be a `RouteExpiry`.
             self.timers
@@ -1728,6 +2028,148 @@ impl State {
         }
 
         self.updated_prefixes.push(prefix);
+    }
+
+    /// Removes the route to a prefix through neighbour `from`, if there is one, along with its
+    /// expiry timer, and records the prefix for route selection at the end of the packet, as a
+    /// retraction does. Returns whether there was one.
+    fn remove_route(&mut self, prefix: IpNet, from: NeighKey) -> bool {
+        let Some(route) = self.route_table.remove(&prefix, from) else {
+            return false;
+        };
+        self.timers.remove(route.timer_key);
+        self.updated_prefixes.push(prefix);
+        true
+    }
+
+    /// Rejects an update for a prefix from neighbour `from` that conflicts with what this node has
+    /// (see [Duplicate addresses](State#duplicate-addresses)), returning whether it did. Updates
+    /// from a source that the prefix already has a route from conflict with nothing, and don't come
+    /// here (see [`RouteTable::get_or_insert_with_known_source`]).
+    ///
+    /// The update still replaces the route through `from` for its prefix, if any, which `from` no
+    /// longer advertises, so that route is removed as if retracted. This node reports the conflict
+    /// over each prefix whose source blocks the update. For each but those that it injects, a
+    /// Conflict Alert is then sent along the selected route, once the packet's routes have been
+    /// selected, towards the prefix's origin.
+    ///
+    /// An update that doesn't conflict removes the routes that it would conflict with, which all
+    /// have an infinite metric then, so that no two sources in the table conflict. Once its link
+    /// was back, such a route would otherwise have a finite metric beside the new one. None of them
+    /// is selected, as no selected route has an infinite metric.
+    fn reject_conflicting_update(
+        &mut self,
+        from: NeighKey,
+        prefix: IpNet,
+        router_id: RouterId,
+        nonexclusive: bool,
+    ) -> bool {
+        let update = Source {
+            prefix,
+            router_id,
+            nonexclusive,
+        };
+        let conflicting = self.route_table.conflicting(from, update, self.router_id);
+
+        let mut blocking: Vec<_> = (conflicting.iter())
+            .filter(|c| c.blocks)
+            .map(|c| c.prefix)
+            .collect();
+        if blocking.is_empty() {
+            for c in conflicting {
+                let route = self.route_table.remove(&c.prefix, c.via.unwrap()).unwrap();
+                self.timers.remove(route.timer_key);
+                // The update's own entry is about to have its route.
+                if c.prefix != prefix && self.route_table.prefix_entries[&c.prefix].is_empty() {
+                    self.route_table.remove_entry(&c.prefix);
+                }
+            }
+            return false;
+        }
+
+        self.remove_route(prefix, from);
+
+        // A prefix with more than one source blocking the update is reported once.
+        blocking.sort_unstable();
+        blocking.dedup();
+        for blocked in blocking {
+            self.outputs.push_back(Output::ConflictAlert {
+                prefix: blocked,
+                from,
+                kind: ConflictAlertKind::Rejected,
+            });
+            let status = self.route_table.prefix_entries[&blocked].status;
+            if !matches!(status, PrefixStatus::Injected { .. }) {
+                self.conflict_alerts.push((blocked, None));
+            }
+        }
+        true
+    }
+
+    /// Handles a Conflict Alert for a prefix from neighbour `from`, which says that the node that
+    /// rejected an update is `hops_away`, or with none, one that this node queued on rejecting an
+    /// update from `from`, once the packet's routes have been selected (see
+    /// [Duplicate addresses](State#duplicate-addresses)).
+    ///
+    /// A node on a side of the conflict reports a received alert, with how far away it says the
+    /// rejecting node is: the originator of the prefix, or a node whose selected route doesn't go
+    /// through `from`. Any but the originator then sends the alert on to the next hop of that
+    /// route, one hop further away, unless it has come 255 hops. An alert with no route to follow
+    /// is dropped unreported.
+    fn handle_conflict_alert(
+        &mut self,
+        from: NeighKey,
+        prefix: IpNet,
+        hops_away: Option<NonZeroU8>,
+    ) {
+        let Some(entry) = self.route_table.prefix_entries.get(&prefix) else {
+            return;
+        };
+
+        let injected = matches!(entry.status, PrefixStatus::Injected { .. });
+        let to = entry.status.selected().filter(|&key| key != from);
+
+        if let Some(hops) = hops_away
+            && (injected || to.is_some())
+        {
+            self.outputs.push_back(Output::ConflictAlert {
+                prefix,
+                from,
+                kind: ConflictAlertKind::Alerted { hops },
+            });
+        }
+
+        let Some(to) = to else {
+            return;
+        };
+
+        // An alert isn't sent on past 255 hops, which bounds one that goes round a loop, should one
+        // last. Loops end long before an alert gets round them, as what ends them goes urgently,
+        // and alerts don't, and the Conflict Alert interval holds one back on its second lap,
+        // unless the first took longer.
+        let Some(hops_away) = hops_away.map_or(Some(NonZeroU8::MIN), |hops| hops.checked_add(1))
+        else {
+            return;
+        };
+
+        // At most one alert per prefix and next hop goes out per interval. Rejections recur at
+        // the period of full dumps, so an interval shorter than that lets each one's alert
+        // through, and only collapses bursts, such as those of several rejecting nodes.
+        let key = (prefix, to);
+        if !self.conflict_alerts_sent.insert(key) {
+            return;
+        }
+        let interval = self.params.get(DurationKey::ConflictAlertInterval);
+        self.timers.insert(Timer::ConflictAlert(key), interval);
+
+        let (ae, plen, prefix) = encode_prefix(prefix, Ae::Ipv4);
+        let tlv = Tlv::ConflictAlert {
+            ae,
+            plen,
+            hops_away,
+            prefix,
+        };
+        self.send(Some(to), None, |e| e.put_tlv(&tlv));
     }
 
     /// Removes the routes through a neighbour along with their expiry timers,
@@ -1777,7 +2219,7 @@ impl State {
             route.set_metric(metric, self.now, self.params.get_tau());
         }
 
-        if entry.status == PrefixStatus::Injected {
+        if let PrefixStatus::Injected { .. } = entry.status {
             return;
         }
 
@@ -1801,7 +2243,7 @@ impl State {
         // if it were feasible. In the latter case, a node SHOULD send a seqno request to
         // the neighbour that advertised it (RFC 8966 §3.8.2.2, with Erratum 7373).
         let (selection, wanted) = match entry.status {
-            PrefixStatus::Injected => unreachable!(),
+            PrefixStatus::Injected { .. } => unreachable!(),
             // The selected route has not changed, so it is still usable. Its metric is
             // still finite, and it is still feasible: only advertising tightens
             // feasibility, and advertising the selected route keeps it feasible.
@@ -1864,7 +2306,7 @@ impl State {
             let mut retraction_timer_key = None;
 
             match entry.status {
-                PrefixStatus::Injected => unreachable!(),
+                PrefixStatus::Injected { .. } => unreachable!(),
                 // The prefix is still reachable, possibly with another router-id.
                 PrefixStatus::Selected(old_key, timer_key) => {
                     trigger_update = route.router_id != entry.advert.unwrap().router_id;
@@ -1972,6 +2414,7 @@ impl State {
                 router_id: route.router_id,
                 seqno: route.seqno,
                 metric: route.metric.get(),
+                nonexclusive: route.nonexclusive,
             };
 
             // The reply to a pending seqno request is forwarded as a triggered update.
@@ -2026,7 +2469,7 @@ impl State {
 
         if entry.is_empty() {
             // Nothing is left to keep the entry for.
-            self.route_table.prefix_entries.remove(&prefix);
+            self.route_table.remove_entry(&prefix);
         }
 
         if let Some((not_to, advert)) = triggered_update {
@@ -2130,6 +2573,7 @@ impl State {
             metric: advert.metric,
             prefix,
             router_id: Some(advert.router_id),
+            nonexclusive: advert.nonexclusive && advert.metric != METRIC_INFINITY,
         };
 
         self.send_except(to, not_to, timeout, |e| e.put_update(&update));
@@ -2196,10 +2640,11 @@ impl State {
     fn advert_for_prefix(&self, entry: &PrefixEntry) -> Option<Advert> {
         match entry.status {
             // A route injected by this node (RFC 8966 §3.7).
-            PrefixStatus::Injected => Some(Advert {
+            PrefixStatus::Injected { nonexclusive } => Some(Advert {
                 router_id: self.router_id,
                 seqno: self.seqno,
                 metric: 0,
+                nonexclusive,
             }),
             _ => entry.advert,
         }
@@ -2210,6 +2655,7 @@ impl State {
             router_id,
             seqno,
             metric,
+            nonexclusive: _,
         } = advert;
 
         // Only updates with a finite metric, not retractions, are recorded

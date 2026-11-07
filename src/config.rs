@@ -6,7 +6,7 @@
 //! [interface]                # optional, as is each key in it
 //! name = "cyn0"              # default: the file's stem, as wg-quick does
 //! mtu = 1400                 # default: 1400
-//! addresses = ["10.42.0.1", "fd42::1"]
+//! addresses = ["10.42.0.1", "fd42::1", "nonexclusive,10.42.0.9"]
 //!
 //! [wireguard]
 //! private_key = "base64"     # or private_key_file = "/etc/cynet/key"
@@ -15,7 +15,7 @@
 //!
 //! [routing]
 //! mesh = ["10.42.0.0/16", "fd42::/48", "192.168.0.0/16"]
-//! attached = ["192.168.7.0/24"]   # directly attached networks
+//! attached = ["192.168.7.0/24", "nonexclusive,0.0.0.0/0"]   # directly attached networks
 //! kernel_routes = true       # default: true; main-table routes for mesh, see below
 //!
 //! [[peer]]
@@ -26,16 +26,22 @@
 //!
 //! A prefix of `mesh` only gets a kernel route if this node has an address or an attached network
 //! of its family (see [`Config::kernel_route_prefixes`]).
+//!
+//! A `nonexclusive,` prefix on an entry of `addresses` or `attached` lets other nodes originate it,
+//! or prefixes inside it, too
+//! (see [`Config::nonexclusive`]).
 
 #[cfg(test)]
 mod tests;
 
 use std::{
     collections::HashSet,
+    fmt::Display,
     fs, io,
     net::{IpAddr, SocketAddr},
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
+    str::FromStr,
     time::Duration,
 };
 
@@ -43,7 +49,7 @@ use base64::{Engine, prelude::BASE64_STANDARD};
 use eyre::{Context, bail, ensure, eyre};
 use gotatun::x25519::{PublicKey, StaticSecret};
 use ipnet::IpNet;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer, de};
 
 use crate::{
     babel::{Params, martian_prefix},
@@ -76,7 +82,7 @@ struct RawInterface {
     name: Option<String>,
     mtu: Option<u16>,
     #[serde(default)]
-    addresses: Vec<IpAddr>,
+    addresses: Vec<Marked<IpAddr>>,
 }
 
 #[derive(Deserialize)]
@@ -93,7 +99,7 @@ struct RawWireguard {
 struct RawRouting {
     mesh: Vec<IpNet>,
     #[serde(default)]
-    attached: Vec<IpNet>,
+    attached: Vec<Marked<IpNet>>,
     kernel_routes: Option<bool>,
 }
 
@@ -103,6 +109,41 @@ struct RawPeer {
     public_key: String,
     preshared_key: Option<String>,
     endpoint: Option<String>,
+}
+
+/// An entry of `addresses` or `attached`, which a `nonexclusive,` prefix marks as nonexclusive.
+struct Marked<T> {
+    value: T,
+    nonexclusive: bool,
+}
+
+impl<T: Copy> Marked<T> {
+    /// Splits entries into the values of all of them, and those of the ones marked nonexclusive.
+    fn split(entries: Vec<Self>) -> (Vec<T>, Vec<T>) {
+        let marked = (entries.iter().filter(|e| e.nonexclusive))
+            .map(|e| e.value)
+            .collect();
+        (entries.into_iter().map(|e| e.value).collect(), marked)
+    }
+}
+
+impl<'de, T> Deserialize<'de> for Marked<T>
+where
+    T: FromStr,
+    T::Err: Display,
+{
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        let (text, nonexclusive) = match text.strip_prefix("nonexclusive,") {
+            Some(rest) => (rest, true),
+            None => (text.as_str(), false),
+        };
+        let value = text.parse().map_err(de::Error::custom)?;
+        Ok(Self {
+            value,
+            nonexclusive,
+        })
+    }
 }
 
 /// Where a peer is reached.
@@ -148,6 +189,11 @@ pub struct Config {
     pub mesh: Vec<IpNet>,
     /// The directly attached networks, which are advertised.
     pub attached: Vec<IpNet>,
+    /// The prefixes of `addresses` and `attached` that other nodes may originate too, as may they
+    /// prefixes inside them, for example a default route at each of several exit nodes. Every other
+    /// prefix that this node originates is exclusive to it: an update from another router for it,
+    /// or for a prefix inside it, conflicts with it.
+    pub nonexclusive: Vec<IpNet>,
     /// Whether to add kernel routes for `mesh` (see [`Self::kernel_route_prefixes`]).
     pub kernel_routes: bool,
     /// The peers.
@@ -195,6 +241,11 @@ impl Config {
             kernel_routes,
         } = raw.routing;
         let kernel_routes = kernel_routes.unwrap_or(true);
+
+        let (addresses, nonexclusive_addresses) = Marked::split(addresses);
+        let (attached, nonexclusive_attached) = Marked::split(attached);
+        let nonexclusive =
+            local_prefixes(&nonexclusive_addresses, &nonexclusive_attached).collect();
 
         let name = name
             .as_deref()
@@ -312,6 +363,7 @@ impl Config {
             reresolve_interval: (reresolve_secs != 0).then(|| Duration::from_secs(reresolve_secs)),
             mesh: mesh.iter().map(IpNet::trunc).collect(),
             attached: attached.iter().map(IpNet::trunc).collect(),
+            nonexclusive,
             kernel_routes,
             peers,
         })

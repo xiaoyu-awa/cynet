@@ -47,12 +47,13 @@ pub enum Input<K> {
 /// is closed, or `outputs` is. The caller joins the returned handle.
 ///
 /// It is given the arguments of [`State::new`], rather than a `State`, so that its timers start on
-/// the driver's clock, and the prefixes that this node originates, whose routes are injected before
-/// any input can add a neighbour (see [`State::inject_route`]).
+/// the driver's clock, and the prefixes that this node originates, each with whether it is
+/// nonexclusive, whose routes are injected before any input can add a neighbour (see
+/// [`State::inject_route`]).
 pub fn spawn<K: Copy + Eq + Hash + Send + 'static>(
     params: Params,
     router_id: RouterId,
-    prefixes: Vec<IpNet>,
+    prefixes: Vec<(IpNet, bool)>,
     inputs: mpsc::Receiver<Input<K>>,
     outputs: mpsc::Sender<Output<K>>,
 ) -> io::Result<thread::JoinHandle<()>> {
@@ -101,15 +102,15 @@ fn get_or_add_neighbour<K: Copy + Eq + Hash>(
 async fn run<K: Copy + Eq + Hash>(
     params: Params,
     router_id: RouterId,
-    prefixes: Vec<IpNet>,
+    prefixes: Vec<(IpNet, bool)>,
     mut inputs: mpsc::Receiver<Input<K>>,
     outputs: mpsc::Sender<Output<K>>,
 ) {
     let mut state = State::new(now(), params, router_id, None);
     let mut keys = NeighKeyMap::new();
 
-    for prefix in prefixes {
-        state.inject_route(prefix);
+    for (prefix, nonexclusive) in prefixes {
+        state.inject_route(prefix, nonexclusive);
     }
 
     loop {

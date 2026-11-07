@@ -14,6 +14,7 @@
 /// An implementation of the Babel routing protocol over point-to-point links.
 pub mod babel;
 pub mod config;
+pub mod conflicts;
 pub mod daemon;
 mod netconf;
 pub mod router;

@@ -22,6 +22,9 @@
 #
 # A lone node, V, has addresses but no kernel routes.
 #
+# A third mesh is a chain, E - F - G, with one network attached at both E and G, unmarked, which
+# the three nodes report as a conflict.
+#
 # Two pairs, P - Q and R - S, go silent for long enough that WireGuard gives up on their sessions:
 # P and Q in a network outage, and R and S with R stopped. That happens behind everything else, so
 # the wait costs little.
@@ -349,9 +352,14 @@ expect "lists peer C" "peer: ${PUBLIC[c]//+/\\+}" "$output"
 expect "shows a handshake" 'latest handshake: [0-9]+' "$output"
 expect "shows a link cost" 'link cost: [0-9]+' "$output"
 expect "lists injected routes" '10\.42\.0\.1/32 +injected' "$output"
-expect "lists the selected route to D" '10\.42\.0\.4/32 +via .*, metric [0-9]+$' "$output"
+# A route goes on a line of its own, under its prefix, with what its choice is based on.
+expect "lists the selected route to D, with its details" \
+    '^    via .*, metric [0-9]+ \([0-9]+\), rid [0-9a-f]{16}, seqno [0-9]+$' \
+    "$(grep -A1 '^  10\.42\.0\.4/32$' <<<"$output")"
 expect "shows how long it has been up" 'uptime: [0-9]+' "$output"
-expect_not "leaves Babel's details to -v" 'seqno|router-id| rid [0-9a-f]|metric [0-9a-z]+ \(|rxcost|hello history|feasible' "$output"
+expect "shows this node's router-id and seqno" '^  router-id: [0-9a-f]{16}, seqno: [0-9]+$' "$output"
+expect "shows what makes up a link's cost" 'rxcost: [0-9]+, txcost: [0-9]+, rtt penalty: [0-9]+$' "$output"
+expect "shows the Hello history" 'hello history: [01]{16} ' "$output"
 # Not at once: a node may have selected a longer route it heard first, and hysteresis keeps it there
 # for up to a minute or so, during which split horizon keeps it from advertising the route to A.
 has_unselected() { in_ns a "$CYNET" show cyn-a | grep -qE 'not via .*, metric [0-9]'; }
@@ -360,13 +368,9 @@ if took=$(wait_until 120 has_unselected); then
 else
     fail "lists the unselected route to D" "$(in_ns a "$CYNET" show cyn-a)"
 fi
-expect "lists the attached network behind D" '192\.168\.7\.0/24 +via' "$output"
-output=$(in_ns a "$CYNET" show -v cyn-a 2>&1)
-expect "-v adds this node's seqno" '^  router-id: [0-9a-f]{16}, seqno: [0-9]+$' "$output"
-expect "-v adds what makes up a link's cost" 'rxcost: [0-9]+, txcost: [0-9]+, rtt penalty: [0-9]+$' "$output"
-expect "-v adds the Hello history" 'hello history: [01]{16} ' "$output"
-expect "-v puts a route on its own line, with more details" '^    via .*, metric [0-9]+ \([0-9]+\), rid [0-9a-f]{16}, seqno [0-9]+$' "$(grep -A1 '10\.42\.0\.4/32$' <<<"$output")"
-expect "-v adds details of the unselected route" '^    not via .*, metric [0-9]+ \([0-9]+\), rid [0-9a-f]{16}, seqno [0-9]+, (un)?feasible$' "$output"
+expect "lists the attached network behind D" '^    via ' "$(grep -A1 '^  192\.168\.7\.0/24$' <<<"$output")"
+output=$(in_ns a "$CYNET" show cyn-a 2>&1)
+expect "shows details of the unselected route" '^    not via .*, metric [0-9]+ \([0-9]+\), rid [0-9a-f]{16}, seqno [0-9]+, (un)?feasible$' "$output"
 # A pseudo-terminal, which is the one place for colors.
 output=$(in_ns a script -qec "'$CYNET' show cyn-a" /dev/null 2>&1)
 expect "has colors in a terminal" $'\x1b\\[32m\x1b\\[1minterface\x1b\\[0m: \x1b\\[32mcyn-a' "$output"
@@ -400,7 +404,7 @@ done
 
 echo "failures"
 # Whichever transit node carries the traffic now, kill it without warning.
-selected=$(in_ns a "$CYNET" show cyn-a | grep -E '10\.42\.0\.4/32 +via' | sed -E 's/.*via ([^… ]+).*/\1/')
+selected=$(in_ns a "$CYNET" show cyn-a | grep -A1 '^  10\.42\.0\.4/32$' | sed -nE 's/^    via ([^… ]+).*/\1/p')
 if [[ ${PUBLIC[b]} == "$selected"* ]]; then
     victim=b survivor=c
 else
@@ -489,13 +493,13 @@ output=$(in_ns x ping -c1 -W2 -t1 10.50.0.3 2>&1)
 expect "IPv4 errors from Y come from the dummy address" 'From 192\.0\.0\.8 .*Time to live exceeded' "$output"
 output=$(in_ns x ping -c1 -W2 -t1 fd50::3 2>&1)
 expect "IPv6 errors from Y come from the dummy prefix" 'From 100::1:[0-9a-f:]+ .*Time exceeded' "$output"
-router_id=$(in_ns y "$CYNET" show -v cyn-y | sed -nE 's/^  router-id: ([0-9a-f]+), .*/\1/p')
+router_id=$(in_ns y "$CYNET" show cyn-y | sed -nE 's/^  router-id: ([0-9a-f]+), .*/\1/p')
 tail=$(sed -E 's/.*From 100::1:([0-9a-f:]+).*/\1/' <<<"$(grep -E 'From 100::1' <<<"$output")")
 as_hex=$(tr -d ':' <<<"$(sed -E 's/(^|:)([0-9a-f]{3})(:|$)/\10\2\3/g; s/(^|:)([0-9a-f]{2})(:|$)/\100\2\3/g; s/(^|:)([0-9a-f])(:|$)/\1000\2\3/g' <<<"$tail")")
 if [[ $as_hex == "$router_id" ]]; then
-    pass "that address carries Y's router-id, as cynet show -v reports it"
+    pass "that address carries Y's router-id, as cynet show reports it"
 else
-    fail "that address carries Y's router-id" "from ping: $tail, from cynet show -v: $router_id"
+    fail "that address carries Y's router-id" "from ping: $tail, from cynet show: $router_id"
 fi
 
 echo "a gateway with no addresses"
@@ -529,6 +533,55 @@ else
     fail "and this host still answers on them"
 fi
 
+echo "a network attached at two nodes"
+for node in e f g; do
+    new_ns "$node"
+    new_key "$node"
+done
+link e f 12
+link f g 13
+THIRD_MESH='"10.80.0.0/16"'
+write_config e 1400 '"10.80.0.1"' '"10.80.9.0/24"' "$THIRD_MESH"
+write_config f 1400 '"10.80.0.2"' '' "$THIRD_MESH"
+write_config g 1400 '"10.80.0.3"' '"10.80.9.0/24"' "$THIRD_MESH"
+add_peer e f 172.16.12.2
+add_peer f e 172.16.12.1
+add_peer f g 172.16.13.2
+add_peer g f 172.16.13.1
+for node in e f g; do start "$node"; done
+
+expect_within 60 "E reaches G across F" ping_ok e 10.80.0.3
+has_conflicts() { in_ns "$1" "$CYNET" show "cyn-$1" | grep -q '^conflicts:$'; }
+for node in e f g; do
+    if ! wait_until 30 has_conflicts "$node" >/dev/null; then
+        fail "${node^^} lists the conflict" "$(in_ns "$node" "$CYNET" show "cyn-$node")"
+    fi
+done
+# The first 5 characters of a key, as `cynet show` names a neighbour, ready for a pattern.
+short() { local key=${PUBLIC[$1]:0:5}; echo "${key//+/\\+}…"; }
+# A conflict goes on a line of its own, under a line for its prefix.
+conflict_of() { grep -A1 '^  10\.80\.9\.0/24$' <<<"$1"; }
+output=$(in_ns f "$CYNET" show cyn-f 2>&1)
+expect "F, between them, rejects one end's updates" \
+    "^    directly with ($(short e)|$(short g)), for [0-9]+ " "$(conflict_of "$output")"
+output_e=$(in_ns e "$CYNET" show cyn-e 2>&1)
+output_g=$(in_ns g "$CYNET" show cyn-g 2>&1)
+conflicts_e_g="$(conflict_of "$output_e")"$'\n'"$(conflict_of "$output_g")"
+expect "one end learns of it from F, 1 hop away" \
+    "^    1 hop away via $(short f), for [0-9]+ " "$conflicts_e_g"
+expect "and the other rejects F's updates" "^    directly with $(short f), for [0-9]+ " "$conflicts_e_g"
+expect "F marks the prefix as conflicted among its routes" '^  10\.80\.9\.0/24 +conflicted$' "$output"
+expect "and so does E, after injected" '^  10\.80\.9\.0/24 +injected, conflicted$' "$output_e"
+expect "and so does G, after injected" '^  10\.80\.9\.0/24 +injected, conflicted$' "$output_g"
+expect "F warns of it in its log" \
+    'WARN.*conflict over 10\.80\.9\.0/24, directly with ' \
+    "$(cat "$WORK/f.log")"
+expect "and so does the end that learns of it" \
+    'WARN.*conflict over 10\.80\.9\.0/24, 1 hop away via ' \
+    "$(cat "$WORK/e.log" "$WORK/g.log")"
+output=$(in_ns a "$CYNET" show cyn-a 2>&1)
+expect_not "a node with no conflict lists none" '^conflicts:' "$output"
+
 echo "long silences"
 # WireGuard asks again 15 s after the last reply, for 90 s, and then forgets the session.
 left=$((112 - (SECONDS - silence_start)))
@@ -539,7 +592,7 @@ for node in p q s; do
     output=$(in_ns "$node" "$CYNET" show "cyn-$node" 2>&1)
     expect "${node^^} has no session left" 'CONNECTION_EXPIRED' "$(cat "$WORK/$node.log")"
     expect "but still knows when its last handshake was" 'latest handshake: [0-9]+ minute' "$output"
-    expect "and its neighbour is still there, with an infinite cost" 'link cost: infinite' "$output"
+    expect "and its neighbour is still there, with an infinite cost" 'link cost: infinity' "$output"
     expect_not "and no route through it" ' via ' "$output"
 done
 

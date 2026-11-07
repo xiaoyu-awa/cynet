@@ -501,6 +501,66 @@ fn unknown_keys_and_missing_sections_are_rejected() {
     assert!(error_of("[wireguard]\n[routing]\n").contains("mesh"));
 }
 
+#[test]
+fn nonexclusive_entries_are_marked() {
+    let config = Config::parse(
+        &config_with(
+            r#"addresses = ["10.42.0.1", "nonexclusive,10.42.0.9", "nonexclusive,fd42::9"]"#,
+            "",
+            r#"attached = ["192.168.7.0/24", "nonexclusive,0.0.0.9/0"]"#,
+        ),
+        Some("cyn0"),
+    )
+    .unwrap();
+
+    let addresses: Vec<std::net::IpAddr> = ["10.42.0.1", "10.42.0.9", "fd42::9"]
+        .map(|addr| addr.parse().unwrap())
+        .into();
+    let prefixes = |prefixes: &[&str]| -> Vec<IpNet> {
+        prefixes
+            .iter()
+            .map(|prefix| prefix.parse().unwrap())
+            .collect()
+    };
+    assert_eq!(config.addresses, addresses);
+    assert_eq!(config.attached, prefixes(&["192.168.7.0/24", "0.0.0.0/0"]));
+    // Addresses as host routes, and host bits cleared, as they are advertised.
+    assert_eq!(
+        config.nonexclusive,
+        prefixes(&["10.42.0.9/32", "fd42::9/128", "0.0.0.0/0"])
+    );
+
+    // The marking is exact, and the rest must parse as without it.
+    for (interface, routing) in [
+        (r#"addresses = ["nonexclusive, 10.42.0.9"]"#, ""),
+        (r#"addresses = ["unicast,10.42.0.9"]"#, ""),
+        (r#"addresses = ["nonexclusive,10.42.0.9/32"]"#, ""),
+        ("", r#"attached = ["nonexclusive,192.168.7.0"]"#),
+    ] {
+        let error = error_of(&config_with(interface, "", routing));
+        let line = if interface.is_empty() {
+            "line 11"
+        } else {
+            "line 3"
+        };
+        assert!(error.contains(line), "{interface}{routing}: {error}");
+    }
+
+    // Marked entries are checked as others are.
+    let error = error_of(&config_with(
+        r#"addresses = ["nonexclusive,fe80::1"]"#,
+        "",
+        "",
+    ));
+    assert!(error.contains("interface.addresses"), "{error}");
+    let error = error_of(&config_with(
+        "",
+        "",
+        r#"attached = ["nonexclusive,ff02::/16"]"#,
+    ));
+    assert!(error.contains("routing.attached"), "{error}");
+}
+
 /// An error about a misspelt key must not quote the line, which could hold a private key.
 #[test]
 fn errors_do_not_quote_keys() {

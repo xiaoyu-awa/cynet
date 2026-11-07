@@ -67,6 +67,7 @@ fn update_tlv(ae: Ae, flags: u8, plen: u8, omitted: u8, metric: u16, bytes: &[u8
         seqno: Seqno::new(7),
         metric,
         prefix,
+        nonexclusive: false,
     }
 }
 
@@ -80,6 +81,7 @@ fn update(ae: Ae, plen: u8, metric: u16, prefix: &str, router_id: Option<u64>) -
         metric,
         prefix: addr(prefix),
         router_id: router_id.map(|n| RouterId::new(n).unwrap()),
+        nonexclusive: false,
     }
 }
 
@@ -434,6 +436,33 @@ fn put_update_round_trips_in_any_order() {
     assert_eq!(decode_updates(&encode_updates(&updates)), updates);
     updates[1..].reverse();
     assert_eq!(decode_updates(&encode_updates(&updates)), updates);
+}
+
+#[test]
+fn nonexclusive_updates_round_trip_compressed() {
+    let nonexclusive = |update: Update| Update {
+        nonexclusive: true,
+        ..update
+    };
+    let updates = [
+        nonexclusive(update(Ipv6, 64, METRIC, "2001:db8:1:2::", Some(1))),
+        // Compressed against the one before, which the sub-TLV doesn't get in the way of.
+        nonexclusive(update(Ipv6, 64, METRIC, "2001:db8:1:3::", Some(1))),
+        update(Ipv6, 64, METRIC, "2001:db8:1:4::", Some(1)),
+        nonexclusive(update(V4ViaV6, 24, METRIC, "10.0.1.0", Some(2))),
+    ];
+
+    let packet = encode_updates(&updates);
+    assert_eq!(decode_updates(&packet), updates);
+
+    // Each nonexclusive update is 2 octets longer than it would be otherwise.
+    let unicast: Vec<_> = (updates.iter())
+        .map(|update| Update {
+            nonexclusive: false,
+            ..update.clone()
+        })
+        .collect();
+    assert_eq!(packet.len(), encode_updates(&unicast).len() + 3 * 2);
 }
 
 #[test]
